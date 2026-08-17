@@ -149,11 +149,17 @@ interface ToolDefinition {
 
 /** dsh-tools 契约：工具必须声明 output { schema, render, presentationMeta? }。
  *  execute 返回值先经 schema 校验（JSON Schema 子集），再由 render(args, value)
- *  投影为展示内容。本插件 19 个工具统一 shape：{ content: string }（纯文本），
+ *  投影为 ContentBlock 数组（官方类型：render(args, value): ContentBlock[]）。
+ *  本插件 19 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
  *  契约集中声明一次，由 registerTool 注入 —— 避免逐个注册重复 19 份。 */
+interface ContentBlock {
+  type: 'text'
+  text: string
+}
+
 interface ToolOutput {
   schema: Record<string, unknown>
-  render: (args: Record<string, unknown>, value: { content: string }) => string
+  render: (args: Record<string, unknown>, value: { content: string }) => ContentBlock[]
 }
 
 interface ToolHost {
@@ -166,7 +172,7 @@ const TOOL_OUTPUT: ToolOutput = {
     properties: { content: { type: 'string' } },
     required: ['content'],
   },
-  render: (_args, value) => value.content,
+  render: (_args, value) => [{ type: 'text', text: value.content }],
 }
 
 /** 统一注册入口：注入 output 契约后转发给宿主 */
