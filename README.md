@@ -79,6 +79,16 @@ dsh 的一切皆插件 —— 但插件的装卸会在 `.dsh/`、Nuke 目录、�
 | `nuke_guardian` | 守卫者巡检：磁盘倒计时 / 趋势异常 / 未终结事务 → 带建议的分级告警 |
 | `nuke_ledger` | 空间台账：每字节回收可溯源，按动作/profile/日聚合，freed/pending 双轨 |
 
+## 安装
+
+```bash
+dsh plugin add beijingwahw/dsh-nuke-plugin
+```
+
+安装后直接对话即可，例如：
+
+> 帮我扫描一下 web profile 的插件残留，先预演不要真删
+
 ## 典型工作流
 
 ### 第一次清理（推荐路径）
@@ -149,16 +159,6 @@ src/
 ```
 
 数据落盘位置：`<dshHome>/.nuke/`（wal/ backups/ audit/ ledger/ history/ policy.json restore-points/）
-
-## 安装
-
-```bash
-dsh plugin add beijingwahw/dsh-nuke-plugin
-```
-
-安装后直接对话即可，例如：
-
-> 帮我扫描一下 web profile 的插件残留，先预演不要真删
 
 ## 开发
 
