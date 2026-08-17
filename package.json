@@ -3,6 +3,22 @@
   "version": "3.0.0",
   "description": "强力卸载 DSH 插件 — 策略分级 · 批量原子 · 指纹快照 · 健康检查 · 并发锁 · 报告导出",
   "main": "lib/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/beijingwahw/dsh-nuke-plugin.git"
+  },
+  "bugs": "https://github.com/beijingwahw/dsh-nuke-plugin/issues",
+  "homepage": "https://github.com/beijingwahw/dsh-nuke-plugin#readme",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "nuke",
+    "cleanup",
+    "transaction"
+  ],
   "scripts": {
     "build": "tsdown src/index.ts --format cjs --out-dir lib",
     "prepare": "tsdown src/index.ts --format cjs --out-dir lib",
