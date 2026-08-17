@@ -1,6 +1,5 @@
 # dsh-nuke-plugin
 
-> **The industrial-grade Nuke environment cleanup engine for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).**
 > DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 硬链接去重 · 趋势预测
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
