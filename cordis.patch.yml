@@ -1,1 +1,6 @@
-- id: dsh-nuke-plugin
+# dsh-nuke-plugin bundle patch: mounts the plugin into a profile layer stack.
+# 该层被应用后，dsh 启动图会加载本包（main: lib/index.js）并注册 19 个 nuke_* 工具。
+# 插件无配置项；如需整体停用，注释掉下方整行（或加 disabled: true）。
+- insert:
+    - id: dsh-nuke-plugin
+      name: dsh-nuke-plugin

@@ -1,0 +1,33 @@
+{
+  "id": "dsh-nuke-plugin",
+  "version": "3.0.0",
+  "main": "lib/index.js",
+  "description": "DeepSeek Harness 工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 硬链接去重 · 趋势预测",
+  "engines": {
+    "dsh": ">=0.0.1"
+  },
+  "contributes": {
+    "tools": [
+      "nuke_list",
+      "nuke_scan",
+      "nuke_deps",
+      "nuke_orphans",
+      "nuke_health",
+      "nuke_blastradius",
+      "nuke_strategies",
+      "nuke_policy",
+      "nuke_trend",
+      "nuke_forecast",
+      "nuke_clean",
+      "nuke_dedup",
+      "nuke_restorepoint",
+      "nuke_status",
+      "nuke_recover",
+      "nuke_verify",
+      "nuke_doctor",
+      "nuke_guardian",
+      "nuke_ledger"
+    ],
+    "skills": []
+  }
+}
