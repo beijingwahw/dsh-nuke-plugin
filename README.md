@@ -25,7 +25,6 @@ dsh 的一切皆插件 —— 但插件的装卸会在 `.dsh/`、Nuke 目录、�
 ## 安装
 
 ```bash
-# --profile 指定目标 profile（小写字母/数字/连字符；插件内工具默认按 web 操作）
 dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 ```
 
