@@ -1,0 +1,266 @@
+// tests/engine.test.ts — 事务引擎核心单测（Saga 回滚 / 崩溃恢复 / dry-run / veto）
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import { createLockManager } from '../src/infra/lock-manager'
+import { createWal } from '../src/infra/wal'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createLogger } from '../src/infra/logger'
+import { createHookRegistry } from '../src/engine/hook-registry'
+import { ok } from '../src/contracts/base'
+import type { CleanOperation, CleanRequest, TxContext } from '../src/contracts/transaction'
+import type { ITransactionEngine } from '../src/contracts/transaction'
+
+let tmp: string
+let home: string
+
+beforeAll(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-test-'))
+  home = path.join(tmp, '.dsh')
+})
+afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
+
+const logger = createLogger({ sink: 'plain', minLevel: 'error' })
+
+function buildEngine(ops: (req: CleanRequest) => CleanOperation[]) {
+  const walRoot = path.join(home, '.nuke', 'tx')
+  const backupsRoot = path.join(home, '.nuke', 'backups')
+  const auditPath = path.join(home, '.nuke', 'audit', 'chain.jsonl')
+  return createTransactionEngine(
+    {
+      lockManager: createLockManager({ lockRoot: path.join(home, '.nuke') }),
+      wal: createWal({ walRoot }),
+      backups: createBackupStore({ backupRoot: backupsRoot }),
+      audit: createAuditLog({ filePath: auditPath }),
+      resolver: null as any,   // 引擎路径校验经由 operation 自身
+      logger,
+      hooks: createHookRegistry({ dir: path.join(home, '.nuke', 'hooks') }),
+      clock: { now: () => new Date() },
+      verifyConfirmationToken: (t) => t === 'VALID-TOKEN',
+    },
+    ops,
+  )
+}
+
+/** 解包 Result：非 ok 即抛错使测试失败（比 expect(r.ok).toBe(true) 多了类型收窄） */
+function okv<T>(r: { ok: true; value: T } | { ok: false; error: { message: string } }): T {
+  if (!r.ok) throw new Error(`expected ok, got: ${r.error.message}`)
+  return r.value
+}
+
+function request(overrides: Partial<CleanRequest> = {}): CleanRequest {
+  return {
+    plugins: ['victim-plugin' as any],
+    profile: 'web' as any,
+    strategy: 'safe',
+    dryRun: false,
+    actor: 'tester',
+    ...overrides,
+  }
+}
+
+// ── 测试用操作 ─────────────────────────────────────────────
+function opRemoveStorage(ctx0?: { dir?: string }): CleanOperation {
+  const dir = () => ctx0?.dir ?? path.join(home, 'storages', 'victim-plugin')
+  return {
+    id: 'op-remove-storage',
+    action: 'remove-storages',
+    target: 'victim-plugin' as any,
+    async preview() {
+      const exists = fs.existsSync(dir())
+      return {
+        summary: `删除 storages/victim-plugin`,
+        touchedPaths: [dir() as any],
+        estimatedBytesReclaimable: exists ? 1024 : 0,
+        requiresExclusiveLock: true,
+      }
+    },
+    async validate() { return ok(undefined) },
+    async execute(ctx: TxContext) {
+      if (!fs.existsSync(dir())) return ok({ outcome: { bytesFreed: 0, message: '跳过（不存在）' }, backup: null })
+      const stat = fs.statSync(dir())
+      const backup = await ctx.backups.stageDir(dir() as any)
+      return ok({ outcome: { bytesFreed: stat.size, message: '已移入回收区' }, backup })
+    },
+    async undo() { return ok(undefined) },   // restore 由引擎 manifest 统一执行
+  }
+}
+
+function opEditPatch(): CleanOperation {
+  const file = () => path.join(home, 'cordis.patch.yml')
+  return {
+    id: 'op-edit-patch',
+    action: 'clean-home-patch',
+    target: 'victim-plugin' as any,
+    async preview() {
+      return { summary: '清理 home patch 引用', touchedPaths: [file() as any], estimatedBytesReclaimable: 10, requiresExclusiveLock: true }
+    },
+    async validate() { return ok(undefined) },
+    async execute(ctx: TxContext) {
+      const original = fs.readFileSync(file(), 'utf-8')
+      const next = original.split('\n').filter(l => !l.includes('victim-plugin')).join('\n')
+      if (next === original) return ok({ outcome: { bytesFreed: 0, message: '无需变更' }, backup: null })
+      const backup = await ctx.backups.stageEdit(file() as any, next)
+      return ok({ outcome: { bytesFreed: 5, message: '已清理 patch' }, backup })
+    },
+    async undo() { return ok(undefined) },
+  }
+}
+
+function opFail(): CleanOperation {
+  return {
+    id: 'op-fail',
+    action: 'remove-attachments',
+    target: 'victim-plugin' as any,
+    async preview() { return { summary: '注定失败', touchedPaths: [], estimatedBytesReclaimable: 0, requiresExclusiveLock: true } },
+    async validate() { return ok(undefined) },
+    async execute() { return errFrom('E_IO', '模拟失败') },
+    async undo() { return ok(undefined) },
+  }
+}
+
+function errFrom(code: any, message: string): any {
+  return Promise.resolve({ ok: false as const, error: { code, message } })
+}
+
+function seedWorkspace() {
+  fs.rmSync(home, { recursive: true, force: true })
+  fs.mkdirSync(path.join(home, 'storages', 'victim-plugin'), { recursive: true })
+  fs.writeFileSync(path.join(home, 'storages', 'victim-plugin', 'data.bin'), 'x'.repeat(100))
+  fs.writeFileSync(path.join(home, 'cordis.patch.yml'), '- id: keep\n- id: victim-plugin\n')
+  fs.mkdirSync(path.join(home, '.nuke'), { recursive: true })
+}
+
+describe('事务引擎', () => {
+  it('commit 成功：目录入回收区 + patch 被清理 + WAL tx-commit', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => [opRemoveStorage(), opEditPatch()])
+    const session = await engine.begin(request())
+    expect(session.ok).toBe(true)
+    const plan = await engine.plan(okv(session))
+    expect(plan.ok).toBe(true)
+    const result = await engine.commit(okv(plan))
+    expect(result.ok).toBe(true)
+    if (result.ok) {
+      expect(result.value.state).toBe('committed')
+      expect(result.value.steps.length).toBe(2)
+      expect(fs.existsSync(path.join(home, 'storages', 'victim-plugin'))).toBe(false)
+      expect(fs.readFileSync(path.join(home, 'cordis.patch.yml'), 'utf-8')).not.toContain('victim-plugin')
+    }
+  })
+
+  it('失败自动回滚（Saga）：步骤 2 失败 → 步骤 1 恢复原状', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => [opRemoveStorage(), opEditPatch(), opFail()])
+    const session = await engine.begin(request())
+    const plan = await engine.plan(okv(session))
+    const result = await engine.commit(okv(plan))
+    expect(result.ok).toBe(false)
+
+    // 关键断言：无半清理脏数据 —— 目录回来了、patch 完整
+    expect(fs.existsSync(path.join(home, 'storages', 'victim-plugin', 'data.bin'))).toBe(true)
+    expect(fs.readFileSync(path.join(home, 'cordis.patch.yml'), 'utf-8')).toContain('victim-plugin')
+
+    const status = await engine.status(okv(session).txId)
+    expect(status?.state).toBe('rolled-back')
+  })
+
+  it('dry-run 零副作用', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => [opRemoveStorage(), opEditPatch()])
+    const session = await engine.begin(request({ dryRun: true }))
+    const plan = await engine.plan(okv(session))
+    const report = await engine.dryRun(okv(plan))
+    expect(report.ok).toBe(true)
+    if (report.ok) {
+      expect(report.value.plans.length).toBe(2)
+      expect(report.value.estimatedBytesReclaimable).toBeGreaterThan(0)
+    }
+    expect(fs.existsSync(path.join(home, 'storages', 'victim-plugin'))).toBe(true)
+    expect(fs.readFileSync(path.join(home, 'cordis.patch.yml'), 'utf-8')).toContain('victim-plugin')
+  })
+
+  it('aggressive 无令牌 → begin 拒绝', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => [opRemoveStorage()])
+    const r = await engine.begin(request({ strategy: 'aggressive' }))
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.code).toBe('E_VALIDATION')
+  })
+
+  it('aggressive 令牌无效 → plan 产生 blocking 警告，commit 拒绝', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => [opRemoveStorage()])
+    const session = await engine.begin(request({ strategy: 'aggressive', confirmationToken: 'BAD' }))
+    expect(session.ok).toBe(true)
+    const plan = await engine.plan(okv(session))
+    expect(plan.ok).toBe(true)
+    expect(okv(plan).warnings.some(w => w.blocking)).toBe(true)
+    const result = await engine.commit(okv(plan))
+    expect(result.ok).toBe(false)
+  })
+
+  it('pre 钩子 veto → 回滚', async () => {
+    seedWorkspace()
+    const engineRef: { current?: ITransactionEngine } = {}
+    const registry = createHookRegistry({ dir: path.join(home, '.nuke', 'hooks') })
+    registry.register({
+      id: 'guard',
+      timing: 'pre',
+      actions: '*',
+      priority: 0,
+      onFailure: 'best-effort',
+      handler: { type: 'inline', run: async () => ({ kind: 'veto' as const, reason: '外部策略禁止' }) },
+    })
+    // 用带 veto 的 registry 构建引擎
+    const walRoot = path.join(home, '.nuke', 'tx')
+    const engine = createTransactionEngine(
+      {
+        lockManager: createLockManager({ lockRoot: path.join(home, '.nuke2') }),
+        wal: createWal({ walRoot }),
+        backups: createBackupStore({ backupRoot: path.join(home, '.nuke', 'backups') }),
+        audit: createAuditLog({ filePath: path.join(home, '.nuke', 'audit', 'chain.jsonl') }),
+        resolver: null as any,
+        logger,
+        hooks: registry,
+        clock: { now: () => new Date() },
+        verifyConfirmationToken: () => true,
+      },
+      () => [opRemoveStorage()],
+    )
+    engineRef.current = engine
+
+    const session = await engine.begin(request())
+    const plan = await engine.plan(okv(session))
+    const result = await engine.commit(okv(plan))
+    expect(result.ok).toBe(false)
+    if (!result.ok) expect(result.error.code).toBe('E_HOOK_VETO')
+    expect(fs.existsSync(path.join(home, 'storages', 'victim-plugin', 'data.bin'))).toBe(true)
+  })
+
+  it('崩溃恢复：模拟半执行事务 → recover() 恢复原状', async () => {
+    seedWorkspace()
+    // 第一个引擎"崩溃"：begin + 部分执行后进程消失（不 commit，runtime 丢弃）
+    const engine1 = buildEngine(() => [opRemoveStorage()])
+    const session = await engine1.begin(request())
+    await engine1.plan(okv(session))
+    // 直接手工执行第一个操作（模拟执行到一半崩溃：WAL 只有 tx-begin + step-intent）
+    const wal = createWal({ walRoot: path.join(home, '.nuke', 'tx') })
+    await wal.append(okv(session).txId, { type: 'step-intent', index: 0, operationId: 'op-remove-storage', action: 'remove-storages', backup: null })
+    const area = await createBackupStore({ backupRoot: path.join(home, '.nuke', 'backups') }).reserve(okv(session).txId)
+    await area.stageDir(path.join(home, 'storages', 'victim-plugin') as any)  // 目录已被移走
+    expect(fs.existsSync(path.join(home, 'storages', 'victim-plugin'))).toBe(false)
+
+    // 新引擎实例（新进程）启动恢复
+    const engine2 = buildEngine(() => [opRemoveStorage()])
+    const recovery = await engine2.recover()
+    expect(recovery.ok).toBe(true)
+    expect(fs.existsSync(path.join(home, 'storages', 'victim-plugin', 'data.bin'))).toBe(true)
+
+    const status = await engine2.status(okv(session).txId)
+    expect(status?.state).toBe('rolled-back')
+  })
+})

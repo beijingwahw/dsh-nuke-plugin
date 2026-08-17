@@ -1,0 +1,536 @@
+// src/engine/transaction-engine.ts — ITransactionEngine 实现
+// ACID 落地：
+//   Atomic   任一步骤失败 → manifest 逆序 restore（Saga 反向补偿），WAL 记 tx-rollback
+//   Durable  WAL 每步 fdatasync；备份区 manifest.jsonl 独立于 WAL（双保险）
+//   Isolated 全程持有独占锁（withLock RAII，异常路径也释放）
+//   Consistent plan 阶段做依赖/令牌/路径校验，aggressive 无令牌拒绝进入 commit
+import * as crypto from 'crypto'
+import * as os from 'os'
+import type {
+  Clock, NukeError, Result, TxId,
+} from '../contracts/base'
+import { err, errorToMessage, ioError, ok } from '../contracts/base'
+import type {
+  BackupRecord, CleanOperation, CleanRequest, DryRunReport, IBackupStore,
+  ITransactionEngine, IWal, OperationPlan, PlanWarning, TxContext, TxPlan,
+  TxSession, TxState, TxSummary,
+} from '../contracts/transaction'
+import type { IAuditLog } from '../contracts/logging'
+import type { ILockManager, LockOwner } from '../contracts/lock'
+import type { IPathResolver } from '../contracts/paths'
+import type { ILogger } from '../contracts/logging'
+import type { IHookRegistry, HookContext } from '../contracts/hooks'
+
+export interface EngineDeps {
+  readonly lockManager: ILockManager
+  readonly wal: IWal
+  readonly backups: IBackupStore
+  readonly audit: IAuditLog
+  readonly resolver: IPathResolver
+  readonly logger: ILogger
+  readonly hooks: IHookRegistry
+  readonly clock: Clock
+  /** aggressive 策略的一次性确认令牌校验（令牌签发方在交互层） */
+  readonly verifyConfirmationToken?: (token: string, request: CleanRequest) => boolean
+}
+
+/** 状态机合法迁移表 */
+const TRANSITIONS: Record<TxState, readonly TxState[]> = {
+  draft: ['planned'],
+  planned: ['validating', 'draft'],
+  validating: ['executing', 'planned'],
+  executing: ['committing', 'rolling-back'],
+  committing: ['committed'],
+  'rolling-back': ['rolled-back', 'failed'],
+  committed: [], 'rolled-back': [], failed: [],
+}
+
+interface TxRuntime {
+  readonly txId: TxId
+  state: TxState
+  request: CleanRequest
+  steps: TxSummary['steps'][number][]
+  startedAt: string
+  finishedAt?: string
+  lockHandle: Awaited<ReturnType<ILockManager['acquire']>> extends Result<infer H, any> ? H : never
+  backupsArea: Awaited<ReturnType<IBackupStore['reserve']>>
+}
+
+export function createTransactionEngine(
+  deps: EngineDeps,
+  operationFactory: (request: CleanRequest) => CleanOperation[],
+): ITransactionEngine {
+  const runtimes = new Map<TxId, TxRuntime>()
+  /** 终结事务摘要缓存（commit/rollback 后仍可 status 查询；进程重启后回退 WAL 重建）。
+   *  LRU 上限：长驻进程中无限增长的 Map 是慢性内存泄漏；溢出逐最旧，
+   *  被逐条目仍可从 WAL 重建（status 的第三路径）。 */
+  const FINISHED_CACHE_MAX = 128
+  const finished = new Map<TxId, TxSummary>()
+  function rememberFinished(txId: TxId, summary: TxSummary): void {
+    // Map 迭代序 = 插入序：删除首个即逐最旧（写前删除使重写条目刷新热度）
+    if (finished.has(txId)) finished.delete(txId)
+    else if (finished.size >= FINISHED_CACHE_MAX) {
+      const oldest = finished.keys().next().value
+      if (oldest !== undefined) finished.delete(oldest)
+    }
+    finished.set(txId, summary)
+  }
+
+  function setState(rt: TxRuntime, next: TxState): Result<void, NukeError> {
+    if (!TRANSITIONS[rt.state].includes(next)) {
+      return err({
+        code: 'E_TX_STATE',
+        message: `非法状态迁移: ${rt.state} → ${next}（tx ${rt.txId}）`,
+      })
+    }
+    rt.state = next
+    return ok(undefined)
+  }
+
+  function makeCtxFromRt(rt: TxRuntime): TxContext {
+    return {
+      txId: rt.txId,
+      request: rt.request,
+      resolver: deps.resolver,
+      logger: deps.logger.child({ tx: rt.txId }),
+      clock: deps.clock,
+      backups: rt.backupsArea,
+    }
+  }
+
+  function hookCtx(txId: TxId, request: CleanRequest, op: CleanOperation, backup?: BackupRecord | null): HookContext {
+    return {
+      txId,
+      actor: request.actor,
+      plugin: op.target,
+      profile: request.profile,
+      strategy: request.strategy,
+      action: op.action,
+      ...(backup ? { backup } : {}),
+    }
+  }
+
+  /** Saga 反向补偿：manifest 逆序 restore（幂等），并逐 op 调 undo 做额外清理。
+   *  安全纪律：本函数自身绝不抛出 —— 它运行在 commit 的失败分支与 catch 块中，
+   *  一旦抛出会跳过外层的锁释放（独占锁悬挂 = 后续所有事务被阻塞直至 TTL）。 */
+  async function rollbackRuntime(rt: TxRuntime, reason: string): Promise<void> {
+    const move = setState(rt, 'rolling-back')
+    if (!move.ok) {
+      // 已处于终态（如 'failed'）的再次补偿：状态机拒绝迁移，但补偿动作仍需尽力执行
+      deps.logger.warn('回滚状态迁移被拒，继续执行补偿动作', { tx: rt.txId, state: rt.state })
+    }
+    const ctx = makeCtxFromRt(rt)
+    const records = rt.backupsArea.manifest()
+    for (const record of [...records].reverse()) {
+      try {
+        const r = await rt.backupsArea.restore(record)
+        if (!r.ok) deps.logger.error('回滚恢复失败', { path: record.originalPath, error: r.error.message })
+      } catch (e) {
+        deps.logger.error('回滚恢复异常', { path: record.originalPath, error: errorToMessage(e) })
+      }
+    }
+    // undo 钩子（非备份类清理，如 pnpm prune 无需恢复但可通知）
+    const executedOps = new Map(rt.steps.filter(s => s.status === 'done').map(s => [s.operationId, s.backup]))
+    for (const op of operationFactory(rt.request)) {
+      const backup = executedOps.get(op.id) ?? null
+      try {
+        const undo = await op.undo(ctx, backup)
+        if (!undo.ok) deps.logger.warn('op.undo 报告', { op: op.id, error: undo.error.message })
+      } catch (e) {
+        deps.logger.error('op.undo 异常', { op: op.id, error: errorToMessage(e) })
+      }
+      rt.steps = rt.steps.map(s => s.operationId === op.id && s.status === 'done' ? { ...s, status: 'undone' } : s)
+    }
+    try {
+      await deps.wal.append(ctx.txId, { type: 'tx-rollback', txId: ctx.txId, reason })
+    } catch (e) {
+      deps.logger.error('回滚 WAL 追加失败（事务将保持可恢复状态）', { tx: ctx.txId, error: errorToMessage(e) })
+    }
+    rt.finishedAt = deps.clock.now().toISOString()
+    setState(rt, rt.state === 'rolling-back' ? 'rolled-back' : 'failed')
+    try {
+      await deps.audit.append({
+        timestamp: rt.finishedAt, actor: rt.request.actor, action: 'tx-rollback',
+        txId: ctx.txId, outcome: 'failure',
+        detail: { reason, undone: records.length },
+      })
+    } catch (e) {
+      deps.logger.error('回滚审计追加失败', { tx: ctx.txId, error: errorToMessage(e) })
+    }
+  }
+
+  /** 事务终结收尾：摘要入缓存 → 释放独占锁 → 移除运行时。
+   *  commit/rollback 的所有终态路径（成功/补偿失败/逃逸异常）都必须经过这里，
+   *  否则锁悬挂会阻塞后续全部清理事务。 */
+  async function finalize(rt: TxRuntime): Promise<void> {
+    rememberFinished(rt.txId, summarize(rt, rt.txId))
+    await rt.lockHandle.release()
+    runtimes.delete(rt.txId)
+  }
+
+  function summarize(rt: TxRuntime, txId: TxId): TxSummary {
+    return {
+      txId,
+      state: rt.state,
+      steps: rt.steps,
+      bytesFreedTotal: rt.steps.reduce((sum, s) => sum + (s.bytesFreed || 0), 0),
+      startedAt: rt.startedAt,
+      ...(rt.finishedAt ? { finishedAt: rt.finishedAt } : {}),
+    }
+  }
+
+  /** WAL 重建路径的 startedAt：显式定位 tx-begin，不依赖 query 的返回顺序 */
+  async function startedAtFromAudit(txId: TxId): Promise<string> {
+    try {
+      const entries = await deps.audit.query({ txId })
+      return entries.find(e => e.action === 'tx-begin')?.timestamp ?? entries[0]?.timestamp ?? ''
+    } catch {
+      return ''
+    }
+  }
+
+  return {
+    async begin(request) {
+      // 输入校验由调用层完成；此处只做策略-令牌前置检查
+      if (request.strategy === 'aggressive' && !request.confirmationToken) {
+        return err({
+          code: 'E_VALIDATION',
+          message: 'aggressive 策略必须携带 confirmationToken（二次确认）',
+        })
+      }
+      const owner: LockOwner = {
+        pid: process.pid,
+        hostname: os.hostname(),
+        bootToken: crypto.randomBytes(8).toString('hex'),
+        purpose: 'clean',
+      }
+      const acquired = await deps.lockManager.acquire({
+        scope: { kind: 'global' }, mode: 'exclusive', owner, waitTimeoutMs: 5000, ttlMs: 300_000,
+      })
+      if (!acquired.ok) return err(acquired.error)
+
+      const txId = crypto.randomBytes(8).toString('hex') as TxId
+      let backupsArea: Awaited<ReturnType<IBackupStore['reserve']>>
+      try {
+        backupsArea = await deps.backups.reserve(txId)
+      } catch (e) {
+        // 锁已持有：reserve 失败必须先释放，否则独占锁悬挂阻塞后续全部事务
+        await acquired.value.release()
+        return err(ioError('备份区预留失败', e))
+      }
+      const rt: TxRuntime = {
+        txId,
+        state: 'draft',
+        request,
+        steps: [],
+        startedAt: deps.clock.now().toISOString(),
+        lockHandle: acquired.value,
+        backupsArea,
+      }
+      runtimes.set(txId, rt)
+
+      await deps.wal.append(txId, { type: 'tx-begin', txId, request })
+      await deps.audit.append({
+        timestamp: rt.startedAt, actor: request.actor, action: 'tx-begin',
+        txId, outcome: 'success',
+        detail: { plugins: request.plugins, profile: request.profile, strategy: request.strategy, dryRun: request.dryRun },
+      })
+      const session: TxSession = { txId, lockId: acquired.value.id, request }
+      return ok(session)
+    },
+
+    async plan(session) {
+      const rt = runtimes.get(session.txId)
+      if (!rt) return err({ code: 'E_TX_NOT_FOUND', message: `事务不存在: ${session.txId}` })
+      const st = setState(rt, 'planned')
+      if (!st.ok) return err(st.error)
+
+      const ctx = makeCtxFromRt(rt)
+      const ops = operationFactory(rt.request)
+      const warnings: PlanWarning[] = []
+
+      // aggressive 令牌校验（blocking）
+      if (rt.request.strategy === 'aggressive') {
+        const token = rt.request.confirmationToken ?? ''
+        const valid = deps.verifyConfirmationToken
+          ? deps.verifyConfirmationToken(token, rt.request)
+          : false   // fail-closed：未注入校验器时一律拒绝，绝不退化为长度检查
+        if (!valid) {
+          warnings.push({
+            code: 'CONFIRMATION_TOKEN_INVALID', blocking: true,
+            message: 'aggressive 策略确认令牌无效，commit 被阻止',
+          })
+        }
+      }
+
+      let total = 0
+      for (const op of ops) {
+        const p = await op.preview(ctx)
+        total += p.estimatedBytesReclaimable
+      }
+
+      const plan: TxPlan = {
+        txId: session.txId,
+        operations: ops,
+        estimatedBytesReclaimable: total,
+        warnings,
+        requiresConfirmationToken: rt.request.strategy === 'aggressive',
+      }
+      return ok(plan)
+    },
+
+    async dryRun(plan) {
+      const rt = runtimes.get(plan.txId)
+      if (!rt) return err({ code: 'E_TX_NOT_FOUND', message: `事务不存在: ${plan.txId}` })
+      const ctx = makeCtxFromRt(rt)
+      const reports: { operation: OperationPlan; summary: string }[] = []
+      let total = 0
+      for (const op of plan.operations) {
+        const p = await op.preview(ctx)   // 零副作用
+        total += p.estimatedBytesReclaimable
+        reports.push({ operation: p, summary: p.summary })
+      }
+      const report: DryRunReport = {
+        txId: plan.txId,
+        plans: reports,
+        estimatedBytesReclaimable: total,
+        warnings: plan.warnings,
+      }
+      await deps.audit.append({
+        timestamp: deps.clock.now().toISOString(), actor: rt.request.actor, action: 'dry-run',
+        txId: plan.txId, outcome: 'success',
+        detail: { operations: reports.length, estimatedBytes: total },
+      })
+      return ok(report)
+    },
+
+    async commit(plan) {
+      const rt = runtimes.get(plan.txId)
+      if (!rt) return err({ code: 'E_TX_NOT_FOUND', message: `事务不存在: ${plan.txId}` })
+
+      // aggressive 令牌复验：plan 可能由外部构造，其 warnings 字段不可信。
+      // 此处以 begin 时登记的 request 为准重新校验，堵死"伪造 plan 跳过令牌"的路径。
+      if (rt.request.strategy === 'aggressive') {
+        const tokenOk = deps.verifyConfirmationToken && rt.request.confirmationToken !== undefined
+          ? deps.verifyConfirmationToken(rt.request.confirmationToken, rt.request)
+          : false
+        if (!tokenOk) {
+          return err({
+            code: 'E_VALIDATION',
+            message: 'aggressive 策略确认令牌无效，commit 被拒绝（令牌复验失败）',
+          })
+        }
+      }
+
+      // blocking 警告闸门
+      const blocking = plan.warnings.find(w => w.blocking)
+      if (blocking) {
+        return err({ code: 'E_VALIDATION', message: `计划存在阻断性警告: ${blocking.message}` })
+      }
+
+      let st = setState(rt, 'validating')
+      if (!st.ok) return err(st.error)
+      const ctx = makeCtxFromRt(rt)
+      const txId = plan.txId
+
+      // 全程兜底：任何逃逸异常（wal.append/钩子/状态机之外的 IO）都必须终结事务，
+      // 否则独占锁悬挂直至 TTL，阻塞后续所有清理。
+      try {
+        // 全量前置校验
+        for (const op of plan.operations) {
+          const v = await op.validate(ctx)
+          if (!v.ok) {
+            await rollbackRuntime(rt, `validate 失败: ${op.id}: ${v.error.message}`)
+            await finalize(rt)
+            return err(v.error)
+          }
+        }
+
+        st = setState(rt, 'executing')
+        if (!st.ok) return err(st.error)
+
+        for (const [index, op] of plan.operations.entries()) {
+          rt.steps.push({ index, operationId: op.id, action: op.action, status: 'pending', bytesFreed: 0, backup: null })
+          await deps.wal.append(txId, { type: 'step-intent', index, operationId: op.id, action: op.action, backup: null })
+
+          // pre 钩子（可 veto）
+          const pre = await deps.hooks.emit('pre', hookCtx(txId, rt.request, op))
+          if (pre.ok && pre.value.verdict.kind === 'veto') {
+            rt.steps[index] = { ...rt.steps[index]!, status: 'skipped' }
+            await rollbackRuntime(rt, `pre 钩子否决: ${pre.value.verdict.reason}`)
+            await finalize(rt)
+            return err({ code: 'E_HOOK_VETO', message: `钩子否决: ${pre.value.verdict.reason}` })
+          }
+
+          try {
+            const executed = await op.execute(ctx)
+            if (!executed.ok) {
+              rt.steps[index] = { ...rt.steps[index]!, status: 'failed', backup: null }
+              await deps.wal.append(txId, { type: 'step-failed', index, error: executed.error })
+              // error 钩子可建议处置
+              const errHook = await deps.hooks.emit('error', {
+                ...hookCtx(txId, rt.request, op), error: executed.error,
+              })
+              const directive = errHook.ok ? errHook.value.errorDirective : null
+              if (directive === 'skip-and-continue') {
+                rt.steps[index] = { ...rt.steps[index]!, status: 'skipped' }
+                continue
+              }
+              await rollbackRuntime(rt, `步骤 ${index}(${op.id}) 失败: ${executed.error.message}`)
+              await finalize(rt)
+              return err(executed.error)
+            }
+            const { outcome, backup } = executed.value
+            rt.steps[index] = {
+              ...rt.steps[index]!, status: 'done', bytesFreed: outcome.bytesFreed, backup,
+            }
+            await deps.wal.append(txId, { type: 'step-done', index, operationId: op.id, outcome, backup })
+            await deps.hooks.emit('post', hookCtx(txId, rt.request, op, backup))
+          } catch (e) {
+            await rollbackRuntime(rt, `步骤 ${index}(${op.id}) 异常: ${errorToMessage(e)}`)
+            await finalize(rt)
+            return err(ioError('事务执行失败', e))
+          }
+        }
+
+        st = setState(rt, 'committing')
+        if (!st.ok) return err(st.error)
+        await deps.wal.append(txId, { type: 'tx-commit', txId })
+        rt.finishedAt = deps.clock.now().toISOString()
+        setState(rt, 'committed')
+        await deps.audit.append({
+          timestamp: rt.finishedAt, actor: rt.request.actor, action: 'tx-commit',
+          txId, outcome: 'success',
+          detail: {
+            steps: rt.steps.length,
+            bytesFreed: rt.steps.reduce((s, x) => s + x.bytesFreed, 0),
+          },
+        })
+        // 释放锁：事务终结
+        await finalize(rt)
+        return ok(summarize(rt, txId))
+      } catch (e) {
+        // rollbackRuntime 已保证不抛；此处兜住其余一切逃逸（WAL/审计/钩子 IO）
+        try { await rollbackRuntime(rt, `commit 逃逸异常: ${errorToMessage(e)}`) } catch { /* 不可达 */ }
+        await finalize(rt)
+        return err(ioError('事务执行失败', e))
+      }
+    },
+
+    async rollback(txId) {
+      const rt = runtimes.get(txId)
+      if (!rt) return err({ code: 'E_TX_NOT_FOUND', message: `事务不存在: ${txId}` })
+      if (rt.state === 'committed' || rt.state === 'rolled-back') {
+        return err({ code: 'E_TX_STATE', message: `事务已终结（${rt.state}），无法回滚` })
+      }
+      try {
+        await rollbackRuntime(rt, '手动回滚')
+      } finally {
+        await finalize(rt)
+      }
+      return ok(summarize(rt, txId))
+    },
+
+    async recover() {
+      const recovered: TxSummary[] = []
+      for (const txId of deps.wal.unfinishedTxIds()) {
+        if (runtimes.has(txId)) continue   // 活跃事务跳过
+        // 单事务隔离：一个事务的 IO 异常不中断其余事务的恢复
+        try {
+          // 步骤清单从 WAL step-intent 重建（含 operationId 与 action）
+          const records = await deps.wal.replay(txId)
+          const intents = records.filter(
+            (r): r is Extract<typeof r, { type: 'step-intent' }> => r.type === 'step-intent',
+          )
+          // 从备份区 manifest 逆序恢复（崩溃时备份依据不依赖内存）
+          const area = await deps.backups.reserve(txId)
+          const manifest = area.manifest()
+          let restoreFailures = 0
+          for (const record of [...manifest].reverse()) {
+            try {
+              const r = await area.restore(record)
+              if (!r.ok) restoreFailures++
+            } catch {
+              restoreFailures++
+            }
+          }
+          if (restoreFailures > 0 || area.orphanArtifacts() > 0) {
+            // 关键安全纪律：restore 未全部成功、或备份区存在 manifest 未覆盖的
+            // 崩溃残留产物时绝不 purge —— 这些产物可能是数据唯一完整副本
+            // （stageDir 已把原位移走），purge 即永久丢失。同时不写
+            // tx-rollback，保持事务"未终结"，下次 recover 自动重试。
+            deps.logger.error('崩溃恢复存在失败项/孤儿产物：备份保留待人工核查/下次重试', {
+              txId, failures: restoreFailures, orphans: area.orphanArtifacts(), total: manifest.length,
+            })
+            recovered.push({
+              txId, state: 'failed',
+              steps: intents.map(r => ({
+                index: r.index, operationId: r.operationId, action: r.action,
+                status: 'undone' as const, bytesFreed: 0, backup: null,
+              })),
+              bytesFreedTotal: 0,
+              startedAt: await startedAtFromAudit(txId),
+            })
+            continue
+          }
+          await deps.wal.append(txId, { type: 'tx-rollback', txId, reason: 'crash-recovery' })
+          await area.purge(txId)
+          const summary: TxSummary = {
+            txId,
+            state: 'rolled-back',
+            steps: intents.map(r => ({
+              index: r.index, operationId: r.operationId, action: r.action,
+              status: 'undone' as const, bytesFreed: 0, backup: null,
+            })),
+            bytesFreedTotal: 0,
+            startedAt: await startedAtFromAudit(txId),
+          }
+          recovered.push(summary)
+          deps.logger.info('崩溃恢复完成', { txId, restored: manifest.length })
+        } catch (e) {
+          deps.logger.error('崩溃恢复事务异常，跳过', { txId, error: errorToMessage(e) })
+        }
+      }
+      return ok(recovered)
+    },
+
+    async status(txId) {
+      const rt = runtimes.get(txId)
+      if (rt) return summarize(rt, txId)
+      const cached = finished.get(txId)
+      if (cached) {
+        // 读刷新热度（真 LRU 语义）：删除重插 = 移到 MRU 端
+        finished.delete(txId)
+        finished.set(txId, cached)
+        return cached
+      }
+      // 进程重启后的终结事务：从 WAL 重建（尽力而为）
+      const records = await deps.wal.replay(txId)
+      if (records.length === 0) return null
+      const begin = records.find(r => r.type === 'tx-begin')
+      if (!begin || begin.type !== 'tx-begin') return null
+      // step-done 记录不含 action：以 step-intent 的 action 按 index 关联回填，
+      // 否则所有步骤都会被误报为 standard-remove
+      const actionByIndex = new Map<number, string>()
+      for (const r of records) {
+        if (r.type === 'step-intent') actionByIndex.set(r.index, r.action)
+      }
+      const steps = records
+        .filter((r): r is Extract<typeof r, { type: 'step-done' }> => r.type === 'step-done')
+        .map(r => ({
+          index: r.index, operationId: r.operationId,
+          action: (actionByIndex.get(r.index) ?? 'standard-remove') as 'standard-remove',
+          status: 'done' as const, bytesFreed: r.outcome.bytesFreed, backup: r.backup,
+        }))
+      const state: TxState = records.some(r => r.type === 'tx-commit') ? 'committed'
+        : records.some(r => r.type === 'tx-rollback') ? 'rolled-back' : 'failed'
+      return {
+        txId,
+        state,
+        steps,
+        bytesFreedTotal: steps.reduce((s, x) => s + x.bytesFreed, 0),
+        startedAt: await startedAtFromAudit(txId),
+      }
+    },
+  }
+}

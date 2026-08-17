@@ -1,0 +1,128 @@
+// src/operations/edit-ops.ts — 配置引用清理（workspace yaml / profile patch / home patch）
+// 命令模式：preview 零副作用；execute 先 stageEdit 留快照再写新内容（fsync）；
+// undo = BackupArea.restore（yaml-edit 记录含 originalContent，幂等）。
+import * as fs from 'fs'
+import * as path from 'path'
+import type { AbsolutePath, NukeError, PluginName, Result } from '../contracts/base'
+import { err, ioError, ok } from '../contracts/base'
+import type {
+  CleanOperation, ExecutedStep, OperationPlan, TxContext,
+} from '../contracts/transaction'
+import type { PathPolicy } from '../contracts/paths'
+import { removePluginFromYaml } from './yaml-edit'
+import { existsSafe } from '../infra/fs-utils'
+
+export interface EditOpSpec {
+  readonly id: string
+  readonly action: 'clean-workspace-yaml' | 'clean-profile-patch' | 'clean-home-patch'
+  readonly target: PluginName
+  /** 相对 dshHome 的文件定位函数 */
+  fileOf(ctx: TxContext): string
+  readonly description: string
+  readonly policy: PathPolicy
+}
+
+export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
+  return {
+    id: `${spec.id}:${spec.target}`,
+    action: spec.action,
+    target: spec.target,
+
+    async preview(ctx: TxContext): Promise<OperationPlan> {
+      const file = spec.fileOf(ctx)
+      if (!existsSafe(file)) {
+        return {
+          summary: `${spec.description}: 文件不存在，跳过（${file}）`,
+          touchedPaths: [], estimatedBytesReclaimable: 0, requiresExclusiveLock: false,
+        }
+      }
+      const content = fs.readFileSync(file, 'utf-8')
+      const next = removePluginFromYaml(content, spec.target)
+      const touched = next === null ? [] : [file as AbsolutePath]
+      return {
+        summary: next === null
+          ? `${spec.description}: 未发现 ${spec.target} 的引用，跳过`
+          : `${spec.description}: 摘除 ${spec.target} 引用（${(content.length - next!.length)} 字符）`,
+        touchedPaths: touched,
+        estimatedBytesReclaimable: 0,   // 配置编辑不回收磁盘空间
+        requiresExclusiveLock: false,
+      }
+    },
+
+    async validate(ctx: TxContext): Promise<Result<void, NukeError>> {
+      // 路径策略先于存在性检查：即使文件不存在，越白名单的目标也必须拒绝（纵深防御）
+      const file = spec.fileOf(ctx)
+      const check = await ctx.resolver.assertDeletable(file, spec.policy)
+      if (!check.ok) return check
+      return ok(undefined)
+    },
+
+    async execute(ctx: TxContext): Promise<Result<ExecutedStep, NukeError>> {
+      const file = spec.fileOf(ctx)
+      if (!existsSafe(file)) {
+        return ok({ outcome: { bytesFreed: 0, message: '文件不存在，跳过' }, backup: null })
+      }
+      const content = fs.readFileSync(file, 'utf-8')
+      const next = removePluginFromYaml(content, spec.target)
+      if (next === null) {
+        return ok({ outcome: { bytesFreed: 0, message: '未发现引用，跳过' }, backup: null })
+      }
+      try {
+        const backup = await ctx.backups.stageEdit(file as AbsolutePath, next)
+        return ok({
+          outcome: { bytesFreed: 0, message: `${spec.description}: 已摘除 ${spec.target} 引用` },
+          backup,
+        })
+      } catch (e) {
+        return err(ioError(`${spec.description} 失败`, e))
+      }
+    },
+
+    async undo(ctx: TxContext, record): Promise<Result<void, NukeError>> {
+      if (!record) return ok(undefined)
+      return ctx.backups.restore(record)
+    },
+  }
+}
+
+/** 三个配置清理操作的标准策略 */
+export function configPolicies(profile: string): {
+  profileScoped: PathPolicy
+  homePatch: PathPolicy
+} {
+  const deny = ['**/@deepseek-ai/dsh-base*', '**/.nuke/**']
+  return {
+    profileScoped: {
+      allowedRoots: [{ kind: 'profile-dir', profile }],
+      denyGlobs: deny, strictWindows: true,
+    },
+    homePatch: {
+      allowedRoots: [{ kind: 'dsh-home-patch' }],
+      denyGlobs: deny, strictWindows: true,
+    },
+  }
+}
+
+/** 便捷构造：单插件的三个配置编辑操作 */
+export function configEditOps(
+  target: PluginName, profile: string, dshHomeOf: (ctx: TxContext) => string,
+): CleanOperation[] {
+  const p = configPolicies(profile)
+  return [
+    makeConfigEditOp({
+      id: 'op-clean-workspace-yaml', action: 'clean-workspace-yaml', target,
+      fileOf: ctx => path.join(dshHomeOf(ctx), 'profiles', profile, 'pnpm-workspace.yaml'),
+      description: '清理 pnpm-workspace.yaml', policy: p.profileScoped,
+    }),
+    makeConfigEditOp({
+      id: 'op-clean-profile-patch', action: 'clean-profile-patch', target,
+      fileOf: ctx => path.join(dshHomeOf(ctx), 'profiles', profile, 'cordis.patch.yml'),
+      description: '清理 profile patch', policy: p.profileScoped,
+    }),
+    makeConfigEditOp({
+      id: 'op-clean-home-patch', action: 'clean-home-patch', target,
+      fileOf: ctx => path.join(dshHomeOf(ctx), 'cordis.patch.yml'),
+      description: '清理 home patch', policy: p.homePatch,
+    }),
+  ]
+}
