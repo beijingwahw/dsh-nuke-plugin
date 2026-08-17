@@ -143,11 +143,36 @@ interface ToolDefinition {
   name: string
   description: string
   parameters: Record<string, unknown>
+  output: ToolOutput
   execute: (args: Record<string, unknown>) => Promise<{ content: string }>
+}
+
+/** dsh-tools 契约：工具必须声明 output { schema, render, presentationMeta? }。
+ *  execute 返回值先经 schema 校验（JSON Schema 子集），再由 render(args, value)
+ *  投影为展示内容。本插件 19 个工具统一 shape：{ content: string }（纯文本），
+ *  契约集中声明一次，由 registerTool 注入 —— 避免逐个注册重复 19 份。 */
+interface ToolOutput {
+  schema: Record<string, unknown>
+  render: (args: Record<string, unknown>, value: { content: string }) => string
 }
 
 interface ToolHost {
   tools: { register(tool: ToolDefinition): unknown }
+}
+
+const TOOL_OUTPUT: ToolOutput = {
+  schema: {
+    type: 'object',
+    properties: { content: { type: 'string' } },
+    required: ['content'],
+  },
+  render: (_args, value) => value.content,
+}
+
+/** 统一注册入口：注入 output 契约后转发给宿主 */
+function registerTool(ctx: ToolHost, tool: Omit<ToolDefinition, 'output'>): void {
+  const def: ToolDefinition = { ...tool, output: TOOL_OUTPUT }
+  ctx.tools.register(def)
 }
 
 export function apply(ctx: ToolHost) {
@@ -174,7 +199,7 @@ export function apply(ctx: ToolHost) {
   }
 
   // ── nuke_list ────────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_list',
     description: '列出指定 profile 下所有已安装的第三方插件',
     parameters: {
@@ -198,7 +223,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_scan ────────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_scan',
     description: '扫描插件残留（配置引用/目录/TEMP），带四因子严重程度评分与可回收空间统计。省略 plugin_name 进入全局模式',
     parameters: {
@@ -254,7 +279,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_deps ────────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_deps',
     description: '依赖关系检测：哪些插件/profile 声明引用了目标插件（删除前必查）',
     parameters: {
@@ -296,7 +321,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_orphans ─────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_orphans',
     description: '全局孤儿扫描：node_modules 未声明包 / 无主 storages-attachments / TEMP 过期条目',
     parameters: {
@@ -333,7 +358,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_health ──────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_health',
     description: '系统健康检查：config/dependency/runtime/residue 四组检查，输出健康度评分与阻断项',
     parameters: {
@@ -358,7 +383,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_strategies ──────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_strategies',
     description: '查看三级清理策略（safe/balanced/aggressive）及其动作集',
     parameters: { type: 'object', properties: {} },
@@ -375,7 +400,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_clean（核心） ───────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_clean',
     description: '事务化强力卸载：健康检查闸门 → 健康度阻断拒绝 → begin(独占锁) → plan(依赖/令牌校验) → [dry_run 预演 | commit 原子执行]。失败自动 Saga 回滚，全程审计',
     parameters: {
@@ -562,7 +587,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_status ──────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_status',
     description: '查询事务状态（活跃/已终结，含步骤明细与回收统计）',
     parameters: {
@@ -589,7 +614,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_recover ─────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_recover',
     description: '崩溃恢复：扫描未终结事务的 WAL，反向补偿恢复到执行前状态',
     parameters: { type: 'object', properties: {} },
@@ -604,7 +629,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_verify ──────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_verify',
     description: '审计链完整性校验（hash chain 任何篡改均可定位）',
     parameters: { type: 'object', properties: {} },
@@ -616,7 +641,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_doctor ──────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_doctor',
     description: '一键全科体检：健康检查+残留扫描+孤儿检测+四因子评分 → 优先级处方（P1 立即/P2 建议/P3 可选）与建议清理策略',
     parameters: {
@@ -653,7 +678,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_dedup ───────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_dedup',
     description: '内容寻址去重：三级瀑布（尺寸分桶→头尾采样→全量 SHA-256）定位重复文件群；apply=true 时以硬链接实收（verify-then-link，需确认令牌）',
     parameters: {
@@ -740,7 +765,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_restorepoint ────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_restorepoint',
     description: '配置还原点管理：清理前自动快照关键配置，事故后一键恢复（list / create / restore / prune）',
     parameters: {
@@ -792,7 +817,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_blastradius ─────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_blastradius',
     description: '爆炸半径沙盘推演（what-if）：删除前预测传递闭包波及面 —— 谁会损坏、谁可级联、风险几级、如何降险。零副作用',
     parameters: {
@@ -837,7 +862,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_trend ───────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_trend',
     description: '历史趋势分析：可回收空间变化率（字节/天）、30 天线性外推、3σ 异常检测（插件失控写盘早期信号）',
     parameters: {
@@ -878,7 +903,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_policy ──────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_policy',
     description: '查看当前清理策略守卫配置（保护名单/批量上限/回收上限/磁盘下限/时间黑窗）。策略文件: <dshHome>/.nuke/policy.json',
     parameters: { type: 'object', properties: {} },
@@ -896,7 +921,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_guardian ────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_guardian',
     description: '守卫者巡检：一键主动运维 —— 磁盘写满倒计时/趋势异常/健康阻断/可回收积压/崩溃残留事务，输出带行动建议的分级告警',
     parameters: {
@@ -932,7 +957,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_forecast ────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_forecast',
     description: '磁盘写满预测：趋势回归 × 实时余量 → 写满倒计时（daysUntilFull）、30 天走势与分级建议',
     parameters: { type: 'object', properties: {} },
@@ -961,7 +986,7 @@ export function apply(ctx: ToolHost) {
   })
 
   // ── nuke_ledger ──────────────────────────────────────────
-  ctx.tools.register({
+  registerTool(ctx, {
     name: 'nuke_ledger',
     description: '空间台账：每字节回收可溯源 —— 按动作/profile/日聚合，已回收(freed)与待回收(pending)双轨统计',
     parameters: {
