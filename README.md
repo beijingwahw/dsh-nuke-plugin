@@ -8,11 +8,8 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-把"删除插件残留"这件危险的事，做成一套**可验证、可撤销、可审计**的事务系统。
+把"删除插件并清理残留"这件危险的事，做成一套**可验证、可撤销、可审计**的事务系统。
 
-```
-删除不是 rm -rf，是一次 ACID 事务。
-```
 
 ## 为什么需要它
 
