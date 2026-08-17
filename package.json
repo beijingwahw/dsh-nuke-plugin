@@ -21,6 +21,7 @@
   ],
   "scripts": {
     "build": "tsdown src/index.ts --format cjs --out-dir lib",
+    "dev": "node --expose-internals --import tsx ./node_modules/@deepseek-ai/cordis/bin.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
@@ -35,8 +36,14 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "latest",
+    "@deepseek-ai/cordis-plugin-hmr": "^1.0.16",
+    "@deepseek-ai/cordis-plugin-include": "^1.0.6",
+    "@deepseek-ai/cordis-plugin-loader": "^1.0.2",
+    "@deepseek-ai/cordis-plugin-logger-console": "^1.0.1",
+    "@deepseek-ai/cordis-plugin-timer": "^1.1.3",
     "@types/node": "^24.13.3",
     "tsdown": "^0.12.0",
+    "tsx": "^4.23.12",
     "typescript": "^5.9.3",
     "vitest": "^3.2.7"
   }
