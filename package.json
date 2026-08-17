@@ -21,7 +21,6 @@
   ],
   "scripts": {
     "build": "tsdown src/index.ts --format cjs --out-dir lib",
-    "prepare": "tsdown src/index.ts --format cjs --out-dir lib",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"
