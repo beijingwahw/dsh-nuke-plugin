@@ -22,6 +22,17 @@ dsh 的一切皆插件 —— 但插件的装卸会在 `.dsh/`、Nuke 目录、�
 | 并发清理打架 | 跨进程读写锁（O_EXCL + bootToken 归属核验 + guard 目录互斥） |
 | 不知道能删多少 | 四因子评分 + 趋势回归 + 磁盘写满预测，先预演后执行 |
 
+## 安装
+
+```bash
+# --profile 指定目标 profile（小写字母/数字/连字符；插件内工具默认按 web 操作）
+dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
+```
+
+安装后直接对话即可，例如：
+
+> 帮我扫描一下 web profile 的插件残留，先预演不要真删
+
 ## 安全纪律（设计原则）
 
 1. **fail-closed** — 校验器/健康检查自身失败时同样拒绝操作，绝不"查不到就放行"
@@ -78,16 +89,6 @@ dsh 的一切皆插件 —— 但插件的装卸会在 `.dsh/`、Nuke 目录、�
 | `nuke_doctor` | 一键全科体检：健康 + 残留 + 孤儿 + 评分 → P1/P2/P3 优先级处方 |
 | `nuke_guardian` | 守卫者巡检：磁盘倒计时 / 趋势异常 / 未终结事务 → 带建议的分级告警 |
 | `nuke_ledger` | 空间台账：每字节回收可溯源，按动作/profile/日聚合，freed/pending 双轨 |
-
-## 安装
-
-```bash
-dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
-```
-
-安装后直接对话即可，例如：
-
-> 帮我扫描一下 web profile 的插件残留，先预演不要真删
 
 ## 典型工作流
 
