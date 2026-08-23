@@ -3,9 +3,9 @@
 //   斜率 ≤0（在净回收）或样本 <2 → 倒计时不可预测（null）
 //   statfs 不可用（如沙箱无权限）→ 仅输出趋势侧结论
 // 保守原则：趋势异常时下调一档严重度（数据被污染时不给乐观结论）。
-import * as fs from 'fs'
 import type { Clock } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
+import { statfsBytes } from '../infra/fs-utils'
 import type { ITrendTracker } from '../contracts/trend.contract'
 import type { DiskForecast, ForecastSeverity, IDiskForecaster } from '../contracts/disk-forecast.contract'
 
@@ -22,14 +22,7 @@ const DAY_MS = 86_400_000
 export function createDiskForecaster(options: DiskForecasterOptions): IDiskForecaster {
   function sample(): { free: number; total: number } | null {
     if (options.sampleDisk) return options.sampleDisk(options.diskRoot)
-    try {
-      const st = (fs as any).statfsSync?.(options.diskRoot)
-      if (!st) return null
-      return {
-        free: Number(st.bsize) * Number(st.bavail),
-        total: Number(st.bsize) * Number(st.blocks),
-      }
-    } catch { return null }
+    return statfsBytes(options.diskRoot)
   }
 
   return {

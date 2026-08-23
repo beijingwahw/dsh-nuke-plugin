@@ -10,12 +10,10 @@
 //   selfWeight = (s_a+f_a)/(s_a+f_a+κ) —— 收缩系数（可解释）
 // κ 是先验强度：动作观测数 << κ 时几乎完全借力全局，>> κ 时自信。
 import type { IAuditLog } from '../contracts/logging'
+import { OP_AUDIT_PREFIX } from '../contracts/logging'
 import type {
   ActionReliability, CalibrationSummary, IReliabilityModel,
 } from '../contracts/reliability.contract'
-
-/** 步骤级审计条目的 action 前缀（引擎写入） */
-export const OP_AUDIT_PREFIX = 'op:'
 
 export interface ReliabilityModelOptions {
   readonly audit: IAuditLog

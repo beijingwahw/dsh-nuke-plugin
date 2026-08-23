@@ -42,7 +42,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
       return {
         summary: next === null
           ? `${spec.description}: 未发现 ${spec.target} 的引用，跳过`
-          : `${spec.description}: 摘除 ${spec.target} 引用（${(content.length - next!.length)} 字符）`,
+          : `${spec.description}: 摘除 ${spec.target} 引用（${content.length - next.length} 字符）`,
         touchedPaths: touched,
         estimatedBytesReclaimable: 0,   // 配置编辑不回收磁盘空间
         requiresExclusiveLock: false,

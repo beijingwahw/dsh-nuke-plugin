@@ -7,6 +7,7 @@
 import * as fs from 'fs'
 import type { NukeError, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
+import { statfsBytes } from './fs-utils'
 import type { HookDefinition } from '../contracts/hooks'
 import type {
   CleanPolicy, IPolicyGuard, PolicyCheckRequest, PolicyViolation,
@@ -36,10 +37,7 @@ export function createPolicyGuard(options: PolicyGuardOptions): IPolicyGuard {
 
   function freeBytes(root: string): number | null {
     if (options.freeBytesOf) return options.freeBytesOf(root)
-    try {
-      const st = (fs as any).statfsSync?.(root)   // Node ≥18.15；不可用时跳过该规则
-      return st ? Number(st.bsize) * Number(st.bavail) : null
-    } catch { return null }
+    return statfsBytes(root)?.free ?? null   // 不可用时跳过该规则（fail-soft）
   }
 
   function load(): CleanPolicy {

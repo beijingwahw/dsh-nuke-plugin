@@ -30,10 +30,17 @@ export interface ILogger {
 }
 
 // ─── 不可变审计日志（hash chain） ──────────────────────────
+
+/** 步骤级审计条目的 action 前缀（`op:<CleanAction>`）。
+ *  写方（事务引擎 auditStep）与读方（可靠性模型）共同依赖此契约常量 ——
+ *  前缀若在任一侧被硬编码改写，统计将静默失明（零样本 → 退化为先验），
+ *  故必须收敛到契约层单一事实源。 */
+export const OP_AUDIT_PREFIX = 'op:'
+
 export interface AuditEntry {
   readonly timestamp: string
   readonly actor: string            // 操作人：CLI 用户 / tool 调用者
-  readonly action: string           // 'tx-begin' | 'step-execute' | 'tx-rollback' | ...
+  readonly action: string           // 'tx-begin' | 'dry-run' | 'tx-commit' | 'tx-rollback' | `${OP_AUDIT_PREFIX}${action}` | ...
   readonly txId?: TxId
   readonly outcome: 'success' | 'failure' | 'skipped'
   readonly detail: Readonly<Record<string, unknown>>

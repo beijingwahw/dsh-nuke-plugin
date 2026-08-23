@@ -38,10 +38,17 @@ import { createReliabilityModel } from './infra/reliability'
 import { createOracle } from './engine/oracle'
 import { createDrill } from './engine/drill'
 import { makeOperationFactory, STRATEGY_ACTIONS } from './operations'
-import type { PluginName, ProfileName, TxId } from './contracts/base'
-import { errorToMessage } from './contracts/base'
-import type { ResidualEvidence } from './contracts/scoring'
+import type { CleanStrategy, PluginName, ProfileName, TxId } from './contracts/base'
+import { errorToMessage, fmtBytes } from './contracts/base'
+import type { ResidualEvidence, SeverityBand } from './contracts/scoring'
 import type { ITransactionEngine } from './contracts/transaction'
+import type { DoctorPriority, DoctorVerdict } from './contracts/doctor.contract'
+import type { OracleConfidence } from './contracts/oracle.contract'
+import type { RiskLevel } from './contracts/blast-radius.contract'
+import type { ForecastSeverity } from './contracts/disk-forecast.contract'
+import type { AlertSeverity } from './contracts/guardian.contract'
+import type { TrendTrigger } from './contracts/trend.contract'
+import { LEDGER_GLOBAL } from './contracts/ledger.contract'
 
 export const name = 'dsh-nuke-plugin'
 export const inject = ['tools']
@@ -147,15 +154,10 @@ function buildRuntime() {
 type Runtime = ReturnType<typeof buildRuntime>
 
 // ─── 出参格式化 ─────────────────────────────────────────────
+// fmtBytes 统一导入自契约层（全项目唯一实现，见 contracts/base.ts）
 
-function fmtBytes(n: number): string {
-  if (n < 1024) return `${n}B`
-  if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)}KB`
-  if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)}MB`
-  return `${(n / 1024 ** 3).toFixed(2)}GB`
-}
-
-const BAND_ICON: Record<string, string> = {
+/** 图标映射键一律用契约联合类型：拼错键或缺键在编译期即失败 */
+const BAND_ICON: Record<SeverityBand, string> = {
   info: '·', low: '🟢', medium: '🟡', high: '🟠', critical: '🔴',
 }
 
@@ -163,8 +165,8 @@ const BAND_ICON: Record<string, string> = {
 
 /** dsh-tools 契约：execute 返回 canonical value，先经 output.schema 校验，
  *  再由 render(args, value) 投影为 ContentBlock 数组。
- *  本插件 19 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
- *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 19 份。 */
+ *  本插件 21 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
+ *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 21 份。 */
 const TEXT_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -377,7 +379,7 @@ export function apply(ctx: Context) {
       if (!cp.ok) return { content: `❌ ${cp.error}` }
       const r = await rt.health.inspect(cp.profile)
       if (!r.ok) return { content: `❌ ${r.error.message}` }
-      const icon = (passed: boolean, severity: string) =>
+      const icon = (passed: boolean, severity: 'info' | 'warning' | 'critical') =>
         passed ? '✅' : severity === 'critical' ? '🔴' : severity === 'warning' ? '🟡' : '❌'
       const lines = [
         `🏥 健康度 ${r.value.score}/100  ${r.value.blocking ? '🔴 存在阻断项（critical 失败，清理事务将被拒绝）' : '🟢 无阻断'}`,
@@ -395,13 +397,13 @@ export function apply(ctx: Context) {
     description: '查看三级清理策略（safe/balanced/aggressive）及其动作集',
     parameters: {},
     execute: async () => {
-      const desc: Record<string, string> = {
+      const desc: Record<CleanStrategy, string> = {
         safe: '仅标准卸载 + 配置引用摘除，不动任何目录（生产安全）',
         balanced: 'safe + 物理回收 node_modules/storages/attachments（推荐）',
         aggressive: 'balanced + pnpm store prune + TEMP 孤儿清理（需确认令牌）',
       }
-      const lines = Object.entries(STRATEGY_ACTIONS).map(([s, actions]) =>
-        `🛡️ ${s}\n  ${desc[s]}\n  动作: ${actions.join(', ')}`)
+      const lines = (Object.keys(STRATEGY_ACTIONS) as CleanStrategy[]).map(s =>
+        `🛡️ ${s}\n  ${desc[s]}\n  动作: ${STRATEGY_ACTIONS[s].join(', ')}`)
       return { content: `可用清理策略：\n\n${lines.join('\n\n')}\n\naggressive 二次确认令牌格式: CONFIRM:<profile>:<逗号排序插件清单>` }
     },
   }))
@@ -431,7 +433,7 @@ export function apply(ctx: Context) {
       const o = r.value
 
       const pct = (n: number) => `${(n * 100).toFixed(1)}%`
-      const confIcon: Record<string, string> = { high: '🟢', medium: '🟡', low: '🔴' }
+      const confIcon: Record<OracleConfidence, string> = { high: '🟢', medium: '🟡', low: '🔴' }
       const lines = [
         `🔮 先知推演 @ ${new Date().toISOString()}`,
         `   插件: ${cp.plugins.join(', ')}  |  profile: ${cprof.profile}  |  策略: ${strategy}`,
@@ -733,8 +735,8 @@ export function apply(ctx: Context) {
       const r = await rt.doctor.diagnose(cp.profile)
       if (!r.ok) return { content: `❌ ${r.error.message}` }
       const d = r.value
-      const verdictIcon: Record<string, string> = { healthy: '✅', attention: '🟡', critical: '🔴' }
-      const priorityLabel: Record<number, string> = { 1: '🔴 P1 立即', 2: '🟠 P2 建议', 3: '🟢 P3 可选' }
+      const verdictIcon: Record<DoctorVerdict, string> = { healthy: '✅', attention: '🟡', critical: '🔴' }
+      const priorityLabel: Record<DoctorPriority, string> = { 1: '🔴 P1 立即', 2: '🟠 P2 建议', 3: '🟢 P3 可选' }
       const lines = [
         `🩺 体检报告 [${cp.profile}]  ${verdictIcon[d.verdict] ?? '·'} ${d.verdict}`,
         `   健康度 ${d.healthScore}/100${d.blocking ? '  ⛔ 存在阻断项（清理事务将被拒绝）' : ''}`,
@@ -788,7 +790,7 @@ export function apply(ctx: Context) {
       // 的 return 之后，apply=true 时永远不会被记录，双轨断裂。
       await rt.ledger.record({
         at: new Date().toISOString(), kind: 'pending', txId: null,
-        profile: '*' as any, plugin: null, action: 'dedup-potential',
+        profile: LEDGER_GLOBAL, plugin: null, action: 'dedup-potential',
         bytes: d.totalReclaimableBytes, note: `${d.groups.length} 组重复内容`,
       })
 
@@ -800,7 +802,7 @@ export function apply(ctx: Context) {
         // 台账：此处记实际 freed（诚实值：仅独占 inode 的副本）
         await rt.ledger.record({
           at: new Date().toISOString(), kind: 'freed', txId: null,
-          profile: '*' as any, plugin: null, action: 'dedup-hardlink',
+          profile: LEDGER_GLOBAL, plugin: null, action: 'dedup-hardlink',
           bytes: e.bytesSaved, note: `${e.linkedFiles} 个副本硬链接化 / ${e.skipped.length} 跳过`,
         })
         const lines = [
@@ -907,7 +909,7 @@ export function apply(ctx: Context) {
       const r = await rt.blastRadius.simulate(cp.plugins, prof)
       if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
       const b = r.value
-      const levelIcon: Record<string, string> = { low: '🟢', medium: '🟡', high: '🟠', extreme: '🔴' }
+      const levelIcon: Record<RiskLevel, string> = { low: '🟢', medium: '🟡', high: '🟠', extreme: '🔴' }
       const lines = [
         `💥 爆炸半径推演  ${levelIcon[b.riskLevel]} ${b.riskLevel.toUpperCase()}（风险分 ${b.riskScore}/100）`,
         `   目标: ${b.targets.join(', ')}`,
@@ -960,7 +962,7 @@ export function apply(ctx: Context) {
         lines.push('   ✅ 无异常突变')
       }
       if (t.latest) {
-        const trig: Record<string, string> = { scan: '扫描', clean: '清理', doctor: '体检' }
+        const trig: Record<TrendTrigger, string> = { scan: '扫描', clean: '清理', doctor: '体检' }
         lines.push(`   最新快照: ${trig[t.latest.trigger] ?? t.latest.trigger} @ ${t.latest.at}，可回收 ${fmtBytes(t.latest.bytesReclaimable)}`)
       }
       return { content: lines.join('\n') }
@@ -998,7 +1000,7 @@ export function apply(ctx: Context) {
       const r = await rt.guardian.patrol({ profile: cp.profile })
       if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
       const g = r.value
-      const sevIcon: Record<string, string> = { critical: '🔴', warning: '🟡', info: 'ℹ️' }
+      const sevIcon: Record<AlertSeverity, string> = { critical: '🔴', warning: '🟡', info: 'ℹ️' }
       const lines = [`🛡️ 守卫者巡检 @ ${g.patrolledAt}`]
       if (g.disk && g.disk.usedPct !== null) {
         lines.push(`   磁盘: 已用 ${g.disk.usedPct}%` +
@@ -1029,7 +1031,7 @@ export function apply(ctx: Context) {
       const r = await rt.forecaster.forecast()
       if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
       const f = r.value
-      const sevIcon: Record<string, string> = { ok: '🟢', watch: '🟡', warning: '🟠', critical: '🔴' }
+      const sevIcon: Record<ForecastSeverity, string> = { ok: '🟢', watch: '🟡', warning: '🟠', critical: '🔴' }
       const lines = [`🔮 磁盘预测 @ ${f.sampledAt}  ${sevIcon[f.severity]} ${f.severity}`]
       if (f.totalBytes !== null && f.freeBytes !== null) {
         lines.push(`   容量 ${fmtBytes(f.totalBytes)} | 余量 ${fmtBytes(f.freeBytes)} | 已用 ${f.usedPct}%`)

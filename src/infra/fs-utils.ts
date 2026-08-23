@@ -31,6 +31,20 @@ export function existsSafe(p: string): boolean {
   try { return fs.existsSync(p) } catch { return false }
 }
 
+/** statfs 磁盘采样（Node ≥18.15）：free = bsize×bavail，total = bsize×blocks。
+ *  旧 Node（API 缺失抛 TypeError）/ 无权限 / 路径不存在 → null（fail-soft，
+ *  调用方按"磁盘信息不可用"降级，绝不阻断主流程）。全项目唯一实现。 */
+export function statfsBytes(root: string): { free: number; total: number } | null {
+  try {
+    const st = fs.statfsSync(root)
+    if (!st) return null
+    return {
+      free: Number(st.bsize) * Number(st.bavail),
+      total: Number(st.bsize) * Number(st.blocks),
+    }
+  } catch { return null }
+}
+
 /** 进程崩溃安全的唯一临时文件名：同进程并发不撞车 */
 function tmpName(dst: string): string {
   return `${dst}.tmp-${process.pid}-${crypto.randomBytes(3).toString('hex')}`

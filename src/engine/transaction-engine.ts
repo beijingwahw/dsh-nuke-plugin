@@ -16,6 +16,7 @@ import type {
   TxSession, TxState, TxSummary,
 } from '../contracts/transaction'
 import type { IAuditLog } from '../contracts/logging'
+import { OP_AUDIT_PREFIX } from '../contracts/logging'
 import type { ILockManager, LockOwner } from '../contracts/lock'
 import type { IPathResolver } from '../contracts/paths'
 import type { ILogger } from '../contracts/logging'
@@ -197,7 +198,8 @@ export function createTransactionEngine(
     }
   }
 
-  /** 步骤审计（可靠性模型的数据源）：action 前缀 op: 区分于事务级条目。
+  /** 步骤审计（可靠性模型的数据源）：action 前缀 OP_AUDIT_PREFIX（契约
+   *  单一事实源，读方 reliability.ts 同源导入）区分于事务级条目。
    *  detail 携带 estimated/actual/ratio —— 每一次清理都在训练下一次预测。
    *  审计失败只记日志不阻断事务：统计飞轮是增强能力，不是关键路径。 */
   async function auditStep(
@@ -208,7 +210,7 @@ export function createTransactionEngine(
       await deps.audit.append({
         timestamp: deps.clock.now().toISOString(),
         actor: rt.request.actor,
-        action: `op:${op.action}`,
+        action: `${OP_AUDIT_PREFIX}${op.action}`,
         txId: rt.txId,
         outcome,
         detail,

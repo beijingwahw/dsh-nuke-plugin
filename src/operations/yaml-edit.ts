@@ -16,7 +16,8 @@ export function removePluginFromYaml(content: string, plugin: string): string | 
   let touched = false
 
   for (const line of lines) {
-    const indent = line.match(/^(\s*)/)![1]!.length
+    // 缩进 = 前导空白长度（与 /^(\s*)/ 匹配等价，免正则免断言）
+    const indent = line.length - line.trimStart().length
 
     // 处于列表项摘除中：属性行（更深缩进）继续摘，直到缩进回落
     if (dropDeeperThan !== null) {
@@ -27,7 +28,7 @@ export function removePluginFromYaml(content: string, plugin: string): string | 
 
     const mId = line.match(listItemRe)
     if (mId) {
-      dropDeeperThan = mId[1]!.length
+      dropDeeperThan = mId[1]?.length ?? 0
       keep.push({ line, drop: true })
       touched = true
       continue
