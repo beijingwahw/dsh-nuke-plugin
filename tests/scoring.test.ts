@@ -6,7 +6,7 @@ const NOW = new Date('2026-08-16T00:00:00Z')
 
 const scorer = createSeverityScorer({ now: () => NOW })
 
-describe('SeverityScorer — 四因子加权评分', () => {
+describe('SeverityScorer — 五因子加权评分', () => {
   it('总分落在 [0,100]，breakdown 权重求和 = 配置权重和', () => {
     const s = scorer.score(evidence({
       location: '/home/u/.dsh/storages/foo', kind: 'storage',

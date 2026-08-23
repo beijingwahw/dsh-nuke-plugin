@@ -1,6 +1,6 @@
 // contracts/doctor.contract.ts — NukeDoctor 一键体检编排器
 // 世界级清理引擎的"全科医生"：一次调用编排 健康检查 + 残留扫描 +
-// 孤儿检测 + 四因子评分，输出带优先级排序的可执行处方。
+// 孤儿检测 + 五因子评分，输出带优先级排序的可执行处方。
 // 设计约束：纯编排层，不直接碰磁盘/事务 —— 所有感知能力来自注入的四个组件。
 
 import type { CleanStrategy, NukeError, ProfileName, Result } from './base'

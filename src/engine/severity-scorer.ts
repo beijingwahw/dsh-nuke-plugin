@@ -1,4 +1,4 @@
-// src/engine/severity-scorer.ts — ISeverityScorer 实现：四因子加权评分（可解释）
+// src/engine/severity-scorer.ts — ISeverityScorer 实现：五因子加权评分（可解释）
 // 模型：total = clamp(100 × Σ(weight_i × raw_i) / Σweight_i) ∈ [0,100]
 // 每个因子返回 raw 值、权重、贡献度与人类可读注释，UI 可展开"为什么是这个分"。
 import type { PluginName } from '../contracts/base'

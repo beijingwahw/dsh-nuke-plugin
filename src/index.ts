@@ -2,9 +2,12 @@
 // 架构：contracts/（接口） → infra/（基建）+ engine/（引擎）+ operations/（命令）
 // 本文件只做两件事：
 //   1. 组装运行时（依赖注入，全部组件可替换、可测试）
-//   2. 注册 19 个工具（薄适配层：校验入参 → 调用组件 → 格式化出参）
+//   2. 注册 21 个工具（薄适配层：校验入参 → 调用组件 → 格式化出参）
 import * as fs from 'fs'
 import * as path from 'path'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { InferArgs, ParameterSchemaSpec, ToolDefinition } from '@deepseek-ai/dsh-tools'
+import type { Context } from '@deepseek-ai/cordis'
 import { createLogger } from './infra/logger'
 import { createValidator } from './infra/validator'
 import { createPathResolver } from './infra/path-resolver'
@@ -31,6 +34,9 @@ import { createPolicyGuard } from './infra/policy-guard'
 import { createDiskForecaster } from './engine/disk-forecaster'
 import { createGuardian } from './engine/guardian'
 import { createLedger } from './infra/ledger'
+import { createReliabilityModel } from './infra/reliability'
+import { createOracle } from './engine/oracle'
+import { createDrill } from './engine/drill'
 import { makeOperationFactory, STRATEGY_ACTIONS } from './operations'
 import type { PluginName, ProfileName, TxId } from './contracts/base'
 import { errorToMessage } from './contracts/base'
@@ -60,6 +66,13 @@ function buildRuntime() {
   const confirmationTokenOf = (profile: string, plugins: readonly string[]) =>
     `CONFIRM:${profile}:${[...plugins].sort().join(',')}`
 
+  // 操作集编译器：引擎与先知共享同一份（推演与执行严格同构）
+  const operationFactory = makeOperationFactory({
+    validator,
+    tempRoot: platform.tempRoot,
+    tempTtlDays: 7,
+  })
+
   const engine: ITransactionEngine = createTransactionEngine(
     {
       lockManager, wal, backups, audit, resolver, logger, hooks,
@@ -67,11 +80,7 @@ function buildRuntime() {
       verifyConfirmationToken: (token, req) =>
         token === confirmationTokenOf(req.profile, req.plugins),
     },
-    makeOperationFactory({
-      validator,
-      tempRoot: platform.tempRoot,
-      tempTtlDays: 7,
-    }),
+    operationFactory,
   )
 
   const scorer = createSeverityScorer()
@@ -111,6 +120,18 @@ function buildRuntime() {
   // 策略守卫第二层：pre-hook veto（绕过工具层直连引擎也逃不掉保护名单）
   hooks.register(policy.asPreHook())
 
+  // 先知引擎：每次推演从审计链重建可靠性模型（数据飞轮 —— 上一次
+  // 清理刚积累的样本立即参与下一次预测）
+  const oracle = createOracle({
+    reliability: () => createReliabilityModel({ audit }),
+    operationFactory,
+    resolver, logger, clock: { now: () => new Date() },
+    blastRadius, forecaster,
+  })
+
+  // 混沌演习：沙箱内注入真实崩溃，持续证明崩溃可恢复性
+  const drill = createDrill({ nukeRoot })
+
   return {
     resolver, platform, nukeRoot, logger, validator,
     engine, wal, audit,
@@ -118,6 +139,7 @@ function buildRuntime() {
     doctor, dedup, dedupExec, restorePoints, reporter,
     blastRadius, trend, policy,
     forecaster, guardian, ledger,
+    oracle, drill,
     confirmationTokenOf,
   }
 }
@@ -137,80 +159,68 @@ const BAND_ICON: Record<string, string> = {
   info: '·', low: '🟢', medium: '🟡', high: '🟠', critical: '🔴',
 }
 
-// ─── 工具注册（薄适配层） ───────────────────────────────────
+// ─── 工具注册（薄适配层，官方 defineTool DSL） ──────────────
 
-interface ToolDefinition {
-  name: string
-  description: string
-  parameters: Record<string, unknown>
-  output: ToolOutput
-  execute: (args: Record<string, unknown>) => Promise<{ content: string }>
-}
-
-/** dsh-tools 契约：工具必须声明 output { schema, render, presentationMeta? }。
- *  execute 返回值先经 schema 校验（JSON Schema 子集），再由 render(args, value)
- *  投影为 ContentBlock 数组（官方类型：render(args, value): ContentBlock[]）。
+/** dsh-tools 契约：execute 返回 canonical value，先经 output.schema 校验，
+ *  再由 render(args, value) 投影为 ContentBlock 数组。
  *  本插件 19 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
- *  契约集中声明一次，由 registerTool 注入 —— 避免逐个注册重复 19 份。 */
-interface ContentBlock {
-  type: 'text'
-  text: string
+ *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 19 份。 */
+const TEXT_OUTPUT_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { content: { type: 'string', required: true } },
+} as const
+
+/** 统一定义入口：注入共享 output 契约后交给官方 defineTool。
+ *  参数用 ParameterSchemaSpec DSL 声明 —— 框架完成 JSON Schema 编译、
+ *  运行时参数校验（类型/enum/required）与 InferArgs 类型推导；DSL 表达
+ *  不了的领域约束（插件名白名单、txId 格式、数值下限）仍在 execute 内
+ *  手工检查（fail loudly，返回 ❌ 文本或抛 ToolArgsError 由宿主物化）。 */
+function defineTextTool<const S extends ParameterSchemaSpec>(tool: {
+  readonly name: string
+  readonly description: string
+  readonly parameters: S
+  execute(args: InferArgs<S>): Promise<{ content: string }>
+}): ToolDefinition {
+  return defineTool({
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.parameters,
+    output: {
+      schema: TEXT_OUTPUT_SCHEMA,
+      render: (_args, value) => [{ type: 'text', text: value.content }],
+    },
+    async execute(args) {
+      return tool.execute(args)
+    },
+  })
 }
 
-interface ToolOutput {
-  schema: Record<string, unknown>
-  render: (args: Record<string, unknown>, value: { content: string }) => ContentBlock[]
-}
-
-interface ToolHost {
-  tools: { register(tool: ToolDefinition): unknown }
-}
-
-const TOOL_OUTPUT: ToolOutput = {
-  schema: {
-    type: 'object',
-    properties: { content: { type: 'string' } },
-    required: ['content'],
-  },
-  render: (_args, value) => [{ type: 'text', text: value.content }],
-}
-
-/** 统一注册入口：注入 output 契约后转发给宿主 */
-function registerTool(ctx: ToolHost, tool: Omit<ToolDefinition, 'output'>): void {
-  const def: ToolDefinition = { ...tool, output: TOOL_OUTPUT }
-  ctx.tools.register(def)
-}
-
-export function apply(ctx: ToolHost) {
+export function apply(ctx: Context) {
   const rt: Runtime = buildRuntime()
 
-  /** 入参校验：插件名列表 */
-  function checkPlugins(names: unknown): { ok: true; plugins: PluginName[] } | { ok: false; error: string } {
-    if (!Array.isArray(names) || names.length === 0) return { ok: false, error: '请提供 plugin_names 数组（至少一个）' }
+  /** 入参校验：插件名列表（元素类型已由 defineTool 保证为 string，这里做领域白名单） */
+  function checkPlugins(names: readonly string[]): { ok: true; plugins: PluginName[] } | { ok: false; error: string } {
+    if (names.length === 0) return { ok: false, error: '请提供 plugin_names 数组（至少一个）' }
     for (const n of names) {
-      const r = rt.validator.validatePluginName(String(n))
+      const r = rt.validator.validatePluginName(n)
       if (!r.ok) return { ok: false, error: `插件名 "${n}" 非法: ${r.error.map(v => v.detail).join('; ')}` }
     }
-    return { ok: true, plugins: names.map(String) as PluginName[] }
+    return { ok: true, plugins: names as PluginName[] }
   }
 
-  function checkProfile(p: unknown): { ok: true; profile: ProfileName } | { ok: false; error: string } {
-    const r = rt.validator.validateProfileName(String(p))
+  function checkProfile(p: string): { ok: true; profile: ProfileName } | { ok: false; error: string } {
+    const r = rt.validator.validateProfileName(p)
     if (!r.ok) return { ok: false, error: `profile "${p}" 非法: ${r.error.map(v => v.detail).join('; ')}` }
-    return { ok: true, profile: String(p) as ProfileName }
-  }
-
-  function checkStrategy(s: unknown): 'safe' | 'balanced' | 'aggressive' | null {
-    return s === 'safe' || s === 'balanced' || s === 'aggressive' ? s : null
+    return { ok: true, profile: p as ProfileName }
   }
 
   // ── nuke_list ────────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_list',
     description: '列出指定 profile 下所有已安装的第三方插件',
     parameters: {
-      type: 'object',
-      properties: { profile: { type: 'string', description: '默认 "web"' } },
+      profile: { type: 'string', description: '默认 "web"' },
     },
     execute: async ({ profile = 'web' }) => {
       const cp = checkProfile(profile)
@@ -226,30 +236,26 @@ export function apply(ctx: ToolHost) {
         return { content: `❌ 无法读取 ${pkgPath}（profile 不存在？）` }
       }
     },
-  })
+  }))
 
   // ── nuke_scan ────────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_scan',
-    description: '扫描插件残留（配置引用/目录/TEMP），带四因子严重程度评分与可回收空间统计。省略 plugin_name 进入全局模式',
+    description: '扫描插件残留（配置引用/目录/TEMP），带五因子严重程度评分与可回收空间统计。省略 plugin_name 进入全局模式',
     parameters: {
-      type: 'object',
-      properties: {
-        plugin_name: { type: 'string', description: '插件名（省略 = 全 profile 全插件全局扫描）' },
-        profile: { type: 'string', description: '默认 "web"' },
-        include_temp: { type: 'boolean', description: '是否扫描 TEMP（仅 aggressive 生效），默认 false' },
-      },
+      plugin_name: { type: 'string', description: '插件名（省略 = 全 profile 全插件全局扫描）' },
+      profile: { type: 'string', description: '默认 "web"' },
+      include_temp: { type: 'boolean', description: '是否扫描 TEMP（仅 aggressive 生效），默认 false' },
     },
     execute: async ({ plugin_name, profile = 'web', include_temp = false }) => {
       const cp = checkProfile(profile)
       if (!cp.ok) return { content: `❌ ${cp.error}` }
-      // 先归一再校验再使用：杜绝"校验 String(x)、传入原始 x"的类型混淆
+      // 领域校验：npm 包名规范（DSL 只保证 string 类型，保证不了格式）
       let plugin: PluginName | undefined
       if (plugin_name !== undefined) {
-        const name = String(plugin_name)
-        const cn = rt.validator.validatePluginName(name)
+        const cn = rt.validator.validatePluginName(plugin_name)
         if (!cn.ok) return { content: `❌ 插件名非法: ${cn.error.map(v => v.detail).join('; ')}` }
-        plugin = name as PluginName
+        plugin = plugin_name as PluginName
       }
       const evidences: ResidualEvidence[] = []
       let bytesReclaimable = 0
@@ -257,7 +263,7 @@ export function apply(ctx: ToolHost) {
         ...(plugin !== undefined ? { plugin } : {}),
         profile: cp.profile,
         strategy: include_temp ? 'aggressive' : 'safe',
-        includeTemp: !!include_temp,
+        includeTemp: include_temp,
       })) {
         if (ev.type === 'found') { evidences.push(ev.evidence); bytesReclaimable += ev.evidence.sizeBytes }
       }
@@ -279,22 +285,18 @@ export function apply(ctx: ToolHost) {
         `     📍 ${e.location}  💾 ${fmtBytes(e.sizeBytes)}` +
         (e.referencedBy.length > 0 ? `  ⚠️ 仍被引用: ${e.referencedBy.join(', ')}` : '  ✅ 孤儿（无引用）'))
       return {
-        content: `⚠️ 发现 ${evidences.length} 处残留，可回收 ${fmtBytes(bytesReclaimable)}：\n${lines.join('\n')}\n\n评分说明: 四因子加权（类型×访问衰减×层级×引用态），≥60 需人工确认后再清理。`,
+        content: `⚠️ 发现 ${evidences.length} 处残留，可回收 ${fmtBytes(bytesReclaimable)}：\n${lines.join('\n')}\n\n评分说明: 五因子加权（类型×访问衰减×层级×引用态×体量），≥60 需人工确认后再清理。`,
       }
     },
-  })
+  }))
 
   // ── nuke_deps ────────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_deps',
     description: '依赖关系检测：哪些插件/profile 声明引用了目标插件（删除前必查）',
     parameters: {
-      type: 'object',
-      properties: {
-        plugin_names: { type: 'array', items: { type: 'string' } },
-        profile: { type: 'string', description: '限定单 profile 分析（省略 = 全 profile）' },
-      },
-      required: ['plugin_names'],
+      plugin_names: { type: 'array', items: { type: 'string' }, required: true, description: '要检测的插件名列表' },
+      profile: { type: 'string', description: '限定单 profile 分析（省略 = 全 profile）' },
     },
     execute: async ({ plugin_names, profile }) => {
       const cp = checkPlugins(plugin_names)
@@ -324,22 +326,22 @@ export function apply(ctx: ToolHost) {
       if (g.value.hasCycle()) lines.push('', `⚠️ 检测到依赖环: ${g.value.cycles().map(c => c.join(' → ')).join('; ')}`)
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_orphans ─────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_orphans',
     description: '全局孤儿扫描：node_modules 未声明包 / 无主 storages-attachments / TEMP 过期条目',
     parameters: {
-      type: 'object',
-      properties: { temp_max_age_days: { type: 'number', description: 'TEMP 条目过期天数，默认 7' } },
+      temp_max_age_days: { type: 'number', description: 'TEMP 条目过期天数，默认 7（须 ≥1）' },
     },
     execute: async ({ temp_max_age_days = 7 }) => {
-      // 下限校验：0/负数会让全部 TEMP 条目（含刚写入的）被判为孤儿
-      const ageDays = Number(temp_max_age_days)
-      if (!Number.isFinite(ageDays) || ageDays < 1) {
+      // 下限校验（领域规则，DSL 无数值下限）：0/负数会让全部 TEMP 条目
+      //（含刚写入的）被判为孤儿；number 类型已由 DSL 保证
+      if (temp_max_age_days < 1) {
         return { content: '❌ temp_max_age_days 必须为 ≥1 的数字（防止把刚写入的临时文件判为孤儿）' }
       }
+      const ageDays = temp_max_age_days
       const r = await rt.orphans.detect({ tempMaxAgeDays: ageDays })
       if (!r.ok) return { content: `❌ ${r.error.message}` }
       const { orphanPluginDirs, orphanDataDirs, tempOrphans, totalReclaimableBytes } = r.value
@@ -361,15 +363,14 @@ export function apply(ctx: ToolHost) {
       }
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_health ──────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_health',
     description: '系统健康检查：config/dependency/runtime/residue 四组检查，输出健康度评分与阻断项',
     parameters: {
-      type: 'object',
-      properties: { profile: { type: 'string', description: '默认 "web"' } },
+      profile: { type: 'string', description: '默认 "web"' },
     },
     execute: async ({ profile = 'web' }) => {
       const cp = checkProfile(profile)
@@ -386,13 +387,13 @@ export function apply(ctx: ToolHost) {
       ]
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_strategies ──────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_strategies',
     description: '查看三级清理策略（safe/balanced/aggressive）及其动作集',
-    parameters: { type: 'object', properties: {} },
+    parameters: {},
     execute: async () => {
       const desc: Record<string, string> = {
         safe: '仅标准卸载 + 配置引用摘除，不动任何目录（生产安全）',
@@ -403,46 +404,121 @@ export function apply(ctx: ToolHost) {
         `🛡️ ${s}\n  ${desc[s]}\n  动作: ${actions.join(', ')}`)
       return { content: `可用清理策略：\n\n${lines.join('\n\n')}\n\naggressive 二次确认令牌格式: CONFIRM:<profile>:<逗号排序插件清单>` }
     },
-  })
+  }))
 
-  // ── nuke_clean（核心） ───────────────────────────────────
-  registerTool(ctx, {
-    name: 'nuke_clean',
-    description: '事务化强力卸载：健康检查闸门 → 健康度阻断拒绝 → begin(独占锁) → plan(依赖/令牌校验) → [dry_run 预演 | commit 原子执行]。失败自动 Saga 回滚，全程审计',
+  // ── nuke_oracle（先知引擎：后果推演） ─────────────────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_oracle',
+    description: '先知推演：dry-run 说"我打算做什么"，先知说"做了会怎样"——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长。基于历史执行数据（贝叶斯学习），零副作用不拿锁。建议清理前先问先知',
     parameters: {
-      type: 'object',
-      properties: {
-        plugin_names: { type: 'array', items: { type: 'string' }, description: '要卸载的插件名列表' },
-        plugin_name: { type: 'string', description: '单个插件名（plugin_names 简写）' },
-        profile: { type: 'string', description: '默认 "web"' },
-        strategy: { type: 'string', description: 'safe / balanced / aggressive，默认 balanced' },
-        dry_run: { type: 'boolean', description: '仅预演，默认 false' },
-        confirmation_token: { type: 'string', description: 'aggressive 必填：CONFIRM:<profile>:<插件清单>' },
-        skip_health: { type: 'boolean', description: '跳过健康检查闸门，默认 false' },
-        report_format: { type: 'string', description: '报告格式 json / markdown / both / none，默认 markdown' },
-        actor: { type: 'string', description: '操作人标识（写入审计日志），默认 nuke-tool' },
-      },
+      plugin_names: { type: 'array', items: { type: 'string' }, description: '要推演的插件名列表' },
+      plugin_name: { type: 'string', description: '单个插件名（plugin_names 简写）' },
+      profile: { type: 'string', description: '默认 "web"' },
+      strategy: { type: 'string', enum: ['safe', 'balanced', 'aggressive'], description: '推演所用策略，默认 balanced' },
     },
     execute: async (args) => {
-      const a: Record<string, unknown> = args ?? {}
-      const {
-        profile = 'web', strategy = 'balanced', dry_run = false,
-        skip_health = false, report_format = 'markdown', actor = 'nuke-tool',
-      } = a
-      // report_format 显式白名单（当前 fail-safe，但意图应明确）
-      const fmt = String(report_format)
-      if (!['json', 'markdown', 'both', 'none'].includes(fmt)) {
-        return { content: '❌ report_format 仅支持 json / markdown / both / none' }
-      }
-      const names: string[] = Array.isArray(a.plugin_names)
-        ? a.plugin_names.map(String)
-        : typeof a.plugin_name === 'string' && a.plugin_name ? [a.plugin_name] : []
+      const { profile = 'web', strategy = 'balanced', plugin_names, plugin_name } = args
+      const names: string[] = plugin_names ?? (plugin_name ? [plugin_name] : [])
       const cp = checkPlugins(names)
       if (!cp.ok) return { content: `❌ ${cp.error}` }
       const cprof = checkProfile(profile)
       if (!cprof.ok) return { content: `❌ ${cprof.error}` }
-      const strat = checkStrategy(strategy)
-      if (!strat) return { content: '❌ 未知策略。可用: safe / balanced / aggressive' }
+
+      const r = await rt.oracle.divine({
+        plugins: cp.plugins, profile: cprof.profile, strategy,
+      })
+      if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
+      const o = r.value
+
+      const pct = (n: number) => `${(n * 100).toFixed(1)}%`
+      const confIcon: Record<string, string> = { high: '🟢', medium: '🟡', low: '🔴' }
+      const lines = [
+        `🔮 先知推演 @ ${new Date().toISOString()}`,
+        `   插件: ${cp.plugins.join(', ')}  |  profile: ${cprof.profile}  |  策略: ${strategy}`,
+        `   事务成功率: ${pct(o.transactionSuccessProbability)}  ${confIcon[o.confidence]} 置信 ${o.confidence}（${o.evidence.stepSamples} 个历史步骤样本）`,
+        `   期望回收: ${fmtBytes(o.expectedReclaimBytes)}（已折算失败回滚；若成功: ${fmtBytes(o.reclaimP10IfSuccess)} ~ ${fmtBytes(o.reclaimP90IfSuccess)}）`,
+        `   预估总量: ${fmtBytes(o.totalEstimatedBytes)}  |  失败期望回滚深度: ${o.expectedRollbackDepth.toFixed(1)} 步`,
+      ]
+      if (o.weakestStep) {
+        lines.push(`   ⚠️ 最脆弱: 第 ${o.weakestStep.index} 步 ${o.weakestStep.action}（成功率 ${pct(o.weakestStep.successProbability)}，失败作废 ${fmtBytes(o.weakestStep.exposureBytes)}）`)
+      }
+      if (o.brokenDependents !== null) {
+        lines.push(o.brokenDependents.length > 0
+          ? `   💥 爆炸半径: 将损坏 ${o.brokenDependents.length} 个外部依赖方（${o.brokenDependents.join(', ')}）`
+          : '   💥 爆炸半径: 无外部波及')
+      }
+      if (o.diskExtensionDays !== null) {
+        lines.push(`   ⏳ 磁盘写满倒计时预计延长 +${o.diskExtensionDays.toFixed(1)} 天`)
+      }
+      lines.push('', '─ 逐步推演 ─')
+      for (const s of o.steps) {
+        const cal = s.calibration
+          ? `  校准 ${(s.calibration.p50 * 100).toFixed(0)}%（${s.calibration.samples} 样本）`
+          : '  校准 n/a'
+        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${cal}`)
+      }
+      lines.push('', `💡 ${o.narrative}`)
+      lines.push('', '决策链建议: nuke_oracle（后果推演）→ nuke_clean dry_run（计划预演）→ nuke_clean（执行）')
+      return { content: lines.join('\n') }
+    },
+  }))
+
+  // ── nuke_drill（混沌演习：崩溃安全自检） ──────────────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_drill',
+    description: '混沌演习：在沙箱中执行真实事务并在第 N 步后模拟进程崩溃（不回滚、锁悬挂），再走真实崩溃恢复路径，逐项验证数据字节级还原/审计链完整/WAL 终结，签发崩溃安全证书。不触碰真实环境，随时可跑',
+    parameters: {
+      crash_after_step: { type: 'number', description: '第几步成功后"断电"（1-2，默认 1）' },
+    },
+    execute: async ({ crash_after_step = 1 }) => {
+      const r = await rt.drill.run({ afterStep: crash_after_step })
+      if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
+      const d = r.value
+      const lines = [
+        `${d.passed ? '🎖️ 崩溃安全证书已签发' : '⚠️ 演习未通过'}  演习 ${d.runId}`,
+        `   注入点: 第 ${d.crashedAtStep} 步成功落盘后模拟进程死亡  |  恢复备份 ${d.restoredFiles} 项  |  耗时 ${d.durationMs}ms`,
+        '',
+        '─ 逐项验证 ─',
+        ...d.checks.map(c => `  ${c.passed ? '✅' : '❌'} ${c.name}: ${c.detail}`),
+        '',
+        d.passed
+          ? '本次演习证明：崩溃后 recover() 能完整还原环境，审计链无断裂，后续事务不受阻塞。建议定期演习（尤其升级后）。'
+          : '存在失败项：崩溃恢复能力存疑，请勿在生产依赖自动恢复，优先人工核查。演习现场保留在 .nuke/drill/ 供取证。',
+      ]
+      return { content: lines.join('\n') }
+    },
+  }))
+
+  // ── nuke_clean（核心） ───────────────────────────────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_clean',
+    description: '事务化强力卸载：健康检查闸门 → 健康度阻断拒绝 → begin(独占锁) → plan(依赖/令牌校验) → [dry_run 预演 | commit 原子执行]。失败自动 Saga 回滚，全程审计',
+    parameters: {
+      plugin_names: { type: 'array', items: { type: 'string' }, description: '要卸载的插件名列表' },
+      plugin_name: { type: 'string', description: '单个插件名（plugin_names 简写）' },
+      profile: { type: 'string', description: '默认 "web"' },
+      strategy: { type: 'string', enum: ['safe', 'balanced', 'aggressive'], description: 'safe / balanced / aggressive，默认 balanced' },
+      dry_run: { type: 'boolean', description: '仅预演，默认 false' },
+      confirmation_token: { type: 'string', description: 'aggressive 必填：CONFIRM:<profile>:<插件清单>' },
+      skip_health: { type: 'boolean', description: '跳过健康检查闸门，默认 false' },
+      report_format: { type: 'string', enum: ['json', 'markdown', 'both', 'none'], description: '报告格式，默认 markdown' },
+      actor: { type: 'string', description: '操作人标识（写入审计日志），默认 nuke-tool' },
+    },
+    execute: async (args) => {
+      const {
+        profile = 'web', strategy = 'balanced', dry_run = false,
+        skip_health = false, report_format = 'markdown', actor = 'nuke-tool',
+        plugin_names, plugin_name, confirmation_token,
+      } = args
+      // 类型与枚举（strategy/report_format）已由 defineTool 编译进 JSON Schema
+      // 并在 execute 前校验；此处只做领域白名单（插件名/profile）
+      const names: string[] = plugin_names ?? (plugin_name ? [plugin_name] : [])
+      const cp = checkPlugins(names)
+      if (!cp.ok) return { content: `❌ ${cp.error}` }
+      const cprof = checkProfile(profile)
+      if (!cprof.ok) return { content: `❌ ${cprof.error}` }
+      const strat = strategy
+      const fmt = report_format
 
       // 1) 健康检查闸门（critical 失败 → 拒绝）。fail-closed：检查本身失败
       //    （IO/解析异常）时同样拒绝 —— 安全闸门绝不能"查不到就放行"。
@@ -461,7 +537,7 @@ export function apply(ctx: ToolHost) {
       const rpLines: string[] = []
       if (!dry_run) {
         const rp = await rt.restorePoints.create({
-          actor: String(actor), reason: `pre-clean:${strat}`, profile: cprof.profile,
+          actor, reason: `pre-clean:${strat}`, profile: cprof.profile,
         })
         rpLines.push(rp.ok
           ? `🛡️ 配置还原点 ${rp.value.id}（${rp.value.files.length} 文件，nuke_restorepoint 可恢复）`
@@ -471,8 +547,8 @@ export function apply(ctx: ToolHost) {
       // 3) 事务：begin → plan →（dryRun | commit）
       const begin = await rt.engine.begin({
         plugins: cp.plugins, profile: cprof.profile, strategy: strat,
-        dryRun: !!dry_run, actor: String(actor),
-        ...(typeof a.confirmation_token === 'string' ? { confirmationToken: a.confirmation_token } : {}),
+        dryRun: dry_run, actor,
+        ...(confirmation_token !== undefined ? { confirmationToken: confirmation_token } : {}),
       })
       if (!begin.ok) {
         return { content: `❌ 事务开启失败 [${begin.error.code}]: ${begin.error.message}` }
@@ -590,25 +666,23 @@ export function apply(ctx: ToolHost) {
         }
       }
     },
-  })
+  }))
 
   // ── nuke_status ──────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_status',
     description: '查询事务状态（活跃/已终结，含步骤明细与回收统计）',
     parameters: {
-      type: 'object',
-      properties: { tx_id: { type: 'string' } },
-      required: ['tx_id'],
+      tx_id: { type: 'string', required: true, description: '16 位十六进制事务 ID' },
     },
     execute: async ({ tx_id }) => {
-      const id = String(tx_id)
       // tx_id 直接拼入 WAL 文件路径：白名单校验堵死 "../" 式路径穿越
-      if (!/^[0-9a-f]{16}$/.test(id)) {
+      //（格式约束超出 DSL 表达力，属领域校验）
+      if (!/^[0-9a-f]{16}$/.test(tx_id)) {
         return { content: `❌ tx_id 非法（应为 16 位十六进制事务 ID）` }
       }
-      const s = await rt.engine.status(id as TxId)
-      if (!s) return { content: `❌ 事务不存在: ${id}` }
+      const s = await rt.engine.status(tx_id as TxId)
+      if (!s) return { content: `❌ 事务不存在: ${tx_id}` }
       const lines = [
         `事务 ${s.txId}: ${s.state}`,
         `  开始: ${s.startedAt}${s.finishedAt ? `  完成: ${s.finishedAt}` : ''}`,
@@ -617,13 +691,13 @@ export function apply(ctx: ToolHost) {
       ]
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_recover ─────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_recover',
     description: '崩溃恢复：扫描未终结事务的 WAL，反向补偿恢复到执行前状态',
-    parameters: { type: 'object', properties: {} },
+    parameters: {},
     execute: async () => {
       const r = await rt.engine.recover()
       if (!r.ok) return { content: `❌ ${r.error.message}` }
@@ -632,27 +706,26 @@ export function apply(ctx: ToolHost) {
       for (const s of r.value) lines.push(`  ${s.txId}: ${s.steps.length} 步已反向补偿`)
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_verify ──────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_verify',
     description: '审计链完整性校验（hash chain 任何篡改均可定位）',
-    parameters: { type: 'object', properties: {} },
+    parameters: {},
     execute: async () => {
       const v = await rt.audit.verify()
       if (v.valid) return { content: `✅ 审计链完整：${v.totalEntries} 条记录，hash 链校验通过。` }
       return { content: `🚨 审计链被篡改！共 ${v.totalEntries} 条，首个损坏点: seq=${v.firstBrokenSeq}` }
     },
-  })
+  }))
 
   // ── nuke_doctor ──────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_doctor',
-    description: '一键全科体检：健康检查+残留扫描+孤儿检测+四因子评分 → 优先级处方（P1 立即/P2 建议/P3 可选）与建议清理策略',
+    description: '一键全科体检：健康检查+残留扫描+孤儿检测+五因子评分 → 优先级处方（P1 立即/P2 建议/P3 可选）与建议清理策略',
     parameters: {
-      type: 'object',
-      properties: { profile: { type: 'string', description: '默认 "web"' } },
+      profile: { type: 'string', description: '默认 "web"' },
     },
     execute: async ({ profile = 'web' }) => {
       const cp = checkProfile(profile)
@@ -681,30 +754,24 @@ export function apply(ctx: ToolHost) {
       }
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_dedup ───────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_dedup',
     description: '内容寻址去重：三级瀑布（尺寸分桶→头尾采样→全量 SHA-256）定位重复文件群；apply=true 时以硬链接实收（verify-then-link，需确认令牌）',
     parameters: {
-      type: 'object',
-      properties: {
-        min_size_bytes: { type: 'number', description: '参与分析的最小文件尺寸，默认 4096' },
-        apply: { type: 'boolean', description: '将重复副本替换为硬链接实收空间（默认 false 只分析）' },
-        confirm_token: { type: 'string', description: 'apply=true 时必填：LINK-DEDUP' },
-      },
+      min_size_bytes: { type: 'integer', description: '参与分析的最小文件尺寸，默认 4096（须 ≥1）' },
+      apply: { type: 'boolean', description: '将重复副本替换为硬链接实收空间（默认 false 只分析）' },
+      confirm_token: { type: 'string', description: 'apply=true 时必填：LINK-DEDUP' },
     },
     execute: async ({ min_size_bytes, apply, confirm_token }) => {
-      // 下限校验：负数/0/NaN 会使全部文件进入哈希阶段 → 全盘 IO/CPU DoS
-      let minSize: number | undefined
-      if (min_size_bytes !== undefined) {
-        const n = Number(min_size_bytes)
-        if (!Number.isInteger(n) || n < 1) {
-          return { content: '❌ min_size_bytes 必须为 ≥1 的整数' }
-        }
-        minSize = n
+      // 下限校验（领域规则）：0/负数会使全部文件进入哈希阶段 → 全盘 IO/CPU DoS；
+      // integer 类型已由 DSL 保证
+      if (min_size_bytes !== undefined && min_size_bytes < 1) {
+        return { content: '❌ min_size_bytes 必须为 ≥1 的整数' }
       }
+      const minSize = min_size_bytes
       // apply 属破坏性动作：显式令牌确认（与 aggressive 清理同纪律）
       if (apply === true && confirm_token !== 'LINK-DEDUP') {
         return { content: '❌ apply=true 需要确认令牌 confirm_token="LINK-DEDUP"（硬链接替换不可逆于权限语义）' }
@@ -768,28 +835,25 @@ export function apply(ctx: ToolHost) {
       lines.push('', '💡 确认后可执行硬链接实收：apply=true + confirm_token="LINK-DEDUP"')
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_restorepoint ────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_restorepoint',
     description: '配置还原点管理：清理前自动快照关键配置，事故后一键恢复（list / create / restore / prune）',
     parameters: {
-      type: 'object',
-      properties: {
-        action: { type: 'string', description: 'list / create / restore / prune，默认 list' },
-        id: { type: 'string', description: 'restore 目标还原点 id' },
-        profile: { type: 'string', description: 'create 用，默认 "web"' },
-        reason: { type: 'string', description: 'create 用，默认 manual' },
-        keep: { type: 'number', description: 'prune 用：保留最近几个，默认 5' },
-        actor: { type: 'string', description: 'create 用，默认 nuke-tool' },
-      },
+      action: { type: 'string', enum: ['list', 'create', 'restore', 'prune'], description: 'list / create / restore / prune，默认 list' },
+      id: { type: 'string', description: 'restore 目标还原点 id' },
+      profile: { type: 'string', description: 'create 用，默认 "web"' },
+      reason: { type: 'string', description: 'create 用，默认 manual' },
+      keep: { type: 'integer', description: 'prune 用：保留最近几个，默认 5（须 ≥1）' },
+      actor: { type: 'string', description: 'create 用，默认 nuke-tool' },
     },
     execute: async ({ action = 'list', id, profile = 'web', reason = 'manual', keep = 5, actor = 'nuke-tool' }) => {
       if (action === 'create') {
         const cp = checkProfile(profile)
         if (!cp.ok) return { content: `❌ ${cp.error}` }
-        const r = await rt.restorePoints.create({ actor: String(actor), reason: String(reason), profile: cp.profile })
+        const r = await rt.restorePoints.create({ actor, reason, profile: cp.profile })
         if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
         return {
           content: `🛡️ 还原点已创建: ${r.value.id}\n   文件 ${r.value.files.length} 个，快照于 ${r.value.createdAt}。`,
@@ -797,17 +861,17 @@ export function apply(ctx: ToolHost) {
       }
       if (action === 'restore') {
         if (!id) return { content: '❌ 请提供 id' }
-        const r = await rt.restorePoints.restore(String(id))
+        const r = await rt.restorePoints.restore(id)
         if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
         return { content: `↩️ 已恢复 ${r.value.files.length} 个配置文件到 ${r.value.createdAt} 时点（${r.value.id}）。` }
       }
       if (action === 'prune') {
-        // keep 下限校验：0/负数/NaN = 清空全部还原点（安全网不容许无确认全删）
-        const k = Number(keep)
-        if (!Number.isInteger(k) || k < 1) {
+        // keep 下限校验（领域规则）：0/负数 = 清空全部还原点（安全网不容许
+        // 无确认全删）；integer 类型已由 DSL 保证
+        if (keep < 1) {
           return { content: '❌ keep 必须为 ≥1 的整数（不允许清空全部还原点）' }
         }
-        const r = await rt.restorePoints.prune(k)
+        const r = await rt.restorePoints.prune(keep)
         if (!r.ok) return { content: `❌ ${r.error.message}` }
         return { content: `🧹 已删除 ${r.value} 个旧还原点。` }
       }
@@ -820,19 +884,15 @@ export function apply(ctx: ToolHost) {
       }
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_blastradius ─────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_blastradius',
     description: '爆炸半径沙盘推演（what-if）：删除前预测传递闭包波及面 —— 谁会损坏、谁可级联、风险几级、如何降险。零副作用',
     parameters: {
-      type: 'object',
-      properties: {
-        plugin_names: { type: 'array', items: { type: 'string' } },
-        profile: { type: 'string', description: '限定单 profile 图（省略 = 全 profile）' },
-      },
-      required: ['plugin_names'],
+      plugin_names: { type: 'array', items: { type: 'string' }, required: true, description: '要推演的插件名列表' },
+      profile: { type: 'string', description: '限定单 profile 图（省略 = 全 profile）' },
     },
     execute: async ({ plugin_names, profile }) => {
       const cp = checkPlugins(plugin_names)
@@ -865,15 +925,14 @@ export function apply(ctx: ToolHost) {
       for (const a of b.advisories) lines.push(`  💡 ${a}`)
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_trend ───────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_trend',
     description: '历史趋势分析：可回收空间变化率（字节/天）、30 天线性外推、3σ 异常检测（插件失控写盘早期信号）',
     parameters: {
-      type: 'object',
-      properties: { profile: { type: 'string', description: '限定 profile（省略 = 全部）' } },
+      profile: { type: 'string', description: '限定 profile（省略 = 全部）' },
     },
     execute: async ({ profile }) => {
       let prof: ProfileName | undefined
@@ -906,13 +965,13 @@ export function apply(ctx: ToolHost) {
       }
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_policy ──────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_policy',
     description: '查看当前清理策略守卫配置（保护名单/批量上限/回收上限/磁盘下限/时间黑窗）。策略文件: <dshHome>/.nuke/policy.json',
-    parameters: { type: 'object', properties: {} },
+    parameters: {},
     execute: async () => {
       const p = rt.policy.load()
       const lines = ['🛡️ 当前清理策略（policy.json）:',]
@@ -924,15 +983,14 @@ export function apply(ctx: ToolHost) {
       lines.push('', '说明: 策略文件缺失或损坏时默认全放行；保护名单同时以引擎 pre-hook 形式强制执行（纵深防御）。')
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_guardian ────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_guardian',
     description: '守卫者巡检：一键主动运维 —— 磁盘写满倒计时/趋势异常/健康阻断/可回收积压/崩溃残留事务，输出带行动建议的分级告警',
     parameters: {
-      type: 'object',
-      properties: { profile: { type: 'string', description: '默认 "web"' } },
+      profile: { type: 'string', description: '默认 "web"' },
     },
     execute: async ({ profile = 'web' }) => {
       const cp = checkProfile(profile)
@@ -960,13 +1018,13 @@ export function apply(ctx: ToolHost) {
       }
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_forecast ────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_forecast',
     description: '磁盘写满预测：趋势回归 × 实时余量 → 写满倒计时（daysUntilFull）、30 天走势与分级建议',
-    parameters: { type: 'object', properties: {} },
+    parameters: {},
     execute: async () => {
       const r = await rt.forecaster.forecast()
       if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
@@ -989,35 +1047,32 @@ export function apply(ctx: ToolHost) {
       lines.push('', `💡 ${f.recommendation}`)
       return { content: lines.join('\n') }
     },
-  })
+  }))
 
   // ── nuke_ledger ──────────────────────────────────────────
-  registerTool(ctx, {
+  ctx.tools.register(defineTextTool({
     name: 'nuke_ledger',
     description: '空间台账：每字节回收可溯源 —— 按动作/profile/日聚合，已回收(freed)与待回收(pending)双轨统计',
     parameters: {
-      type: 'object',
-      properties: {
-        kind: { type: 'string', description: 'freed / pending（省略 = 全部）' },
-        profile: { type: 'string', description: '限定 profile（省略 = 全部）' },
-        days: { type: 'number', description: '只统计最近 N 天（省略 = 全部）' },
-      },
+      kind: { type: 'string', enum: ['freed', 'pending'], description: 'freed / pending（省略 = 全部）' },
+      profile: { type: 'string', description: '限定 profile（省略 = 全部）' },
+      days: { type: 'number', description: '只统计最近 N 天（省略 = 全部）' },
     },
     execute: async ({ kind, profile, days }) => {
       const filter: { kind?: 'freed' | 'pending'; profile?: ProfileName; since?: string } = {}
-      if (kind === 'freed' || kind === 'pending') filter.kind = kind
+      if (kind !== undefined) filter.kind = kind
       if (profile !== undefined) {
         const cp = checkProfile(profile)
         if (!cp.ok) return { content: `❌ ${cp.error}` }
         filter.profile = cp.profile
       }
       if (days !== undefined) {
-        // NaN/负数防御：NaN 会让 new Date(NaN).toISOString() 抛 RangeError
-        const n = Number(days)
-        if (!Number.isFinite(n) || n < 0) {
+        // 下限校验（领域规则，DSL 无数值下限）：负数时间窗无意义；
+        // number 类型已由 DSL 保证（JSON 不携带 NaN）
+        if (days < 0) {
           return { content: '❌ days 必须为 ≥0 的数字' }
         }
-        filter.since = new Date(Date.now() - n * 86_400_000).toISOString()
+        filter.since = new Date(Date.now() - days * 86_400_000).toISOString()
       }
       const r = await rt.ledger.query(filter)
       if (!r.ok) return { content: `❌ ${r.error.message}` }
@@ -1046,5 +1101,5 @@ export function apply(ctx: ToolHost) {
       }
       return { content: lines.join('\n') }
     },
-  })
+  }))
 }

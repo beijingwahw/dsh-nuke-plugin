@@ -1,9 +1,9 @@
 # dsh-nuke-plugin
 
-> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 硬链接去重 · 趋势预测
+> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
-[![Tests](https://img.shields.io/badge/tests-206%2F206-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
+[![Tests](https://img.shields.io/badge/tests-222%2F222-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -17,10 +17,11 @@ dsh 的一切皆插件 —— 但插件的装卸会在 `.dsh/`、Nuke 目录、�
 | 痛点 | 解法 |
 |---|---|
 | 删错无法挽回 | 每个动作自带 `validate / preview / execute / undo`，目录删除 = 原子改名进回收区 |
-| 清理途中崩溃 | WAL 预写日志 + 备份区，`nuke_recover` 重放并反向补偿 |
+| 清理途中崩溃 | WAL 预写日志 + 备份区，`nuke_recover` 重放并反向补偿；`nuke_drill` 随时实战验证这条退路 |
 | 出事无从追责 | hash chain 审计日志，任何篡改可被 `nuke_verify` 检出 |
 | 并发清理打架 | 跨进程读写锁（O_EXCL + bootToken 归属核验 + guard 目录互斥） |
-| 不知道能删多少 | 四因子评分 + 趋势回归 + 磁盘写满预测，先预演后执行 |
+| 不知道能删多少 | 五因子评分 + 趋势回归 + 磁盘写满预测，先预演后执行 |
+| 不知道"删了会怎样" | `nuke_oracle` 先知推演：基于历史执行数据预测事务成功率、期望回收、最脆弱步骤 |
 
 ## 安装
 
@@ -41,7 +42,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 5. **保护名单 + 限额 + 黑窗** — 作为引擎 pre-hook veto，超限即拒绝（纵深防御，不依赖单层检查）
 6. **回收区代替物理删除** — commit 后才允许 purge；restore 失败或存在孤儿产物时绝不 purge
 
-## 工具速查（19 个）
+## 工具速查（21 个）
 
 所有工具注册为 dsh Agent 工具，安装后直接让 Agent 调用即可。
 
@@ -50,7 +51,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | 工具 | 说明 |
 |---|---|
 | `nuke_list` | 列出 profile 下已安装的第三方插件 |
-| `nuke_scan` | 残留扫描（配置引用/目录/TEMP），四因子评分 + 可回收空间统计；省略插件名进入全局模式 |
+| `nuke_scan` | 残留扫描（配置引用/目录/TEMP），五因子评分 + 可回收空间统计；省略插件名进入全局模式 |
 | `nuke_deps` | 依赖关系检测：谁引用了目标插件（删除前必查） |
 | `nuke_orphans` | 全局孤儿扫描：node_modules 未声明包 / 无主附件 / TEMP 过期条目 |
 | `nuke_health` | 健康检查：config/dependency/runtime/residue 四组，critical 失败自动阻断清理 |
@@ -64,6 +65,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | `nuke_policy` | 查看守卫配置：保护名单 / 批量上限 / 回收上限 / 磁盘下限 / 时间黑窗 |
 | `nuke_trend` | 历史趋势：字节/天变化率、30 天外推、3σ̂ 异常检测（失控写盘早期信号） |
 | `nuke_forecast` | 磁盘写满预测：趋势 × 实时余量 → 倒计时与分级建议 |
+| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长；基于历史执行数据贝叶斯自学习，零副作用不拿锁 |
 
 ### 执行 — 事务化清理
 
@@ -88,6 +90,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | `nuke_doctor` | 一键全科体检：健康 + 残留 + 孤儿 + 评分 → P1/P2/P3 优先级处方 |
 | `nuke_guardian` | 守卫者巡检：磁盘倒计时 / 趋势异常 / 未终结事务 → 带建议的分级告警 |
 | `nuke_ledger` | 空间台账：每字节回收可溯源，按动作/profile/日聚合，freed/pending 双轨 |
+| `nuke_drill` | **混沌演习**：沙箱中执行真实事务 → 第 N 步后模拟"断电"（不回滚、锁悬挂）→ 走真实恢复路径 → 逐项验证数据字节级还原 / 审计链完整 / WAL 终结 → 签发崩溃安全证书 |
 
 ## 典型工作流
 
@@ -95,9 +98,10 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 
 ```
 1. nuke_scan                    # 看清残留与可回收空间
-2. nuke_blastradius [插件]       # 零副作用推演：会不会误伤
-3. nuke_clean --dry_run true    # 预演：只出计划，不动文件
-4. nuke_clean                   # 执行：失败自动回滚，全程审计
+2. nuke_oracle                  # 先知推演：做了会怎样（成功率/期望回收/最脆弱步骤）
+3. nuke_blastradius [插件]       # 零副作用推演：会不会误伤
+4. nuke_clean --dry_run true    # 预演：只出计划，不动文件
+5. nuke_clean                   # 执行：失败自动回滚，全程审计
 ```
 
 ### aggressive 策略（需要确认令牌）
@@ -120,6 +124,49 @@ nuke_clean --strategy aggressive \
 ```
 nuke_guardian                   # 一键巡检，输出带建议的告警
 nuke_forecast                   # 磁盘还能撑几天
+nuke_drill                      # 定期混沌演习，确认崩溃退路始终有效
+```
+
+## 核心创新：会自我学习的清理引擎
+
+传统工具的"预演"只能告诉你"我打算做什么"。本插件更进一步——用历史执行数据回答"**做了会怎样**"，并用真实崩溃验证"**出了事能否退回**"。
+
+### 先知引擎（nuke_oracle）— 概率化后果推演
+
+dry-run 是确定性预演，先知是概率化推演。每次清理的每个步骤都会入审计链，先知从中学习：
+
+- **贝叶斯可靠性模型**（经验贝叶斯收缩）：每个动作的成败率向全局均值收缩——
+  `p̂ = (s + κ·μ) / (n + κ)`。执行过 100 次的动作自信报数，只跑过 1 次的动作自动向全局均值靠拢，不会被单次运气带偏
+- **校准分布**：追踪"预估回收 vs 实际回收"的比率历史，用中位数修正乐观估计——预演说能回收 1GB，历史上实际只有 90%，先知就按 90% 报
+- **事务成功率**：各步骤成功概率连乘，一眼看出整条链的把握有多大
+- **期望回收**：`Σ(步骤回收量 × 校准系数) × 事务成功率`——不是"最多能回收多少"，是"预期能回收多少"
+- **最脆弱步骤**：成功率贡献最小的一环，建议先修它（比如先解依赖再清理）
+- 零副作用：影子上下文执行 preview，不拿锁、不落盘
+
+### 混沌演习（nuke_drill）— 崩溃安全证书
+
+"有恢复机制"和"恢复机制真的有效"是两回事。演习不承诺，只验证：
+
+```
+沙箱搭建 → 真实事务执行 → 第 N 步成功落盘后模拟进程死亡
+       （跳过回滚、跳过锁释放——最恶劣的崩溃现场）
+→ 模拟重启 → 走真实 nuke_recover 路径 → 逐项验证：
+   ✓ 崩溃注入生效          ✓ 事务完整回滚
+   ✓ 数据字节级还原         ✓ 审计链完整（hash chain）
+   ✓ 新事务畅通无阻塞       ✓ WAL 正确终结
+→ 通过则签发崩溃安全证书（含耗时与验证明细）
+```
+
+随时可跑、不触碰真实环境。升级、改配置、怀疑人生时，跑一次就知道退路还在不在。
+
+### 数据闭环
+
+```
+执行（审计链记录每步成败与预估/实际）
+   → 可靠性模型（贝叶斯学习：动作成功率 + 校准分布）
+      → 先知引擎（预测下次：成功率 / 期望回收 / 最脆弱步骤）
+         → 决策（先修最弱步骤，或换 safe 策略）
+            → 再执行 → 数据更准 → ...
 ```
 
 ## 事务生命周期
@@ -152,10 +199,10 @@ nuke_clean
 ```
 src/
 ├── contracts/   # 契约层：先定义接口再实现；Result 类型消灭异常控制流
-├── infra/       # 基建：WAL / 读写锁 / 备份区 / hash-chain 审计 / 台账 / 校验器
-├── engine/      # 引擎：事务 / 扫描 / 评分 / 依赖图 / 去重 / 趋势 / 守卫 / 还原点
+├── infra/       # 基建：WAL / 读写锁 / 备份区 / hash-chain 审计 / 台账 / 校验器 / 贝叶斯可靠性
+├── engine/      # 引擎：事务 / 扫描 / 评分 / 依赖图 / 去重 / 趋势 / 守卫 / 还原点 / 先知 / 混沌演习
 ├── operations/  # 命令模式：每个动作自带 validate/preview/execute/undo
-└── index.ts     # 组装运行时（依赖注入）+ 注册 19 个工具
+└── index.ts     # 组装运行时（依赖注入）+ 注册 21 个工具
 ```
 
 数据落盘位置：`<dshHome>/.nuke/`（wal/ backups/ audit/ ledger/ history/ policy.json restore-points/）
@@ -167,7 +214,7 @@ git clone https://github.com/beijingwahw/dsh-nuke-plugin
 cd dsh-nuke-plugin
 npm install
 npm run typecheck    # tsc --noEmit（零错误）
-npm test             # vitest（206 用例 / 25 文件）
+npm test             # vitest（222 用例 / 28 文件）
 npm run build        # tsdown 构建
 npm run dev          # 开发期热更新进程（见下）
 ```
@@ -198,6 +245,15 @@ verify-then-link：canonical 与 victim 执行前重算 SHA-256 复验；跨文�
 
 **Q: 多个 dsh 实例同时清理会怎样？**
 `nuke_clean` 持有跨进程独占锁（O_EXCL 原子获取 + bootToken 归属核验 + 固定名 guard 目录互斥），后到者等待或失败，绝不会交叉写。
+
+**Q: 先知的成功率预测为什么用贝叶斯收缩，而不是直接用历史频率？**
+只跑过 1 次且恰好成功的动作，频率是 100%——但没人敢信。经验贝叶斯收缩 `p̂ = (s + κ·μ) / (n + κ)` 把小样本拉向全局均值：数据越多越自信，数据越少越保守。这与保险精算、A/B 测试平滑是同一套方法论。
+
+**Q: nuke_oracle 和 nuke_clean --dry_run 有什么区别？**
+dry-run 回答"我打算做什么"（确定性计划明细）；先知回答"做了会怎样"（概率化后果：成功率、期望回收、最脆弱步骤）。两者互补：先知看趋势，dry-run 看细节。
+
+**Q: 混沌演习会在我的真实环境里制造崩溃吗？**
+不会。演习在 `<nukeRoot>/drill/<runId>/` 沙箱内进行——用一份合成的插件布局（含受保护文件）执行真实事务代码路径，崩溃、恢复、验证全部发生在沙箱里，真实环境零接触。
 
 ## License
 

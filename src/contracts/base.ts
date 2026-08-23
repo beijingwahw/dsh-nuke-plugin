@@ -65,6 +65,21 @@ export function ioError(context: string, e: unknown): NukeError {
   return { code: 'E_IO', message: `${context}: ${errorToMessage(e)}` }
 }
 
+// ─── 混沌演习：受控崩溃信号 ─────────────────────────────────
+// 事务引擎的 crashAfterStep 注入点抛出本异常时，commit 的所有 catch
+// 都必须原样 re-throw —— 不回滚、不释放锁、不写终结审计，
+// 语义上等价于进程在第 stepIndex 步成功落盘后立刻断电死亡。
+// 仅沙箱演习（nuke_drill）与测试使用，生产组装永不注入。
+export class SimulatedCrashError extends Error {
+  constructor(
+    public readonly txId: string,
+    public readonly stepIndex: number,
+  ) {
+    super(`SIMULATED_CRASH: 事务 ${txId} 第 ${stepIndex} 步成功落盘后模拟进程死亡（跳过回滚与锁释放）`)
+    this.name = 'SimulatedCrashError'
+  }
+}
+
 // ─── 从旧 types.ts 提升的领域枚举 ───────────────────────────
 export type CleanStrategy = 'safe' | 'balanced' | 'aggressive'
 

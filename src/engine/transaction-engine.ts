@@ -9,7 +9,7 @@ import * as os from 'os'
 import type {
   Clock, NukeError, Result, TxId,
 } from '../contracts/base'
-import { err, errorToMessage, ioError, ok } from '../contracts/base'
+import { err, errorToMessage, ioError, ok, SimulatedCrashError } from '../contracts/base'
 import type {
   BackupRecord, CleanOperation, CleanRequest, DryRunReport, IBackupStore,
   ITransactionEngine, IWal, OperationPlan, PlanWarning, TxContext, TxPlan,
@@ -32,6 +32,10 @@ export interface EngineDeps {
   readonly clock: Clock
   /** aggressive 策略的一次性确认令牌校验（令牌签发方在交互层） */
   readonly verifyConfirmationToken?: (token: string, request: CleanRequest) => boolean
+  /** 混沌演习注入点：第 crashAfterStep 步成功落盘（step-done WAL + 审计）
+   *  后抛 SimulatedCrashError 穿透 commit —— 不回滚、不释放锁，
+   *  语义等价于进程在该点断电死亡。仅沙箱演习/测试使用，生产永不注入。 */
+  readonly crashAfterStep?: number
 }
 
 /** 状态机合法迁移表 */
@@ -54,6 +58,10 @@ interface TxRuntime {
   finishedAt?: string
   lockHandle: Awaited<ReturnType<ILockManager['acquire']>> extends Result<infer H, any> ? H : never
   backupsArea: Awaited<ReturnType<IBackupStore['reserve']>>
+  /** operationId → preview 预估回收字节数（plan/dryRun 时填充，
+   *  commit 复用 → 步骤审计里的 estimated 零额外 IO；外部直连 commit
+   *  未经过 plan 时按需补一次 preview） */
+  estimates: Map<string, number>
 }
 
 export function createTransactionEngine(
@@ -189,6 +197,27 @@ export function createTransactionEngine(
     }
   }
 
+  /** 步骤审计（可靠性模型的数据源）：action 前缀 op: 区分于事务级条目。
+   *  detail 携带 estimated/actual/ratio —— 每一次清理都在训练下一次预测。
+   *  审计失败只记日志不阻断事务：统计飞轮是增强能力，不是关键路径。 */
+  async function auditStep(
+    rt: TxRuntime, op: CleanOperation, outcome: 'success' | 'failure',
+    detail: Readonly<Record<string, unknown>>,
+  ): Promise<void> {
+    try {
+      await deps.audit.append({
+        timestamp: deps.clock.now().toISOString(),
+        actor: rt.request.actor,
+        action: `op:${op.action}`,
+        txId: rt.txId,
+        outcome,
+        detail,
+      })
+    } catch (e) {
+      deps.logger.warn('步骤审计追加失败（可靠性统计缺此样本）', { tx: rt.txId, op: op.id, error: errorToMessage(e) })
+    }
+  }
+
   return {
     async begin(request) {
       // 输入校验由调用层完成；此处只做策略-令牌前置检查
@@ -226,6 +255,7 @@ export function createTransactionEngine(
         startedAt: deps.clock.now().toISOString(),
         lockHandle: acquired.value,
         backupsArea,
+        estimates: new Map(),
       }
       runtimes.set(txId, rt)
 
@@ -266,6 +296,7 @@ export function createTransactionEngine(
       let total = 0
       for (const op of ops) {
         const p = await op.preview(ctx)
+        rt.estimates.set(op.id, p.estimatedBytesReclaimable)
         total += p.estimatedBytesReclaimable
       }
 
@@ -287,6 +318,7 @@ export function createTransactionEngine(
       let total = 0
       for (const op of plan.operations) {
         const p = await op.preview(ctx)   // 零副作用
+        rt.estimates.set(op.id, p.estimatedBytesReclaimable)
         total += p.estimatedBytesReclaimable
         reports.push({ operation: p, summary: p.summary })
       }
@@ -363,10 +395,26 @@ export function createTransactionEngine(
           }
 
           try {
+            // 预估回收量：execute 前取（目标还在原位，preview 才准）。
+            // plan/dryRun 已缓存 → 通常零额外 IO；外部直连 commit 才补算。
+            let estimated = rt.estimates.get(op.id)
+            if (estimated === undefined) {
+              try {
+                const p = await op.preview(ctx)
+                estimated = p.estimatedBytesReclaimable
+                rt.estimates.set(op.id, estimated)
+              } catch {
+                estimated = undefined   // preview 失败不影响执行，只是缺校准样本
+              }
+            }
             const executed = await op.execute(ctx)
             if (!executed.ok) {
               rt.steps[index] = { ...rt.steps[index]!, status: 'failed', backup: null }
               await deps.wal.append(txId, { type: 'step-failed', index, error: executed.error })
+              await auditStep(rt, op, 'failure', {
+                operationId: op.id, estimated: estimated ?? null,
+                error: executed.error.message,
+              })
               // error 钩子可建议处置
               const errHook = await deps.hooks.emit('error', {
                 ...hookCtx(txId, rt.request, op), error: executed.error,
@@ -385,8 +433,21 @@ export function createTransactionEngine(
               ...rt.steps[index]!, status: 'done', bytesFreed: outcome.bytesFreed, backup,
             }
             await deps.wal.append(txId, { type: 'step-done', index, operationId: op.id, outcome, backup })
+            await auditStep(rt, op, 'success', {
+              operationId: op.id,
+              estimated: estimated ?? null,
+              actual: outcome.bytesFreed,
+              ...(estimated !== undefined && estimated > 0
+                ? { ratio: outcome.bytesFreed / estimated }
+                : {}),
+            })
             await deps.hooks.emit('post', hookCtx(txId, rt.request, op, backup))
+            // 混沌演习注入点：step-done WAL + 审计已落盘，此刻"断电"
+            if (deps.crashAfterStep === index) {
+              throw new SimulatedCrashError(txId, index)
+            }
           } catch (e) {
+            if (e instanceof SimulatedCrashError) throw e   // 穿透：模拟进程死亡
             await rollbackRuntime(rt, `步骤 ${index}(${op.id}) 异常: ${errorToMessage(e)}`)
             await finalize(rt)
             return err(ioError('事务执行失败', e))
@@ -410,6 +471,9 @@ export function createTransactionEngine(
         await finalize(rt)
         return ok(summarize(rt, txId))
       } catch (e) {
+        // 混沌演习：模拟进程死亡 —— 不补偿、不释放锁、不写终结审计，
+        // 由演习方（nuke_drill）捕获后走真实崩溃恢复路径（recover()）
+        if (e instanceof SimulatedCrashError) throw e
         // rollbackRuntime 已保证不抛；此处兜住其余一切逃逸（WAL/审计/钩子 IO）
         try { await rollbackRuntime(rt, `commit 逃逸异常: ${errorToMessage(e)}`) } catch { /* 不可达 */ }
         await finalize(rt)
