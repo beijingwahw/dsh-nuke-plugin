@@ -26,7 +26,9 @@
       "nuke_verify",
       "nuke_doctor",
       "nuke_guardian",
-      "nuke_ledger"
+      "nuke_ledger",
+      "nuke_oracle",
+      "nuke_drill"
     ],
     "skills": []
   }
