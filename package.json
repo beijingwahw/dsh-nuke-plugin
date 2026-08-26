@@ -2,6 +2,7 @@
   "name": "dsh-nuke-plugin",
   "version": "3.0.0",
   "description": "强力卸载 DSH 插件 — 策略分级 · 批量原子 · 指纹快照 · 健康检查 · 并发锁 · 报告导出",
+  "type": "module",
   "main": "lib/index.js",
   "repository": {
     "type": "git",
@@ -20,7 +21,7 @@
     "transaction"
   ],
   "scripts": {
-    "build": "tsdown src/index.ts --format cjs --out-dir lib",
+    "build": "tsdown src/index.ts --format esm --out-dir lib",
     "dev": "node --expose-internals --import tsx ./node_modules/@deepseek-ai/cordis/bin.js",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
