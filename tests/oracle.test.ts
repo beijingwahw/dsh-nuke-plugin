@@ -378,3 +378,115 @@ describe('先知引擎（V5.2 决策智能：帕累托计划合成 + 大小分�
     expect(r.ok).toBe(true)
   })
 })
+
+describe('先知引擎（V5.3 失败模式智能：模式诊断 / 重试感知推演 / 优化器对齐）', () => {
+  /** V5.3 mock：remove-node-modules 历史失败全是 EBUSY（locked，瞬态），
+   *  引擎重试可挽回 → retryAdjusted 显著高于裸成功率 */
+  function modeModel(pRaw: number, pAdj: number): IReliabilityModel {
+    return {
+      sampleCount: 20,
+      globalSuccessProbability: 0.9,
+      byAction: () => new Map(),
+      reliabilityOf: (action): ActionReliability => ({
+        action,
+        successes: action === 'remove-node-modules' ? 8 : 10,
+        failures: action === 'remove-node-modules' ? 4 : 0,
+        successProbability: action === 'remove-node-modules' ? pRaw : 1,
+        ci95: [0, 1],
+        selfWeight: action === 'remove-node-modules' ? 0.4 : 0.5,
+        calibration: null,
+        failureModes: action === 'remove-node-modules'
+          ? [{
+            mode: 'locked' as const, count: 4, share: 1,
+            transience: 'transient' as const,
+          }]
+          : [],
+        transientShare: action === 'remove-node-modules' ? 1 : 0,
+        retryAdjustedProbability: action === 'remove-node-modules' ? pAdj : 1,
+      }),
+    }
+  }
+
+  it('重试感知事务成功率 = ∏ retryAdjusted p_i（与裸连乘并列，口径透明）', async () => {
+    // 步骤：patch(p=1) → node-modules(p=0.5, 重试感知 0.875) → storages(p=1)
+    const oracle = buildOracle(modeModel(0.5, 0.875))
+    const r = okv(await oracle.divine(request))
+    expect(r.transactionSuccessProbability).toBeCloseTo(0.5)          // 裸口径不变
+    expect(r.retryAdjustedSuccessProbability).toBeCloseTo(0.875)      // 重试感知口径
+    // 步骤级透传：失败模式分布 + 重试感知成功率
+    const nm = r.steps.find(s => s.action === 'remove-node-modules')!
+    expect(nm.failureModes).toHaveLength(1)
+    expect(nm.failureModes[0]!.mode).toBe('locked')
+    expect(nm.failureModes[0]!.transience).toBe('transient')
+    expect(nm.retryAdjustedProbability).toBeCloseTo(0.875)
+    expect(nm.transientShare).toBeCloseTo(1)
+    // 其余步骤零失败：空模式档案 + 恒等投影
+    const patch = r.steps.find(s => s.action === 'clean-home-patch')!
+    expect(patch.failureModes).toEqual([])
+    expect(patch.retryAdjustedProbability).toBeCloseTo(1)
+  })
+
+  it('最脆弱步骤附带主导模式诊断与处方（从"哪里弱"到"为什么弱、怎么办"）', async () => {
+    const oracle = buildOracle(modeModel(0.5, 0.875))
+    const r = okv(await oracle.divine(request))
+    const w = r.weakestStep!
+    expect(w.index).toBe(1)                            // node-modules 仍是最脆弱
+    expect(w.dominantFailureMode).toBe('locked')
+    expect(w.dominantFailureShare).toBeCloseTo(1)
+    expect(w.prescription).toContain('EBUSY')
+    expect(w.prescription).toContain('重试')
+    // 叙事融合重试感知口径（有效成功率高于裸口径时明确告知）
+    expect(r.narrative).toContain('重试')
+  })
+
+  it('零失败历史：最脆弱步骤无模式诊断（dominant=null，诚实缺省）', async () => {
+    const oracle = buildOracle(mockModel(() => 0.9))
+    const r = okv(await oracle.divine(request))
+    const w = r.weakestStep!
+    expect(w.dominantFailureMode).toBeNull()
+    expect(w.dominantFailureShare).toBe(0)
+    expect(w.prescription).toBeNull()
+    // 全部步骤恒等投影 → 重试感知 = 裸连乘
+    expect(r.retryAdjustedSuccessProbability).toBeCloseTo(r.transactionSuccessProbability)
+  })
+
+  it('优化器候选取重试调整口径：计划合成与引擎真实行为（含自动重试）对齐', async () => {
+    // node-modules 裸 p=0.5（历史 EBUSY 失败），重试感知 0.99 —— V5.2 口径下
+    // 优化器会把它当弱者剔除；V5.3 口径下它几乎可靠，应被保留
+    const oracle = buildOracle(modeModel(0.5, 0.99))
+    const r = okv(await oracle.divine(request))
+    const plan = r.optimizedPlan!
+    // 重试感知下全集 P=0.99、E≈0.99×700=693 —— 剔除它牺牲 200B 只换 1 个点，
+    // 性价比极差 → 推荐保留全部三步
+    expect(plan.recommended.actions).toContain('remove-node-modules')
+    expect(plan.recommended.successProbability).toBeCloseTo(0.99)
+    expect(plan.drops).toHaveLength(0)
+  })
+
+  it('全瞬态历史 → 重试感知叙事生效；全永久失败 → 无重试增益', async () => {
+    // permission（永久）：重试不增益 → 两口径一致，叙事不提重试
+    const permModel: IReliabilityModel = {
+      sampleCount: 20,
+      globalSuccessProbability: 0.9,
+      byAction: () => new Map(),
+      reliabilityOf: (action): ActionReliability => ({
+        action,
+        successes: 0, failures: action === 'remove-node-modules' ? 4 : 0,
+        successProbability: action === 'remove-node-modules' ? 0.5 : 1,
+        ci95: [0, 1], selfWeight: 0.4, calibration: null,
+        failureModes: action === 'remove-node-modules'
+          ? [{ mode: 'permission' as const, count: 4, share: 1, transience: 'permanent' as const }]
+          : [],
+        transientShare: 0,
+        retryAdjustedProbability: action === 'remove-node-modules' ? 0.5 : 1,
+      }),
+    }
+    const oracle = buildOracle(permModel)
+    const r = okv(await oracle.divine(request))
+    expect(r.retryAdjustedSuccessProbability).toBeCloseTo(0.5)
+    // 永久模式处方：指引人工介入（重试无意义）
+    expect(r.weakestStep!.dominantFailureMode).toBe('permission')
+    expect(r.weakestStep!.prescription).toContain('权限')
+    expect(r.narrative).not.toContain('自动重试瞬态失败')
+  })
+})

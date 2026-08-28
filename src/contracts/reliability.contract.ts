@@ -17,6 +17,7 @@
 // 下游消费者：先知引擎（oracle）用它们把 dry-run 的确定性预估
 // 升级为概率化的后果推演。
 import type { CleanAction } from './base'
+import type { FailureModeStat } from './failure.contract'
 
 /** 校准比（actual/estimated）分布摘要 */
 export interface CalibrationSummary {
@@ -58,6 +59,16 @@ export interface ActionReliability {
   readonly calibration: CalibrationSummary | null
   /** V5.2：带 sizeBytes 查询时的桶级调制证据；未查询大小时为 undefined */
   readonly sizeBucket?: SizeBucketEvidence
+  /** V5.3：失败模式分布（按 share 降序；零失败动作 = 空数组）。
+   *  回答"这步为什么挂"—— 可靠性的因果补全。 */
+  readonly failureModes?: readonly FailureModeStat[]
+  /** V5.3：瞬态失败占全部失败的份额 0-1（零失败 = 0）。
+   *  引擎自动重试只对这部分失败有效。 */
+  readonly transientShare?: number
+  /** V5.3：重试调整成功率 = p + (1-p)·transientShare·(1-(1-e)^R)。
+   *  语义：引擎自动重试瞬态失败（有界次数）前提下的有效成功率。
+   *  基础 p 取自经验（含历史重试效果），不重复计息 —— 收敛不发散。 */
+  readonly retryAdjustedProbability?: number
 }
 
 export interface IReliabilityModel {

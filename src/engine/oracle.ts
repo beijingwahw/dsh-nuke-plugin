@@ -17,6 +17,8 @@ import { err, ioError, ok } from '../contracts/base'
 import type { IReliabilityModel } from '../contracts/reliability.contract'
 import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
 } from '../contracts/oracle.contract'
+import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
+import type { FailureMode, FailureModeStat } from '../contracts/failure.contract'
 import type { OptimizedPlan, OptimizerGoal } from '../contracts/optimizer.contract'
 import type { ILogger } from '../contracts/logging'
 import type { Clock } from '../contracts/base'
@@ -48,21 +50,43 @@ export interface MonteCarloSummary {
   readonly successRate: number
 }
 
-/** 最脆弱步骤详情：附带"修复它对整体成功率的提升幅度"（可行动性） */
+/** 最脆弱步骤详情：附带"修复它对整体成功率的提升幅度"（可行动性）
+ *  V5.3：附失败模式诊断与处方 —— 从"哪里最弱"升级为"为什么弱、怎么办" */
 export interface OracleWeakestStepDetail extends OracleWeakestStep {
   /** 将该步成功率视作 1（完全修复）后的整体成功率 */
   readonly repairedSuccessProbability: number
   /** 修复带来的整体成功率绝对提升（repaired − current） */
   readonly repairUplift: number
+  /** V5.3：该步历史失败的主导模式（零失败历史 = null） */
+  readonly dominantFailureMode: FailureMode | null
+  /** V5.3：主导模式的失败份额 0-1（dominantFailureMode 为 null 时 = 0） */
+  readonly dominantFailureShare: number
+  /** V5.3：按模式给出的处方（人类可读，来自失败分类学单一事实源） */
+  readonly prescription: string | null
+}
+
+/** V5.3 步骤详情：契约字段语义不变，附失败模式分布与重试调整成功率 */
+export interface OracleStepDetail extends OracleStep {
+  /** 历史失败模式分布（share 降序；零失败 = 空数组） */
+  readonly failureModes: readonly FailureModeStat[]
+  /** 瞬态失败份额（引擎自动重试只对这部分有效） */
+  readonly transientShare: number
+  /** 引擎自动重试瞬态失败前提下的有效成功率 */
+  readonly retryAdjustedProbability: number
 }
 
 /** 先知报告详情：契约字段语义不变，新增蒙特卡洛分布与修复建议 */
 export interface OracleReportDetail extends OracleReport {
+  readonly steps: readonly OracleStepDetail[]
   readonly weakestStep: OracleWeakestStepDetail | null
   /** 蒙特卡洛模拟结果（trials=0 时各分位数与均值退化为 0） */
   readonly monteCarlo: MonteCarloSummary
   /** V5.2 决策智能：帕累托最优计划合成（优化失败不阻断推演 → null） */
   readonly optimizedPlan: OptimizedPlan | null
+  /** V5.3：重试感知事务成功率 = ∏ retryAdjusted p_i。
+   *  引擎将自动重试瞬态失败（有界次数）前提下的整体成功率 ——
+   *  与 transactionSuccessProbability（裸连乘）并列，口径透明。 */
+  readonly retryAdjustedSuccessProbability: number
 }
 
 /** IOracle 的引擎层扩展：divine 返回详情报告（协变返回类型） */
@@ -207,7 +231,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
 
         // ── 可靠性融合 ──────────────────────────────────────────
         const rel = await deps.reliability()
-        const steps: OracleStep[] = []
+        const steps: OracleStepDetail[] = []
         // 后缀和：exposure_i = Σ_{j≥i} b_j（第 i 步失败作废的总量）
         const suffix = new Array<number>(previews.length + 1).fill(0)
         for (let i = previews.length - 1; i >= 0; i--) {
@@ -226,11 +250,17 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
             selfWeight: r.selfWeight,
             exposureBytes: suffix[i]!,
             calibration: r.calibration,
+            // V5.3 失败模式智能：这步为什么挂 + 引擎自愈后的有效成功率
+            failureModes: r.failureModes ?? [],
+            transientShare: r.transientShare ?? 0,
+            retryAdjustedProbability: r.retryAdjustedProbability ?? r.successProbability,
           })
         }
 
         // 事务成功率：Saga 全成或全无 → 连乘
         const pSuccess = steps.reduce((acc, s) => acc * s.successProbability, 1)
+        // V5.3：重试感知成功率 —— 引擎自动重试瞬态失败前提下的连乘
+        const pRetryAdjusted = steps.reduce((acc, s) => acc * s.retryAdjustedProbability, 1)
 
         // 期望回收与区间：成功前提下的校准分位 × 各步预估
         const calOf = (s: OracleStep, q: 'p10' | 'p50' | 'p90') => {
@@ -245,18 +275,23 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
 
         // 最脆弱步骤：失败概率 × 敞口（作废的预估量）最大者；
         // 附带修复收益 —— 把该步成功率视作 1 后整体成功率提升多少
-        // （"先修哪里"的可行动性排序依据，而非只报忧）
+        //（"先修哪里"的可行动性排序依据，而非只报忧）
+        // V5.3：附主导失败模式与处方 —— 诊断书而非只报忧
         let weakest: OracleWeakestStepDetail | null = null
         for (const s of steps) {
           const vuln = (1 - s.successProbability) * s.exposureBytes
           const cur = weakest ? (1 - weakest.successProbability) * weakest.exposureBytes : -1
           if (vuln > cur && vuln > 0) {
             const repaired = pSuccess / s.successProbability
+            const dominant = s.failureModes[0] ?? null
             weakest = {
               index: s.index, action: s.action,
               successProbability: s.successProbability, exposureBytes: s.exposureBytes,
               repairedSuccessProbability: Math.min(1, repaired),
               repairUplift: Math.min(1, repaired) - pSuccess,
+              dominantFailureMode: dominant ? dominant.mode : null,
+              dominantFailureShare: dominant ? dominant.share : 0,
+              prescription: dominant ? MODE_PRESCRIPTIONS[dominant.mode] : null,
             }
           }
         }
@@ -312,6 +347,8 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         const priorOnlySteps = steps.filter(s => (s.selfWeight ?? 0) === 0).length
 
         // ── V5.2 决策智能：帕累托最优计划合成（优化失败不阻断推演） ──
+        // V5.3：候选成功率取重试调整口径 —— 计划合成描述的是引擎将
+        // 真实执行的行为（含瞬态自动重试），预测与执行语义对齐
         let optimizedPlan: OptimizedPlan | null = null
         try {
           const candidates = previews.map((pv, i) => {
@@ -319,7 +356,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
             return {
               action: pv.op.action,
               index: i,
-              successProbability: r.successProbability,
+              successProbability: r.retryAdjustedProbability ?? r.successProbability,
               estimatedBytes: pv.estimated,
               calibrationRatio: r.calibration ? r.calibration.p50 : 1,
               riskLevel: 'medium' as const,
@@ -344,8 +381,9 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           confidence,
           monteCarlo: mc,
           optimizedPlan,
+          retryAdjustedSuccessProbability: pRetryAdjusted,
           narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc,
-            priorOnlySteps, rel.globalSuccessProbability),
+            priorOnlySteps, rel.globalSuccessProbability, pRetryAdjusted),
           evidence: {
             stepSamples: rel.sampleCount,
             globalSuccessProbability: rel.globalSuccessProbability,
@@ -367,16 +405,24 @@ function narrate(
   mc: MonteCarloSummary,
   priorOnlySteps = 0,
   globalPrior = 0.95,
+  pRetryAdjusted?: number,
 ): string {
   const pct = (p: number) => `${(p * 100).toFixed(1)}%`
   const parts: string[] = []
   parts.push(`事务成功率 ${pct(p)}，期望回收 ${fmtBytes(expected)}`)
+  // V5.3：重试感知口径 —— 引擎将自愈瞬态失败，用户应看到"有效成功率"
+  if (typeof pRetryAdjusted === 'number' && pRetryAdjusted > p + 0.0005) {
+    parts.push(`引擎自动重试瞬态失败（EBUSY/超时等）后有效成功率 ${pct(pRetryAdjusted)}（+${((pRetryAdjusted - p) * 100).toFixed(1)} 个百分点）`)
+  }
   if (mc.trials > 0) {
     // 蒙特卡洛互证口径：P10/P90 是含失败回滚的分布分位（悲观-乐观带）
     parts.push(`蒙特卡洛 ${mc.trials} 次抽样：回收 P10 ${fmtBytes(mc.p10)} ~ P90 ${fmtBytes(mc.p90)}（抽样成功率 ${pct(mc.successRate)}）`)
   }
   if (weakest && (1 - weakest.successProbability) * weakest.exposureBytes > 0) {
-    parts.push(`最脆弱环节是第 ${weakest.index} 步 ${weakest.action}（成功率 ${(weakest.successProbability * 100).toFixed(0)}%，失败将作废 ${fmtBytes(weakest.exposureBytes)} 潜在回收；修复它可将整体成功率提升至 ${pct(weakest.repairedSuccessProbability)}（+${(weakest.repairUplift * 100).toFixed(1)} 个百分点））`)
+    const diag = weakest.dominantFailureMode !== null
+      ? `，历史主导失败模式 ${weakest.dominantFailureMode}（占 ${(weakest.dominantFailureShare * 100).toFixed(0)}%）；处方：${weakest.prescription}`
+      : ''
+    parts.push(`最脆弱环节是第 ${weakest.index} 步 ${weakest.action}（成功率 ${(weakest.successProbability * 100).toFixed(0)}%，失败将作废 ${fmtBytes(weakest.exposureBytes)} 潜在回收；修复它可将整体成功率提升至 ${pct(weakest.repairedSuccessProbability)}（+${(weakest.repairUplift * 100).toFixed(1)} 个百分点）${diag}）`)
   }
   if (broken && broken.length > 0) {
     parts.push(`⚠️ 将损坏 ${broken.length} 个外部依赖方（${broken.join(', ')}），建议先解除依赖或同批删除`)

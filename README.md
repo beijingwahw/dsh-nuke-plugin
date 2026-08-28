@@ -3,7 +3,7 @@
 > DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
-[![Tests](https://img.shields.io/badge/tests-444%2F444-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
+[![Tests](https://img.shields.io/badge/tests-528%2F528-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -42,7 +42,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 5. **保护名单 + 限额 + 黑窗** — 作为引擎 pre-hook veto，超限即拒绝（纵深防御，不依赖单层检查）
 6. **回收区代替物理删除** — commit 后才允许 purge；restore 失败或存在孤儿产物时绝不 purge
 
-## 工具速查（21 个）
+## 工具速查（22 个）
 
 所有工具注册为 dsh Agent 工具，安装后直接让 Agent 调用即可。
 
@@ -66,6 +66,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | `nuke_trend` | 历史趋势：字节/天变化率、30 天外推、3σ̂ 异常检测（失控写盘早期信号） |
 | `nuke_forecast` | 磁盘写满预测：趋势 × 实时余量 → 倒计时与分级建议 |
 | `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长；基于历史执行数据贝叶斯自学习，零副作用不拿锁 |
+| `nuke_failures` | **失败档案**：每类动作的历史失败模式诊断（EBUSY 锁定/超时/权限/校验拒绝…）、瞬态份额与处方；⚡瞬态引擎自动重试、🔒永久需人工介入 |
 
 ### 执行 — 事务化清理
 
@@ -170,6 +171,32 @@ dry-run 是确定性预演，先知是概率化推演。每次清理的每个步
          → 决策（先修最弱步骤，或换 safe 策略）
             → 再执行 → 数据更准 → ...
 ```
+
+## V5.3 失败模式智能：从"会挂"到"为什么挂、怎么办"
+
+V5.2 之前，系统学习"这步会挂"（概率），但不学习"以什么方式挂、挂了怎么办"。失败被回滚后，下一次清理迎面撞上同一个失败。V5.3 闭环了**预测 → 诊断 → 处方 → 自愈 → 再学习**：
+
+```
+失败分类学（契约层单一事实源）
+   ├── 分类器：错误文本 → 10 种规范模式（locked/timeout/resource/space/
+   │   vanished/permission/validation/dependency/io/unknown）
+   ├── 瞬态性：transient（EBUSY/超时/句柄…重试有救）vs permanent（校验/权限/依赖…重试纯浪费）
+   └── 处方：每个模式一条人类可读的修复指引
+        ↓ 写方（引擎）与读方（模型）共享 —— 分类规则永不漂移
+   ├── 引擎：步骤级模式感知重试（瞬态 → 有界指数退避自动重试；永久 → 立即失败快速回滚）
+   ├── 模型：从审计链学习每动作的失败模式分布 + 瞬态份额
+   │         → 重试调整成功率 p_adj = p + (1-p)·t·(1-(1-e)^R)
+   └── 先知：重试感知事务成功率（两档口径并列）+ 最脆弱步骤的模式诊断与处方
+             + 计划合成候选取重试调整口径（预测与引擎真实行为对齐）
+```
+
+三个关键设计：
+
+- **模式感知重试，不是盲目重试**——EBUSY（文件被占用）稍后自愈概率高，指数退避后重试（默认 2 次、退避 150ms 起步、单次等待上限 2s）；`E_VALIDATION`（策略拒绝）重试一万次结果相同，立即回滚省时间。命令级重试（exec-ops 的 spawn 错误）之上补齐了步骤级（fs/edit 操作失败同样覆盖）
+- **投影不双重计息**——基础 p 取经验值（历史若已含重试自愈效果则一并计入），重试调整投影建立在经验之上：`p_adj = p + (1-p)·t·(1-(1-e)^R)`（t=瞬态份额，R=重试上限，e=单次重试成功率默认 0.5）。引擎一直开着重试时投影收敛于经验值，永不发散
+- **审计即学习数据**——引擎把 `retries` 与 `failureMode` 写进步骤审计 detail；可靠性模型优先读显式 failureMode（新条目），缺失时从 error 文本现场分类（旧条目兼容）—— 迁移零成本
+
+`nuke_oracle` 输出升级：**♻️ 重试感知成功率**（两档口径并列）、逐步推演附**模式画像**（`locked⚡80%` = 80% 的历史失败是锁定、瞬态可自愈）、最脆弱步骤附**🩺 主导失败模式 + 💊 处方**。新工具 `nuke_failures` 给出全部动作的失败档案。
 
 ## V5.2 决策智能：帕累托计划合成（先知从"预测者"到"决策顾问"）
 

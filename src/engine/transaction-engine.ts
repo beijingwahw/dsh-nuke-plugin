@@ -17,6 +17,10 @@ import type {
 } from '../contracts/transaction'
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX } from '../contracts/logging'
+import {
+  classifyFailureMode, DEFAULT_RETRY_POLICY, MODE_TRANSIENCE,
+} from '../contracts/failure.contract'
+import type { FailureMode, RetryPolicy } from '../contracts/failure.contract'
 import type { ILockManager, LockOwner } from '../contracts/lock'
 import type { IPathResolver } from '../contracts/paths'
 import type { ILogger } from '../contracts/logging'
@@ -45,6 +49,11 @@ export interface TransactionEngineOptions {
   /** dryRun 预演并发度（有界并发池 lane 数），默认 4。
    *  并发只加速 IO 等待，输出仍严格按 plan 顺序收集（索引序而非完成序）。 */
   readonly previewConcurrency?: number
+  /** V5.3：步骤级模式感知重试策略。默认 { maxRetries: 2, backoffMs: 150 }：
+   *  execute 失败时按失败分类学判定瞬态性 —— 瞬态（EBUSY/超时/句柄耗尽…）
+   *  指数退避后自动重试；永久（校验拒绝/权限/依赖缺失…）立即失败回滚。
+   *  maxRetries: 0 完全关闭（回到 V4 语义）。 */
+  readonly retryPolicy?: RetryPolicy
 }
 
 /** V5：步骤运行时形态 —— 在契约步骤之上可选携带 execute 耗时（毫秒）。
@@ -59,6 +68,14 @@ export type TxSummaryWithStepTimings = Omit<TxSummary, 'steps'> & {
 }
 
 const DEFAULT_PREVIEW_CONCURRENCY = 4
+
+/** 退避上限：即使 maxRetries 配置得很大，单次等待也不超过 2s ——
+ *  重试总时延有物理上界，独占锁不会被无界退避无限占用 */
+const MAX_BACKOFF_MS = 2_000
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 /** 状态机合法迁移表 */
 const TRANSITIONS: Record<TxState, readonly TxState[]> = {
@@ -96,6 +113,11 @@ export function createTransactionEngine(
   const previewConcurrency = Number.isInteger(options.previewConcurrency) && (options.previewConcurrency ?? 0) >= 1
     ? (options.previewConcurrency as number)
     : DEFAULT_PREVIEW_CONCURRENCY
+  /** V5.3 步骤级重试：负值/非整数钳制为 0（关闭），永不产生无界重试 */
+  const retryMax = Number.isInteger(options.retryPolicy?.maxRetries)
+    ? Math.max(0, options.retryPolicy?.maxRetries ?? 0)
+    : DEFAULT_RETRY_POLICY.maxRetries
+  const retryBackoffMs = Math.max(0, options.retryPolicy?.backoffMs ?? DEFAULT_RETRY_POLICY.backoffMs)
   /** 终结事务摘要缓存（commit/rollback 后仍可 status 查询；进程重启后回退 WAL 重建）。
    *  LRU 上限：长驻进程中无限增长的 Map 是慢性内存泄漏；溢出逐最旧，
    *  被逐条目仍可从 WAL 重建（status 的第三路径）。 */
@@ -465,17 +487,38 @@ export function createTransactionEngine(
             const executed = await (async () => {
               // V5：步骤计时 —— execute 前后取注入时钟，耗时随 step-done 审计与摘要下发
               const startedAt = deps.clock.now().getTime()
-              const r = await op.execute(ctx)
+              // V5.3：步骤级模式感知重试 —— 失败分类学判定瞬态性：
+              //   transient（EBUSY/超时/句柄…）→ 指数退避后重试（有界）
+              //   permanent（校验/权限/依赖…）→ 立即失败（重试是纯浪费）
+              // 计时覆盖全部尝试（含退避等待），审计 detail 记录 retries
+              // 与最终 failureMode —— 可靠性模型的 V5.3 学习数据源。
+              let retries = 0
+              let r = await op.execute(ctx)
+              while (!r.ok && retries < retryMax) {
+                const mode = classifyFailureMode(r.error.message)
+                if (MODE_TRANSIENCE[mode] !== 'transient') break
+                retries++
+                const wait = Math.min(MAX_BACKOFF_MS, retryBackoffMs * 2 ** (retries - 1))
+                deps.logger.info('步骤瞬态失败，自动重试', {
+                  tx: txId, op: op.id, mode, retry: retries, max: retryMax, waitMs: wait,
+                  error: r.error.message,
+                })
+                if (wait > 0) await sleep(wait)
+                r = await op.execute(ctx)
+              }
               const durationMs = Math.max(0, deps.clock.now().getTime() - startedAt)
-              return { r, durationMs }
+              return { r, durationMs, retries }
             })()
             if (!executed.r.ok) {
+              const failureMode: FailureMode = classifyFailureMode(executed.r.error.message)
               rt.steps[index] = { ...rt.steps[index]!, status: 'failed', backup: null, durationMs: executed.durationMs }
               await deps.wal.append(txId, { type: 'step-failed', index, error: executed.r.error })
               await auditStep(rt, op, 'failure', {
                 operationId: op.id, estimated: estimated ?? null,
                 error: executed.r.error.message,
                 durationMs: executed.durationMs,
+                retries: executed.retries,
+                failureMode,
               })
               // error 钩子可建议处置
               const errHook = await deps.hooks.emit('error', {
@@ -501,6 +544,9 @@ export function createTransactionEngine(
               estimated: estimated ?? null,
               actual: outcome.bytesFreed,
               durationMs: executed.durationMs,
+              // V5.3：重试后成功是宝贵证据（瞬态失败被引擎自愈）——
+              // retries>0 的成功样本让"重试调整投影"有据可依
+              ...(executed.retries > 0 ? { retries: executed.retries } : {}),
               ...(estimated !== undefined && estimated > 0
                 ? { ratio: outcome.bytesFreed / estimated }
                 : {}),

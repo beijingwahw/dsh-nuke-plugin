@@ -305,3 +305,93 @@ describe('可靠性统计升级（Wilson 区间 + 时间加权分位数）', () 
     expect(cal2!.p50).toBeCloseTo(0.6, 4)
   })
 })
+
+describe('V5.3 失败模式智能（模式学习 / 瞬态份额 / 重试调整投影）', () => {
+  it('失败模式归因：error 文本分类 + 显式 failureMode 优先 + 旧样本兼容', async () => {
+    const audit = auditAt('modes')
+    // remove-node-modules：3 次 EBUSY（locked）+ 1 次 EACCES（permission）失败
+    for (let i = 0; i < 3; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-node-modules', outcome: 'failure',
+        detail: { error: "EBUSY: resource busy or locked, rename 'a' -> 'b'" },
+      })
+    }
+    // 旧式条目（无 failureMode）→ 现场分类 error 文本
+    await audit.append({
+      timestamp: '2026-08-20T00:00:10Z',
+      actor: 't', action: 'op:remove-node-modules', outcome: 'failure',
+      detail: { error: "EACCES: permission denied, unlink '/root/x'" },
+    })
+    // 新式条目（引擎 V5.3 显式 failureMode）→ 直接采用，无需文本
+    await audit.append({
+      timestamp: '2026-08-20T00:00:11Z',
+      actor: 't', action: 'op:remove-node-modules', outcome: 'failure',
+      detail: { error: 'Timeout after 30000ms', failureMode: 'timeout' },
+    })
+    const model = await createReliabilityModel({ audit })
+    const r = model.reliabilityOf('remove-node-modules')
+    expect(r.failures).toBe(5)
+    expect(r.failureModes).toBeDefined()
+    // 分布：locked 3/5, permission 1/5, timeout 1/5（count 降序）
+    expect(r.failureModes!.map(m => [m.mode, m.count])).toEqual([
+      ['locked', 3], ['permission', 1], ['timeout', 1],
+    ])
+    expect(r.failureModes![0]!.share).toBeCloseTo(0.6, 6)
+    expect(r.failureModes![0]!.transience).toBe('transient')
+    // 瞬态份额 = (locked 3 + timeout 1)/5 = 0.8
+    expect(r.transientShare).toBeCloseTo(0.8, 6)
+  })
+
+  it('重试调整投影：p_adj = p + (1-p)·t·(1-(1-e)^R)，且不越界', async () => {
+    const audit = auditAt('retry-adj')
+    // remove-storages：2 成 2 败（全 EBUSY）→ t=1
+    for (let i = 0; i < 2; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-storages', outcome: 'success',
+        detail: { estimated: 100, actual: 100 },
+      })
+    }
+    for (let i = 0; i < 2; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:01:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-storages', outcome: 'failure',
+        detail: { error: 'EBUSY: 被占用' },
+      })
+    }
+    const model = await createReliabilityModel({ audit, retryAttempts: 2, retryEfficacy: 0.5 })
+    const r = model.reliabilityOf('remove-storages')
+    expect(r.transientShare).toBeCloseTo(1, 6)
+    // p_adj = p + (1-p)×1×0.75 = 0.25 + 0.75×0.75（恒等展开验证）
+    const expected = r.successProbability + (1 - r.successProbability) * 0.75
+    expect(r.retryAdjustedProbability).toBeCloseTo(expected, 10)
+    expect(r.retryAdjustedProbability).toBeGreaterThan(r.successProbability)
+    expect(r.retryAdjustedProbability).toBeLessThanOrEqual(1)
+  })
+
+  it('零失败动作：failureModes 空、transientShare=0、retryAdjusted 恒等', async () => {
+    const audit = auditAt('no-fail')
+    for (let i = 0; i < 3; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:clean-home-patch', outcome: 'success',
+        detail: { estimated: 10, actual: 9 },
+      })
+    }
+    const model = await createReliabilityModel({ audit })
+    const r = model.reliabilityOf('clean-home-patch')
+    expect(r.failures).toBe(0)
+    expect(r.failureModes).toEqual([])
+    expect(r.transientShare).toBe(0)
+    expect(r.retryAdjustedProbability).toBeCloseTo(r.successProbability, 12)
+  })
+
+  it('冷启动：零历史动作的模式字段诚实缺省（空分布 + 恒等投影）', async () => {
+    const model = await createReliabilityModel({ audit: auditAt('cold-v53') })
+    const r = model.reliabilityOf('remove-node-modules')
+    expect(r.failureModes).toEqual([])
+    expect(r.transientShare).toBe(0)
+    expect(r.retryAdjustedProbability).toBeCloseTo(r.successProbability, 12)
+  })
+})

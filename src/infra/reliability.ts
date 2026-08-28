@@ -40,6 +40,10 @@ import { OP_AUDIT_PREFIX } from '../contracts/logging'
 import type {
   ActionReliability, CalibrationSummary, IReliabilityModel, SizeBucket,
 } from '../contracts/reliability.contract'
+import {
+  classifyFailureMode, DEFAULT_RETRY_EFFICACY, MODE_TRANSIENCE, retryAdjustedProbability,
+} from '../contracts/failure.contract'
+import type { FailureMode, FailureModeStat } from '../contracts/failure.contract'
 
 // ─── V5.2：大小桶边界（操作级协变量调制） ─────────────────────
 // 大目录删除的失败模式（EBUSY/长路径/超时/句柄耗尽）与 5MB 级完全不同，
@@ -79,6 +83,11 @@ export interface ReliabilityModelOptions {
    *  年龄以该动作样本中最新的时间戳为基准 —— 无墙钟依赖，结果确定。
    *  Infinity = 不做时间衰减（全 1 权重，等价于未加权分位数）。 */
   readonly calibrationHalfLifeMs?: number
+  /** V5.3：重试调整投影的引擎重试次数上限（默认 2，与引擎默认重试策略
+   *  对齐 —— 模型描述的必须是将要发生的引擎行为）。 */
+  readonly retryAttempts?: number
+  /** V5.3：单次重试对瞬态失败的成功率（默认 0.5，见 failure.contract） */
+  readonly retryEfficacy?: number
   /** 只统计该时间之后的观测（ISO；默认全部） */
   readonly since?: string
 }
@@ -94,6 +103,8 @@ interface ActionStats {
   samples: CalibrationSample[]
   /** V5.2：大小桶统计（estimated 可归桶的成败样本；双向归桶保证无偏） */
   buckets: Map<SizeBucket, { successes: number; failures: number }>
+  /** V5.3：失败模式计数（错误文本 → 分类学；写方也可直接给 failureMode） */
+  modes: Map<FailureMode, number>
 }
 
 function quantile(sorted: readonly number[], q: number): number {
@@ -165,6 +176,8 @@ export async function createReliabilityModel(
   const priorK = options.priorStrength ?? 20
   const minCal = options.minCalibrationSamples ?? 3
   const halfLifeMs = options.calibrationHalfLifeMs ?? 30 * 24 * 3600 * 1000
+  const retryAttempts = options.retryAttempts ?? 2
+  const retryEfficacy = options.retryEfficacy ?? DEFAULT_RETRY_EFFICACY
 
   // ── 采集：一次性读审计链，按动作聚合 ───────────────────────
   const entries = await options.audit.query(options.since !== undefined ? { since: options.since } : {})
@@ -176,7 +189,11 @@ export async function createReliabilityModel(
     if (e.outcome === 'skipped') continue   // 策略性跳过不是可靠性证据
     const action = e.action.slice(OP_AUDIT_PREFIX.length)
     const s = stats.get(action)
-      ?? { successes: 0, failures: 0, samples: [] as CalibrationSample[], buckets: new Map<SizeBucket, { successes: number; failures: number }>() }
+      ?? {
+        successes: 0, failures: 0, samples: [] as CalibrationSample[],
+        buckets: new Map<SizeBucket, { successes: number; failures: number }>(),
+        modes: new Map<FailureMode, number>(),
+      }
     const est = (e.detail as { estimated?: unknown }).estimated
     const act = (e.detail as { actual?: unknown }).actual
     if (e.outcome === 'success') {
@@ -189,6 +206,15 @@ export async function createReliabilityModel(
     } else {
       s.failures++
       pooledF++
+      // V5.3 失败模式归因：优先取写方显式记录的 failureMode（事务引擎
+      // 已分类），缺失（旧条目/外部写入）则从 error 文本现场分类 ——
+      // 分类学在契约层单一事实源，两侧规则永不漂移。
+      const detail = e.detail as { failureMode?: unknown; error?: unknown }
+      const mode: FailureMode = typeof detail.failureMode === 'string'
+        && detail.failureMode in MODE_TRANSIENCE
+        ? detail.failureMode as FailureMode
+        : classifyFailureMode(typeof detail.error === 'string' ? detail.error : null)
+      s.modes.set(mode, (s.modes.get(mode) ?? 0) + 1)
     }
     // V5.2 大小桶：成败双向归桶（estimated>0 即可归桶；失败样本同样
     // 带 estimated —— 事务引擎失败审计已记录预估量，负证据不丢失）
@@ -272,6 +298,30 @@ export async function createReliabilityModel(
         p90: weightedQuantile(samples, 0.90),
       }
       : null
+
+    // V5.3 失败模式智能：模式分布（share 降序）+ 瞬态份额 + 重试调整投影。
+    // 基础 p 是经验值（历史若已含重试效果则一并计入）—— 投影建立在
+    // 经验之上而非替换经验，重试效果不会被双重计息（收敛不发散）。
+    const totalFail = fail
+    const failureModes: FailureModeStat[] = []
+    if (totalFail > 0 && s) {
+      for (const [mode, count] of s.modes) {
+        failureModes.push({
+          mode,
+          count,
+          share: count / totalFail,
+          transience: MODE_TRANSIENCE[mode],
+        })
+      }
+      failureModes.sort((a, b) => b.count - a.count)
+    }
+    const transientShare = totalFail > 0 && s
+      ? [...s.modes.entries()]
+        .filter(([m]) => MODE_TRANSIENCE[m] === 'transient')
+        .reduce((acc, [, c]) => acc + c, 0) / totalFail
+      : 0
+    const retryAdj = retryAdjustedProbability(mean, transientShare, retryAttempts, retryEfficacy)
+
     return {
       action,
       successes: succ,
@@ -281,6 +331,9 @@ export async function createReliabilityModel(
       selfWeight,
       calibration,
       ...(sizeBucket !== undefined ? { sizeBucket } : {}),
+      failureModes,
+      transientShare,
+      retryAdjustedProbability: retryAdj,
     }
   }
 

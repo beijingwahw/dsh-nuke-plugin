@@ -1,8 +1,8 @@
-// src/index.ts — dsh-nuke-plugin V4（契约驱动重构）
+// src/index.ts — dsh-nuke-plugin V5（契约驱动重构）
 // 架构：contracts/（接口） → infra/（基建）+ engine/（引擎）+ operations/（命令）
 // 本文件只做两件事：
 //   1. 组装运行时（依赖注入，全部组件可替换、可测试）
-//   2. 注册 21 个工具（薄适配层：校验入参 → 调用组件 → 格式化出参）
+//   2. 注册 22 个工具（薄适配层：校验入参 → 调用组件 → 格式化出参）
 import * as fs from 'fs'
 import * as path from 'path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -46,6 +46,7 @@ import type { ResidualEvidence, SeverityBand } from './contracts/scoring'
 import type { ITransactionEngine } from './contracts/transaction'
 import type { DoctorPriority, DoctorVerdict } from './contracts/doctor.contract'
 import type { OracleConfidence } from './contracts/oracle.contract'
+import { MODE_PRESCRIPTIONS } from './contracts/failure.contract'
 import type { RiskLevel } from './contracts/blast-radius.contract'
 import type { ForecastSeverity } from './contracts/disk-forecast.contract'
 import type { AlertSeverity } from './contracts/guardian.contract'
@@ -179,8 +180,8 @@ const BAND_ICON: Record<SeverityBand, string> = {
 
 /** dsh-tools 契约：execute 返回 canonical value，先经 output.schema 校验，
  *  再由 render(args, value) 投影为 ContentBlock 数组。
- *  本插件 21 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
- *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 21 份。 */
+ *  本插件 22 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
+ *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 22 份。 */
 const TEXT_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -448,10 +449,15 @@ export function apply(ctx: Context) {
 
       const pct = (n: number) => `${(n * 100).toFixed(1)}%`
       const confIcon: Record<OracleConfidence, string> = { high: '🟢', medium: '🟡', low: '🔴' }
+      // V5.3：重试感知口径 —— 引擎将自动重试瞬态失败，两档成功率并列
+      const retryLine = o.retryAdjustedSuccessProbability > o.transactionSuccessProbability + 0.0005
+        ? `   ♻️ 重试感知成功率: ${pct(o.retryAdjustedSuccessProbability)}（引擎自动重试瞬态失败 EBUSY/超时后的有效口径）`
+        : ''
       const lines = [
         `🔮 先知推演 @ ${new Date().toISOString()}`,
         `   插件: ${cp.plugins.join(', ')}  |  profile: ${cprof.profile}  |  策略: ${strategy}`,
         `   事务成功率: ${pct(o.transactionSuccessProbability)}  ${confIcon[o.confidence]} 置信 ${o.confidence}（${o.evidence.stepSamples} 个历史步骤样本${o.confidence === 'low' ? `；零/少样本时收缩向设计先验 ${pct(o.evidence.globalSuccessProbability)}` : ''}）`,
+        ...(retryLine ? [retryLine] : []),
         `   期望回收: ${fmtBytes(o.expectedReclaimBytes)}（已折算失败回滚；若成功: ${fmtBytes(o.reclaimP10IfSuccess)} ~ ${fmtBytes(o.reclaimP90IfSuccess)}）`,
         `   预估总量: ${fmtBytes(o.totalEstimatedBytes)}  |  失败期望回滚深度: ${o.expectedRollbackDepth.toFixed(1)} 步`,
       ]
@@ -464,6 +470,12 @@ export function apply(ctx: Context) {
       if (o.weakestStep) {
         lines.push(`   ⚠️ 最脆弱: 第 ${o.weakestStep.index} 步 ${o.weakestStep.action}（成功率 ${pct(o.weakestStep.successProbability)}，失败作废 ${fmtBytes(o.weakestStep.exposureBytes)}）`)
         lines.push(`      🔧 修复该步可令整体成功率升至 ${pct(o.weakestStep.repairedSuccessProbability)}（+${(o.weakestStep.repairUplift * 100).toFixed(1)} 个百分点）`)
+        // V5.3 失败模式诊断：为什么弱 + 怎么办（处方来自失败分类学）
+        if (o.weakestStep.dominantFailureMode !== null) {
+          const t = o.weakestStep.dominantFailureShare * 100
+          lines.push(`      🩺 主导失败模式: ${o.weakestStep.dominantFailureMode}（占历史失败 ${t.toFixed(0)}%）`)
+          lines.push(`      💊 处方: ${o.weakestStep.prescription}`)
+        }
       }
       if (o.brokenDependents !== null) {
         lines.push(o.brokenDependents.length > 0
@@ -480,9 +492,20 @@ export function apply(ctx: Context) {
           : '  校准 n/a'
         // 🧭 = 该动作零历史，成功率纯为先验收缩（冷启动透明度）
         const prior = (s.selfWeight ?? 0) === 0 ? ' 🧭' : ''
-        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${cal}${prior}`)
+        // V5.3：重试调整成功率（有瞬态历史且投影有提升时显示差额）
+        const retryAdj = s.retryAdjustedProbability > s.successProbability + 0.0005
+          ? `  → 重试感知 ${pct(s.retryAdjustedProbability)}`
+          : ''
+        // V5.3：主导失败模式（⚡=瞬态可自愈 / 🔒=永久需介入）
+        const modes = s.failureModes.length > 0
+          ? `  模式 ${s.failureModes.map(m =>
+            `${m.mode}${m.transience === 'transient' ? '⚡' : '🔒'}${(m.share * 100).toFixed(0)}%`,
+          ).join(' ')}`
+          : ''
+        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${retryAdj}${cal}${prior}${modes}`)
       }
       // V5.2 决策智能：帕累托前沿 + 推荐计划（先知从"预测者"升级为"决策顾问"）
+      // V5.3：候选成功率已取重试调整口径 —— 计划合成与引擎执行语义对齐
       const plan = o.optimizedPlan
       if (plan) {
         lines.push('', `─ 帕累托计划合成（${plan.solver === 'exact' ? '精确枚举' : '启发式'}）─`)
@@ -504,6 +527,42 @@ export function apply(ctx: Context) {
       }
       lines.push('', `💡 ${o.narrative}`)
       lines.push('', '决策链建议: nuke_oracle（后果推演+计划合成）→ nuke_clean dry_run（计划预演）→ nuke_clean（执行）')
+      return { content: lines.join('\n') }
+    },
+  }))
+
+  // ── nuke_failures（失败档案：失败模式诊断书） ─────────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_failures',
+    description: '失败档案：从审计链学习每类动作的历史失败模式（EBUSY 锁定/超时/权限/校验拒绝…）、瞬态份额与处方，回答"清理为什么失败、怎么办"。⚡瞬态模式引擎将自动重试，🔒永久模式需按处方人工介入。零副作用，清理反复失败时先看这里',
+    parameters: {},
+    execute: async () => {
+      const model = await createReliabilityModel({ audit: rt.audit })
+      const all = [...model.byAction().values()]
+        .filter(a => a.failures > 0 || a.successes > 0)
+        .sort((a, b) => b.failures - a.failures)
+      if (all.length === 0) {
+        return { content: '📚 失败档案: 尚无历史执行样本 —— 先跑一次 nuke_clean，档案会从审计链自动学习' }
+      }
+      const pct = (n: number) => `${(n * 100).toFixed(1)}%`
+      const lines = [
+        `📚 失败档案 @ ${new Date().toISOString()}（样本 ${model.sampleCount}，全局成功率 ${pct(model.globalSuccessProbability)}）`,
+        '─ 动作 × 失败模式（按失败次数降序）─',
+      ]
+      for (const a of all) {
+        const retry = (a.retryAdjustedProbability ?? a.successProbability) - a.successProbability
+        const retryNote = retry > 0.0005
+          ? `  ♻️ 重试感知 ${pct(a.retryAdjustedProbability ?? 0)}（+${(retry * 100).toFixed(1)}pct）`
+          : ''
+        lines.push(`  ${a.action}: 成 ${a.successes} / 败 ${a.failures}（成功率 ${pct(a.successProbability)}）${retryNote}`)
+        for (const m of a.failureModes ?? []) {
+          const icon = m.transience === 'transient' ? '⚡' : '🔒'
+          lines.push(`    ${icon} ${m.mode}: ${m.count} 次（${(m.share * 100).toFixed(0)}% 的失败，${m.transience === 'transient' ? '瞬态可自愈' : '永久需介入'}）`)
+          lines.push(`       💊 ${MODE_PRESCRIPTIONS[m.mode]}`)
+        }
+        if (a.failures === 0) lines.push('    （零失败 —— 无模式档案）')
+      }
+      lines.push('', '口径: ⚡瞬态 = 引擎自动重试（有界指数退避）；🔒永久 = 重试无意义，按处方处理。档案随每次清理自动更新')
       return { content: lines.join('\n') }
     },
   }))
