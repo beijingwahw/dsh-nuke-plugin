@@ -9,6 +9,7 @@ import { err, ioError, ok } from '../contracts/base'
 import type { ResidualEvidence, ISeverityScorer } from '../contracts/scoring'
 import type { IHealthInspector } from '../contracts/health.contract'
 import type { IOrphanDetector, IResidualScanner } from '../contracts/scan'
+import type { IToolRegistry } from '../contracts/tool.contract'
 import type { DoctorPriority, DoctorRecommendation, DoctorReport, IDoctor } from '../contracts/doctor.contract'
 
 export interface DoctorDeps {
@@ -17,6 +18,9 @@ export interface DoctorDeps {
   readonly orphans: IOrphanDetector
   readonly scorer: ISeverityScorer
   readonly clock: Clock
+  /** V5.2 可选：注入共享工具注册表 → 报告附带环境矩阵（dsh/pnpm 解析结果）。
+   *  缺省 = 报告不含 tools 字段（旧装配形态兼容）。 */
+  readonly toolRegistry?: IToolRegistry
 }
 
 /** 处方条目上限：报告可读性优先，超出部分仍计入总可回收空间 */
@@ -118,6 +122,12 @@ export function createDoctor(deps: DoctorDeps): IDoctor {
           : health.score < 80 || hasUrgent ? 'attention'
           : 'healthy'
 
+        // 5) V5.2 环境矩阵：共享注册表解析全部外部工具（TTL 缓存，
+        //    与健康检查同源 —— 环境矩阵与 runtime 检查永远一致）
+        const tools = deps.toolRegistry
+          ? await deps.toolRegistry.resolveAll()
+          : undefined
+
         const report: DoctorReport = {
           generatedAt: deps.clock.now().toISOString(),
           profile,
@@ -126,6 +136,7 @@ export function createDoctor(deps: DoctorDeps): IDoctor {
           blocking: health.blocking,
           recommendations: all.slice(0, MAX_RECOMMENDATIONS),
           totalReclaimableBytes,
+          ...(tools !== undefined ? { tools } : {}),
         }
         return ok(report)
       } catch (e) {

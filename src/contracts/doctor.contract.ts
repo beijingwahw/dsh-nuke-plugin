@@ -5,6 +5,7 @@
 
 import type { CleanStrategy, NukeError, ProfileName, Result } from './base'
 import type { ResidualEvidence, SeverityScore } from './scoring'
+import type { ToolResolution } from './tool.contract'
 
 /** 总体判决：healthy=无行动必要 / attention=建议处理 / critical=存在阻断或健康度告急 */
 export type DoctorVerdict = 'healthy' | 'attention' | 'critical'
@@ -30,6 +31,9 @@ export interface DoctorReport {
   readonly blocking: boolean            // critical 检查失败 → 清理事务将被拒绝
   readonly recommendations: readonly DoctorRecommendation[]  // priority 升序、分值降序
   readonly totalReclaimableBytes: number
+  /** V5.2 环境矩阵：外部工具（dsh/pnpm）解析结果，来自共享 ToolRegistry
+   *  （单一事实源）。缺省 = []（未注入注册表的旧装配形态）。 */
+  readonly tools?: readonly ToolResolution[]
 }
 
 export interface IDoctor {

@@ -9,8 +9,6 @@ let home: string
 
 /** 桩命令运行器：dsh/pnpm 均可用 */
 const stubOk = () => ({ status: 0, stdout: 'v1.0.0\n', stderr: '' })
-const stubNoDsh = (cmd: string) =>
-  cmd === 'dsh' ? { status: 127, stdout: '', stderr: 'not found' } : { status: 0, stdout: '9.0.0\n', stderr: '' }
 
 function seedHealthy() {
   const pd = path.join(home, 'profiles', 'default')
@@ -88,19 +86,102 @@ describe('HealthInspector', () => {
     }
   })
 
-  it('dsh CLI 不可用 → critical；WAL 有未完成事务 → warning', async () => {
+  it('dsh CLI 未找到（ENOENT + 救援落空）→ warning 且不阻断；WAL 有未完成事务 → warning', async () => {
+    // V5.1 语义修正：真实 spawnSync 的"命令不存在"是 status=null + error.code=ENOENT
+    //（127 是 shell 的 not-found 码，spawnSync 无 shell 不会产生）；
+    // 且 CLI 缺失不再 critical —— 残留清理/事务回滚不依赖外部 CLI，仅 standard-remove 需要（可 skip_standard）
+    const stubEnoent = (cmd: string) =>
+      cmd === 'dsh'
+        ? { status: null, stdout: '', stderr: '', errorCode: 'ENOENT' }
+        : { status: 0, stdout: '9.0.0\n', stderr: '' }
     const r = await make({
-      runCommand: stubNoDsh as any,
+      runCommand: stubEnoent as any,
+      resolveCommand: (cmd: string) => (cmd === 'pnpm' ? { path: '/usr/local/bin/pnpm', dir: '/usr/local/bin' } : null),
       walUnfinished: () => ['deadbeef'],
     }).inspect(PROFILE)
     if (!r.ok) throw new Error('inspect failed')
-    expect(r.value.results.find(x => x.check === 'dsh CLI')!.passed).toBe(false)
-    expect(r.value.results.find(x => x.check === 'dsh CLI')!.severity).toBe('critical')
-    expect(r.value.blocking).toBe(true)
+    const dsh = r.value.results.find(x => x.check === 'dsh CLI')!
+    expect(dsh.passed).toBe(false)
+    expect(dsh.severity).toBe('warning')
+    expect(dsh.message).toContain('未找到')
+    expect(dsh.fix).toContain('skip_standard')
+    expect(r.value.blocking).toBe(false)   // CLI 缺失不再阻断清理事务
     const wal = r.value.results.find(x => x.check === 'WAL 未完成事务')!
     expect(wal.passed).toBe(false)
     expect(wal.severity).toBe('warning')
     expect(wal.fix).toBeTruthy()
+  })
+
+  it('V5.1 宿主 PATH 缺失但全局 bin 有 dsh（ENOENT + 救援命中）→ 可用并附救援路径提示', async () => {
+    // 模拟 nvm 场景：用户 shell 有 dsh（rc 注入 PATH），宿主进程 PATH 没有它
+    const probeCalls: string[] = []
+    const r = await make({
+      runCommand: ((cmd: string, _args: readonly string[], _opts: object) => {
+        probeCalls.push(cmd)
+        // 'dsh' 裸名 ENOENT；救援绝对路径可执行
+        if (cmd === 'dsh') {
+          return { status: null, stdout: '', stderr: '', errorCode: 'ENOENT' }
+        }
+        if (cmd.endsWith('/bin/dsh')) {
+          return { status: 0, stdout: '0.1.0-rc.6\n', stderr: '' }
+        }
+        return { status: 0, stdout: '9.0.0\n', stderr: '' }
+      }) as any,
+      resolveCommand: () => ({ path: '/root/.nvm/versions/node/v24.1.0/bin/dsh', dir: '/root/.nvm/versions/node/v24.1.0/bin' }),
+    }).inspect(PROFILE)
+    if (!r.ok) throw new Error('inspect failed')
+    // 救援确实以绝对路径重试了（而非拿裸名空手而归）
+    expect(probeCalls).toContain('/root/.nvm/versions/node/v24.1.0/bin/dsh')
+    const dsh = r.value.results.find(x => x.check === 'dsh CLI')!
+    expect(dsh.passed).toBe(true)
+    expect(dsh.message).toContain('0.1.0-rc.6')
+    expect(dsh.message).toContain('救援路径')
+    expect(dsh.message).toContain('/root/.nvm')
+    expect(r.value.blocking).toBe(false)
+  })
+
+  it('V5.1 --version 退出码非 0（旗标行为差异）→ 判定可用，不误报缺失', async () => {
+    // 某些 CLI 版本不支持 --version 旗标（退出码非 0），但二进制确实存在
+    const stub = (cmd: string) =>
+      cmd === 'dsh'
+        ? { status: 1, stdout: '', stderr: 'unknown option: --version\n' }
+        : { status: 0, stdout: '9.0.0\n', stderr: '' }
+    const r = await make({ runCommand: stub as any }).inspect(PROFILE)
+    if (!r.ok) throw new Error('inspect failed')
+    const dsh = r.value.results.find(x => x.check === 'dsh CLI')!
+    expect(dsh.passed).toBe(true)
+    expect(dsh.message).toContain('可用')
+    expect(dsh.message).toContain('退出码 1')
+  })
+
+  it('V5.1 锁残留检测覆盖 V4/V5 锁协议目录（.nuke/locks/）与 V3 遗留锁', async () => {
+    const locksDir = path.join(home, '.nuke', 'locks')
+    fs.mkdirSync(locksDir, { recursive: true })
+    fs.writeFileSync(path.join(locksDir, 'global.lock'), '{"version":1}')
+    try {
+      const r = await make().inspect(PROFILE)
+      if (!r.ok) throw new Error('inspect failed')
+      const lock = r.value.results.find(x => x.check === 'nuke 锁残留')!
+      expect(lock.passed).toBe(false)
+      expect(lock.message).toContain('global.lock')
+      expect(lock.severity).toBe('warning')
+      // 锁残留是 warning，不阻断
+      expect(r.value.blocking).toBe(false)
+    } finally {
+      fs.rmSync(locksDir, { recursive: true, force: true })
+    }
+    // V3 遗留锁也纳入检测
+    const legacy = path.join(home, '.nuke.lock')
+    fs.writeFileSync(legacy, '{}')
+    try {
+      const r = await make().inspect(PROFILE)
+      if (!r.ok) throw new Error('inspect failed')
+      const lock = r.value.results.find(x => x.check === 'nuke 锁残留')!
+      expect(lock.passed).toBe(false)
+      expect(lock.message).toContain('.nuke.lock')
+    } finally {
+      fs.rmSync(legacy, { force: true })
+    }
   })
 
   it('package.json 比 lockfile 新 → lockfile 新鲜度 warning', async () => {

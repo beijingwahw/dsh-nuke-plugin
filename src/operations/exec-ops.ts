@@ -16,6 +16,8 @@ import type {
   CleanOperation, CommandExecutionDetail, ExecutedStep, OperationPlan, TxContext,
 } from '../contracts/transaction'
 import type { IInputValidator } from '../contracts/validation'
+import type { IToolRegistry, ToolResolution } from '../contracts/tool.contract'
+import { createToolRegistry } from '../infra/tool-registry'
 
 /** 命令运行器返回形态（error/signal 为 V4 增量可选字段，旧注入实现无需改动） */
 export interface CommandResult {
@@ -128,6 +130,10 @@ export async function runCommandWithRetry(
     durationMs: Date.now() - startedAt,
     attempts,
     timedOut: isTimedOut(last),
+    // V5.1：透传 spawn 错误码 —— ENOENT（未找到）与"执行了但退出非 0"语义迥异
+    ...(typeof (last.error as { code?: unknown } | null | undefined)?.code === 'string'
+      ? { errorCode: (last.error as { code: string }).code }
+      : {}),
   }
 }
 
@@ -137,6 +143,46 @@ export interface ExecOpOptions {
   readonly commandTimeoutMs?: number
   /** V4 增量：瞬态重试策略（缺省 = 最多 2 次退避重试） */
   readonly retry?: CommandRetryPolicy
+  /** V5.1 增量：命令解析注入点（PATH 救援探测；缺省 = bin-resolver 真实实现，测试可注入） */
+  readonly resolveCommand?: (cmd: string) => { readonly path: string; readonly dir: string } | null
+  /** V5.2 增量：共享工具注册表（解析单一事实源；缺省 = 用本操作的 run/retry 组装私有注册表） */
+  readonly toolRegistry?: IToolRegistry
+}
+
+/** 用本操作的 run/retry 组装私有注册表（未注入共享注册表时的兼容路径） */
+function buildPrivateRegistry(
+  options: ExecOpOptions,
+  run: CommandRunner,
+  retry: CommandRetryPolicy,
+): IToolRegistry {
+  return createToolRegistry({
+    // 探测适配器：复用 runCommandWithRetry 的重试/超时纪律，映射到注册表探针形态
+    probe: (cmdOrPath: string) =>
+      runCommandWithRetry(run, cmdOrPath, ['--version'], { timeoutMs: 5_000 }, retry)
+        .then(d => ({
+          status: d.exitCode,
+          stdout: d.stdout,
+          stderr: d.stderr,
+          ...(d.errorCode !== undefined ? { errorCode: d.errorCode } : {}),
+        })),
+    // 注意：注入解析器"返回 null"就是它的判定结果，不能穿透到默认解析器
+    ...(options.resolveCommand ? { resolveCommand: options.resolveCommand } : {}),
+  })
+}
+
+/** 经注册表校验工具可用性（缺失 → 结构化错误，detail/fixHint 来自单一事实源） */
+async function requireTool(
+  registry: IToolRegistry, tool: string,
+): Promise<Result<void, NukeError & { details?: { resolution?: ToolResolution } }>> {
+  const res = await registry.resolve(tool)
+  if (res.status === 'missing') {
+    return err({
+      code: 'E_IO',
+      message: `${res.detail}: ${res.fixHint}`,
+      details: { resolution: res },
+    })
+  }
+  return ok(undefined)
 }
 
 /** 失败路径的统一错误构造：结构化捕获进 details（审计链可见） */
@@ -160,6 +206,8 @@ export function makeStandardRemoveOp(
   const run = options.runCommand ?? defaultCommandRunner
   const timeoutMs = options.commandTimeoutMs ?? 60_000
   const retry = options.retry ?? DEFAULT_RETRY_POLICY
+  // V5.2：CLI 解析委托注册表（共享实例优先，缺省私有组装 —— 语义只有一份）
+  const registry = options.toolRegistry ?? buildPrivateRegistry(options, run, retry)
 
   return {
     id: `op-standard-remove:${target}`,
@@ -198,15 +246,9 @@ export function makeStandardRemoveOp(
           details: { violations: prof.error },
         })
       }
-      const probe = await runCommandWithRetry(run, 'dsh', ['--version'], { timeoutMs: 5_000 }, retry)
-      if (probe.exitCode !== 0) {
-        return err({
-          code: 'E_IO',
-          message: 'dsh CLI 不可用（standard-remove 需要 dsh 在 PATH 中）',
-          details: { command: probe },
-        })
-      }
-      return ok(undefined)
+      // V5.2：CLI 可用性委托工具注册表（显式 env → PATH → 救援三段式，语义单一事实源；
+      // 救援命中的绝对路径由 execute 阶段实际使用前的 runCommandWithRetry 复核）
+      return requireTool(registry, 'dsh')
     },
 
     async execute(): Promise<Result<ExecutedStep, NukeError>> {
@@ -241,6 +283,8 @@ export function makePnpmPruneOp(
   const run = options.runCommand ?? defaultCommandRunner
   const timeoutMs = options.commandTimeoutMs ?? 120_000
   const retry = options.retry ?? DEFAULT_RETRY_POLICY
+  // V5.2：CLI 解析委托注册表（与 standard-remove 同一事实源）
+  const registry = options.toolRegistry ?? buildPrivateRegistry(options, run, retry)
 
   return {
     id: 'op-pnpm-store-prune:global',
@@ -263,15 +307,8 @@ export function makePnpmPruneOp(
     },
 
     async validate(): Promise<Result<void, NukeError>> {
-      const probe = await runCommandWithRetry(run, 'pnpm', ['--version'], { timeoutMs: 5_000 }, retry)
-      if (probe.exitCode !== 0) {
-        return err({
-          code: 'E_IO',
-          message: 'pnpm CLI 不可用（pnpm-store-prune 需要 pnpm 在 PATH 中）',
-          details: { command: probe },
-        })
-      }
-      return ok(undefined)
+      // V5.2：委托工具注册表（三段式：env 覆盖 → PATH → 救援；旗标差异不再误报）
+      return requireTool(registry, 'pnpm')
     },
 
     async execute(ctx): Promise<Result<ExecutedStep, NukeError>> {

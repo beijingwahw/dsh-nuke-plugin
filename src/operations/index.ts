@@ -16,6 +16,7 @@ import type {
   CleanOperation, CleanRequest, DryRunActionDetail, OperationPlan, OperationRiskLevel, TxContext,
 } from '../contracts/transaction'
 import type { IInputValidator } from '../contracts/validation'
+import type { IToolRegistry } from '../contracts/tool.contract'
 import type { IPathResolver } from '../contracts/paths'
 import type { ILogger } from '../contracts/logging'
 import { configEditOps } from './edit-ops'
@@ -116,6 +117,8 @@ export interface OperationFactoryOptions {
   readonly tempRoot: string
   readonly tempTtlDays?: number
   readonly now?: () => Date
+  /** V5.2：共享工具注册表（CLI 解析单一事实源，注入 exec-ops） */
+  readonly toolRegistry?: IToolRegistry
 }
 
 // ─── V4：动作构建表（表驱动 —— 新增动作只加一行，不再散落 if 链） ──
@@ -129,6 +132,7 @@ const PER_PLUGIN_BUILDERS: readonly PerPluginBuilder[] = [
   (plugin, profile, _dshHomeOf, options) => [makeStandardRemoveOp(plugin, profile, {
     validator: options.validator,
     ...(options.runCommand ? { runCommand: options.runCommand } : {}),
+    ...(options.toolRegistry ? { toolRegistry: options.toolRegistry } : {}),
   })],
   (plugin, profile, dshHomeOf) => configEditOps(plugin, profile, dshHomeOf),
   (plugin, profile, dshHomeOf) => dirRemoveOps(plugin, profile, dshHomeOf),
@@ -146,6 +150,7 @@ const GLOBAL_BUILDERS: readonly GlobalBuilder[] = [
     {
       validator: options.validator,
       ...(options.runCommand ? { runCommand: options.runCommand } : {}),
+      ...(options.toolRegistry ? { toolRegistry: options.toolRegistry } : {}),
     },
   )],
   (_profile, options) => [makePurgeTempOp({

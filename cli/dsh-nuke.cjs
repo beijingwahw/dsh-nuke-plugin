@@ -616,7 +616,17 @@ function runHealthChecks(profile) {
   }
 
   const dshCheck = spawnSync('dsh', ['--version'], { encoding: 'utf-8', timeout: 5000 });
-  results.push({ check: 'dsh CLI', passed: dshCheck.status === 0, message: dshCheck.status === 0 ? dshCheck.stdout.trim() : '不可用' });
+  // V5.1：status 非 null = 二进制确实执行了（--version 旗标行为差异不算不可用）；
+  // status null（spawn ENOENT）才是真正找不到 —— 与插件版 probeCli 三段式语义对齐
+  results.push({
+    check: 'dsh CLI',
+    passed: dshCheck.status !== null,
+    message: dshCheck.status === 0
+      ? dshCheck.stdout.trim()
+      : dshCheck.status !== null
+        ? `可用（--version 退出码 ${dshCheck.status}）`
+        : '不可用（不在 PATH；CLI 在交互 shell 运行，请确认 dsh 已全局安装）',
+  });
 
   return results;
 }

@@ -109,6 +109,9 @@ export interface CommandExecutionDetail {
   readonly attempts: number
   /** 是否因超时被终止（fail-closed 信号：调用方必须按失败处理） */
   readonly timedOut: boolean
+  /** V5.1 增量：spawn 层错误码（'ENOENT' = 命令未找到；缺省 = 进程已执行）。
+   *  区分"二进制不存在"与"存在但退出码非 0"，杜绝把宿主 PATH 环境差异误判为 CLI 缺失 */
+  readonly errorCode?: string
 }
 
 /** 目录清理影响面明细（fs 类操作 preview 阶段计算，供 dry-run 报告展示） */

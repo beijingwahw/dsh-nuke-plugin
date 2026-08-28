@@ -169,6 +169,43 @@ dry-run 是确定性预演，先知是概率化推演。每次清理的每个步
             → 再执行 → 数据更准 → ...
 ```
 
+## V5.1 长期方案：外部工具治理（单一事实源）
+
+真实故障复盘：dsh CLI 经 nvm 安装，用户 shell 的 rc 文件注入 PATH 而宿主进程不加载 rc → 宿主 PATH 缺口 → `spawnSync('dsh')` ENOENT。此时系统中有**三处独立探测**（健康检查 / standard-remove / pnpm-prune）各自解释"什么算可用"，一处误报 critical 即阻断全部清理 —— 即便 dsh 实际就装在 `~/.nvm/versions/node/v24/bin/dsh`。
+
+长期方案把外部工具解析收敛为**一份实现、一个事实源**：
+
+### 工具注册表（ToolRegistry）
+
+```
+解析链（顺序固定，全系统只此一份）：
+  ① 显式环境变量 DSH_BIN / PNPM_BIN
+     → 用户显式指定的路径失效时响亮报错，绝不静默降级
+  ② 裸名探测（PATH 语义）
+     → exit 0 = ok；exit 非 0 但进程已执行 = ok（旗标差异不算缺失）
+  ③ spawn ENOENT → 全局 bin 候选目录救援（nvm/volta/asdf/npm 前缀）
+     → 救援命中 = rescued（附宿主 PATH 修复提示）；全落空 = missing
+```
+
+治理原则：
+
+- **语义漂移在结构上不可能** —— 健康检查、standard-remove、pnpm-prune、doctor 全部委托同一注册表，"什么算可用"只存在一份定义
+- **能力映射降级** —— 每个工具声明 `affects`（依赖它的动作清单）；缺失时只降级这些动作并给出 `fixHint`，**永不全局阻断清理**
+- **TTL 缓存（60s）** —— 一次事务内多次探测共享结果；环境变化后可 `invalidate()` 强制重解析
+- **逃生通道** —— `DSH_BIN` / `PNPM_BIN` 环境变量显式指定路径，绕过 PATH 缺口
+
+### doctor 环境矩阵
+
+`nuke_doctor` 报告新增**环境矩阵**：全部已注册外部工具的解析结果（状态 + 来源 + 路径 + 版本 + 影响面 + 修复建议），与 runtime 健康检查同源（共享注册表缓存）—— 两处输出永远一致，排查环境问题一次到位。
+
+```
+─ 环境矩阵（外部工具）─
+  ✅ dsh: 版本: 0.1.0-rc.6
+  🟡 pnpm: 可用: 9.12.0（救援路径 /home/t/.nvm/.../bin/pnpm；宿主 PATH 未含该目录，建议修复）
+  ❌ node: node 命令未找到（宿主 PATH 与常见全局 bin 目录均无 node）
+     🔧 安装 node 或将其所在目录加入 PATH
+```
+
 ## V5 全模块升级总览
 
 V5 聚焦 V4 未覆盖的模块与一处真实整合缺口，全部向后兼容，零新增运行时依赖。
@@ -338,6 +375,12 @@ dry-run 回答"我打算做什么"（确定性计划明细）；先知回答"做
 
 **Q: 混沌演习会在我的真实环境里制造崩溃吗？**
 不会。演习在 `<nukeRoot>/drill/<runId>/` 沙箱内进行——用一份合成的插件布局（含受保护文件）执行真实事务代码路径，崩溃、恢复、验证全部发生在沙箱里，真实环境零接触。
+
+**Q: 健康检查提示 dsh CLI 不可用，但我明明装了（shell 里 `dsh --version` 正常）？**
+这是宿主进程 PATH 与用户 shell PATH 不一致的经典场景（dsh 经 nvm/npm 安装，rc 文件注入的 PATH 宿主进程看不到）。V5.1 起注册表会自动走全局 bin 救援（nvm/volta/asdf/npm 前缀目录），命中则以 `rescued` 状态继续工作；也可设 `DSH_BIN=/完整/路径/dsh` 显式指定。CLI 缺失只是 warning（附 `skip_standard` 降级建议），不会阻断清理事务。
+
+**Q: 我想让清理彻底绕过 dsh CLI，怎么做？**
+`nuke_clean` 传 `skip_standard: true` 跳过标准卸载步骤；其余配置摘除与目录回收动作不依赖任何外部 CLI。
 
 ## License
 

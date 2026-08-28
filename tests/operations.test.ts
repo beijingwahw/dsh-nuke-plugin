@@ -196,12 +196,53 @@ describe('makeStandardRemoveOp / makePnpmPruneOp', () => {
     expect(r.error.code).toBe('E_VALIDATION')
   })
 
-  it('standard-remove：dsh 不可用 → validate 拒绝', async () => {
+  it('standard-remove：dsh 未找到（ENOENT + 救援落空）→ validate 拒绝并给出修复指引', async () => {
+    // V5.1：真实 spawnSync 的"命令不存在"是 status=null + error.code=ENOENT（非 127）
+    const enoentRun = (cmd: string) =>
+      cmd === 'dsh'
+        ? { status: null, stdout: '', stderr: '', error: { code: 'ENOENT' } }
+        : { status: 0, stdout: '', stderr: '' }
     const op = makeStandardRemoveOp(VICTIM, PROFILE, {
-      validator: createValidator(), runCommand: stubRun([]),
+      validator: createValidator(), runCommand: enoentRun,
+      resolveCommand: () => null,   // 救援也找不到
     })
     const r = await op.validate(ctx)
     expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.code).toBe('E_IO')
+    expect(r.error.message).toContain('未找到')
+    expect(r.error.message).toContain('skip_standard')
+  })
+
+  it('standard-remove V5.1：宿主 PATH 缺失但救援命中（绝对路径可执行）→ validate 通过', async () => {
+    const calls: string[] = []
+    const run = (cmd: string) => {
+      calls.push(cmd)
+      if (cmd === 'dsh') return { status: null, stdout: '', stderr: '', error: { code: 'ENOENT' } }
+      if (cmd.endsWith('/bin/dsh')) return { status: 0, stdout: '0.1.0-rc.6\n', stderr: '' }
+      return { status: 0, stdout: '', stderr: '' }
+    }
+    const op = makeStandardRemoveOp(VICTIM, PROFILE, {
+      validator: createValidator(), runCommand: run,
+      resolveCommand: () => ({ path: '/root/.nvm/versions/node/v24.1.0/bin/dsh', dir: '/root/.nvm/versions/node/v24.1.0/bin' }),
+    })
+    const r = await op.validate(ctx)
+    expect(r.ok).toBe(true)
+    // 救援确实以绝对路径复核了
+    expect(calls).toContain('/root/.nvm/versions/node/v24.1.0/bin/dsh')
+  })
+
+  it('standard-remove V5.1：--version 退出码非 0（旗标行为差异）→ 二进制存在，validate 通过', async () => {
+    // 旧逻辑 exitCode!==0 一律拒绝 —— 把"执行了但旗标不支持"误判为 CLI 缺失
+    const run = (cmd: string) =>
+      cmd === 'dsh'
+        ? { status: 1, stdout: '', stderr: 'unknown option: --version\n' }
+        : { status: 0, stdout: '', stderr: '' }
+    const op = makeStandardRemoveOp(VICTIM, PROFILE, {
+      validator: createValidator(), runCommand: run,
+    })
+    const r = await op.validate(ctx)
+    expect(r.ok).toBe(true)
   })
 
   it('pnpm prune：cwd 指向 profile 目录', async () => {

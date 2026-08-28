@@ -18,12 +18,20 @@ import type {
   HealthCheckResult, HealthReport, IHealthInspector,
 } from '../contracts/health.contract'
 import { DEFAULT_IO_CONCURRENCY, forEachPool } from '../infra/fs-utils'
+import { createToolRegistry } from '../infra/tool-registry'
+import type { IToolRegistry } from '../contracts/tool.contract'
 
 /** 命令探测的统一返回形态 */
 interface CommandProbe {
   readonly status: number | null
   readonly stdout: string
   readonly stderr: string
+  /** V5.1：spawn 层错误码（'ENOENT' = 命令未找到）；缺省 = 进程已执行。
+   *  真实 spawnSync 在二进制缺失时 status=null 且 error.code='ENOENT'；
+   *  "status 非 null" 意味着二进制确实执行了（退出码可能非 0）。
+   *  旧桩用 status=127 模拟"命令不存在"是语义错误 —— 127 是 shell 的
+   *  not-found 码，spawnSync（无 shell）不会产生它。 */
+  readonly errorCode?: string
 }
 
 export interface HealthInspectorOptions {
@@ -32,6 +40,10 @@ export interface HealthInspectorOptions {
    *  异步桩可与并行检查组真实并发）。 */
   readonly runCommand?: (cmd: string, args: readonly string[], opts: { cwd: string; timeoutMs: number }) =>
     CommandProbe | Promise<CommandProbe>
+  /** V5.1：命令解析注入点（PATH 救援探测）；缺省 = bin-resolver 真实实现，测试可注入 */
+  readonly resolveCommand?: (cmd: string) => { readonly path: string; readonly dir: string } | null
+  /** V5.2：共享工具注册表（解析单一事实源；缺省 = 用 runCommand/resolveCommand 组装私有注册表） */
+  readonly toolRegistry?: IToolRegistry
   readonly walUnfinished?: () => readonly string[]
   readonly now?: () => Date
 }
@@ -60,7 +72,15 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
   // spawnSync 失败时 stdout/stderr 可能为 null —— 归一化为 string（与 exec-ops 同纪律）
   const runCommand = options.runCommand ?? ((cmd, args, opts) => {
     const r = spawnSync(cmd, args, { cwd: opts.cwd, encoding: 'utf-8', timeout: opts.timeoutMs })
-    return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
+    return {
+      status: r.status,
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      // V5.1：spawn 层错误码透传（ENOENT 判定的依据）
+      ...(typeof (r.error as unknown as { code?: unknown } | null | undefined)?.code === 'string'
+        ? { errorCode: (r.error as unknown as { code: string }).code }
+        : {}),
+    }
   })
 
   const R = (
@@ -197,30 +217,48 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
       `inode 余量充足（${(ratio * 100).toFixed(1)}%，free ${free}/${total}）`, 'info', 'runtime')
   }
 
+  /** V5.2：CLI 探测委托工具注册表（单一事实源）—— 三段式语义
+   *  （显式 env → PATH → 全局 bin 救援；旗标差异不误报；missing 仅 warning
+   *  并携带能力映射的修复建议）全部收敛在注册表内，此处只做结果渲染 */
+  const toolRegistry: IToolRegistry = options.toolRegistry ?? createToolRegistry({
+    probe: (cmdOrPath: string) =>
+      runCommand(cmdOrPath, ['--version'], { cwd: options.dshHome, timeoutMs: 5000 }),
+    // 注意：注入解析器"返回 null"就是它的判定结果，不能穿透到默认解析器
+    ...(options.resolveCommand ? { resolveCommand: options.resolveCommand } : {}),
+  })
+
+  async function probeCli(label: string, tool: string): Promise<HealthCheckResultV5> {
+    const res = await toolRegistry.resolve(tool)
+    if (res.status === 'missing') {
+      // 能力降级而非全局阻断：残留清理/事务回滚不依赖外部 CLI
+      return R(label, false, res.detail, 'warning', 'runtime', res.fixHint)
+    }
+    return R(label, true, res.detail, 'info', 'runtime')
+  }
+
   async function checkRuntime(): Promise<HealthCheckResultV5[]> {
     const out: HealthCheckResultV5[] = []
-    const dsh = await runCommand('dsh', ['--version'], { cwd: options.dshHome, timeoutMs: 5000 })
-    if (dsh.status === 0) {
-      out.push(R('dsh CLI', true, `版本: ${dsh.stdout.trim().slice(0, 60)}`, 'info', 'runtime'))
-    } else {
-      out.push(R('dsh CLI', false, 'dsh 命令不可用（不在 PATH 或执行失败）', 'critical', 'runtime',
-        '确认 dsh 已安装且在 PATH 中；standard-remove 步骤将不可用'))
-    }
+    // V5.2：CLI 探测统一委托注册表（防两类误报：宿主 PATH 环境差异 / 旗标行为差异）
+    out.push(await probeCli('dsh CLI', 'dsh'))
+    out.push(await probeCli('pnpm CLI', 'pnpm'))
 
-    const pnpm = await runCommand('pnpm', ['--version'], { cwd: options.dshHome, timeoutMs: 5000 })
-    if (pnpm.status === 0) {
-      out.push(R('pnpm CLI', true, `版本: ${pnpm.stdout.trim().slice(0, 60)}`, 'info', 'runtime'))
-    } else {
-      out.push(R('pnpm CLI', false, 'pnpm 命令不可用', 'warning', 'runtime', '安装 pnpm: npm i -g pnpm'))
-    }
-
-    // 锁残留
-    const lockPath = path.join(options.dshHome, '.nuke', 'nuke.lock')
-    let lockExists = false
-    try { await fsp.access(lockPath); lockExists = true } catch { lockExists = false }
-    if (lockExists) {
-      out.push(R('nuke 锁残留', false, `发现锁文件 ${lockPath}，可能存在并发清理或上次异常退出`, 'warning', 'runtime',
-        '确认无清理进行后由管理员破锁'))
+    // 锁残留（V5.1 修正路径）：V4/V5 锁协议写 .nuke/locks/<scope>.lock；
+    // 旧检查只看 V3 死路径 .nuke/nuke.lock，真实锁残留永远漏检。
+    const staleLocks: string[] = []
+    try {
+      for (const f of await fsp.readdir(path.join(options.dshHome, '.nuke', 'locks'))) {
+        if (f.endsWith('.lock')) staleLocks.push(f)
+      }
+    } catch { /* 锁目录不存在 = 无残留 */ }
+    // V3 遗留锁（CLI 旧版写 DSH_HOME/.nuke.lock）一并纳入
+    try {
+      await fsp.access(path.join(options.dshHome, '.nuke.lock'))
+      staleLocks.push('.nuke.lock')
+    } catch { /* 无遗留锁 */ }
+    if (staleLocks.length > 0) {
+      out.push(R('nuke 锁残留', false,
+        `发现 ${staleLocks.length} 个锁文件: ${staleLocks.join(', ')}（可能存在并发清理或上次异常退出）`,
+        'warning', 'runtime', '确认无清理进行后由管理员破锁（锁文件含 owner/TTL，破锁纪律见 lock-manager）'))
     } else {
       out.push(R('nuke 锁残留', true, '无锁残留', 'info', 'runtime'))
     }

@@ -38,6 +38,8 @@ import { createReliabilityModel } from './infra/reliability'
 import { createOracle } from './engine/oracle'
 import { createDrill, isDrillMatrixReport } from './engine/drill'
 import { makeOperationFactory, STRATEGY_ACTIONS } from './operations'
+import { createToolRegistry } from './infra/tool-registry'
+import type { IToolRegistry } from './contracts/tool.contract'
 import type { CleanStrategy, PluginName, ProfileName, TxId } from './contracts/base'
 import { errorToMessage, fmtBytes } from './contracts/base'
 import type { ResidualEvidence, SeverityBand } from './contracts/scoring'
@@ -73,11 +75,18 @@ function buildRuntime() {
   const confirmationTokenOf = (profile: string, plugins: readonly string[]) =>
     `CONFIRM:${profile}:${[...plugins].sort().join(',')}`
 
+  // V5.2 共享工具注册表：外部工具解析的单一事实源（dsh/pnpm 探测语义
+  // 全系统只此一份）。支持 env 覆盖变量 DSH_BIN/PNPM_BIN（用户显式
+  // 指定路径 → 响亮校验，不静默降级）。健康检查 / standard-remove /
+  // pnpm-prune / doctor 全部委托此注册表 —— 语义漂移在结构上不可能。
+  const toolRegistry: IToolRegistry = createToolRegistry()
+
   // 操作集编译器：引擎与先知共享同一份（推演与执行严格同构）
   const operationFactory = makeOperationFactory({
     validator,
     tempRoot: platform.tempRoot,
     tempTtlDays: 7,
+    toolRegistry,
   })
 
   const engine: ITransactionEngine = createTransactionEngine(
@@ -101,8 +110,13 @@ function buildRuntime() {
   const health = createHealthInspector({
     dshHome: platform.dshHome,
     walUnfinished: () => wal.unfinishedTxIds(),
+    toolRegistry,
   })
-  const doctor = createDoctor({ health, scanner, orphans, scorer, clock: { now: () => new Date() } })
+  const doctor = createDoctor({
+    health, scanner, orphans, scorer,
+    clock: { now: () => new Date() },
+    toolRegistry,
+  })
   const dedup = createDedupAnalyzer({ dshHome: platform.dshHome })
   const dedupExec = createDedupExecutor()
   const restorePoints = createRestorePointManager({ dshHome: platform.dshHome, nukeRoot })
@@ -141,7 +155,7 @@ function buildRuntime() {
 
   return {
     resolver, platform, nukeRoot, logger, validator,
-    engine, wal, audit,
+    engine, wal, audit, toolRegistry,
     scorer, analyzer, scanner, orphans, health,
     doctor, dedup, dedupExec, restorePoints, reporter,
     blastRadius, trend, policy,
@@ -815,6 +829,18 @@ export function apply(ctx: Context) {
             `     💡 ${rec.reason} → 建议 ${rec.suggestedStrategy}`,
             `     📍 ${rec.evidence.location}  💾 ${fmtBytes(rec.evidence.sizeBytes)}`,
           )
+        }
+      }
+      // V5.2 环境矩阵：外部工具解析结果（与 runtime 健康检查同源，
+      // 共享注册表 TTL 缓存 —— 两处输出永远一致）
+      if (d.tools && d.tools.length > 0) {
+        const toolIcon: Record<string, string> = { ok: '✅', rescued: '🟡', missing: '❌' }
+        lines.push('', '─ 环境矩阵（外部工具）─')
+        for (const t of d.tools) {
+          lines.push(`  ${toolIcon[t.status] ?? '·'} ${t.tool}: ${t.detail}`)
+          if (t.status === 'missing') {
+            lines.push(`     🔧 ${t.fixHint}`)
+          }
         }
       }
       return { content: lines.join('\n') }
