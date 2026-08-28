@@ -13,8 +13,9 @@
 // preview 阶段触碰备份区（副作用逃逸），立即爆炸失败，防患于未然。
 import type { CleanOperation, CleanRequest, TxContext } from '../contracts/transaction'
 import type { CleanStrategy, PluginName, ProfileName, TxId } from '../contracts/base'
-import { err, ioError, ok } from '../contracts/base'
+import { err, fmtDuration, ioError, ok } from '../contracts/base'
 import type { IReliabilityModel } from '../contracts/reliability.contract'
+import type { PredictionScorecard } from '../contracts/prediction.contract'
 import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
 } from '../contracts/oracle.contract'
 import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
@@ -73,6 +74,8 @@ export interface OracleStepDetail extends OracleStep {
   readonly transientShare: number
   /** 引擎自动重试瞬态失败前提下的有效成功率 */
   readonly retryAdjustedProbability: number
+  /** V5.4：该步预计耗时（ms，动作历史时间加权中位；零历史 = null） */
+  readonly predictedDurationMs: number | null
 }
 
 /** 先知报告详情：契约字段语义不变，新增蒙特卡洛分布与修复建议 */
@@ -87,6 +90,14 @@ export interface OracleReportDetail extends OracleReport {
    *  引擎将自动重试瞬态失败（有界次数）前提下的整体成功率 ——
    *  与 transactionSuccessProbability（裸连乘）并列，口径透明。 */
   readonly retryAdjustedSuccessProbability: number
+  /** V5.4：预计耗时（ms）= 各步 p50 之和；任一步零历史 = null
+   *  （诚实留白 —— 不用先验冒充耗时证据）。墙钟口径含重试退避。 */
+  readonly predictedDurationMs: number | null
+  /** V5.4：悲观耗时上界（ms）= 各步 p90 之和（"每步都跑在最慢 10%"） */
+  readonly pessimisticDurationMs: number | null
+  /** V5.4：先知战绩（预测存证 vs 实际结局的对账）；未注入评分级或
+   *  零可对账样本 = null —— 预测若不可证伪就与巫术无异，先知公开成绩单 */
+  readonly trackRecord: PredictionScorecard | null
 }
 
 /** IOracle 的引擎层扩展：divine 返回详情报告（协变返回类型） */
@@ -114,6 +125,9 @@ export interface OracleDeps {
   readonly monteCarloSeed?: number
   /** V5.2 优化器目标（默认 { kind: 'pareto' }：前沿 + 拐点推荐） */
   readonly optimizerGoal?: OptimizerGoal
+  /** V5.4：预测战绩工厂（先知问责制）。可选 —— 未注入时 trackRecord=null；
+   *  工厂抛错同样降级为 null（战绩展示是增强，不阻断推演）。 */
+  readonly scorecard?: () => Promise<PredictionScorecard | null>
 }
 
 /** preview 阶段触碰备份区 = 副作用逃逸，立即引爆（防御性纪律） */
@@ -254,6 +268,8 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
             failureModes: r.failureModes ?? [],
             transientShare: r.transientShare ?? 0,
             retryAdjustedProbability: r.retryAdjustedProbability ?? r.successProbability,
+            // V5.4：耗时预测（时间加权中位；零历史 = null 诚实留白）
+            predictedDurationMs: r.duration?.p50 ?? null,
           })
         }
 
@@ -366,6 +382,30 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           optimizedPlan = opt.ok ? opt.value : null
         } catch { optimizedPlan = null }
 
+        // ── V5.4 耗时预测：各步 p50 之和（任一步零历史 → null 诚实留白）─
+        // 悲观上界 = 各步 p90 之和（"每步都跑在最慢 10% 分位"的串联）。
+        // 墙钟口径与引擎计时一致（含重试退避等待）—— 用户等的就是这个数。
+        const durationAll = previews.length > 0
+          && steps.every(s => s.predictedDurationMs !== null)
+        const predictedDurationMs = durationAll
+          ? steps.reduce((acc, s) => acc + (s.predictedDurationMs ?? 0), 0)
+          : null
+        const pessimisticDurationMs = durationAll
+          ? previews.reduce((acc, pv) => {
+            const r = rel.reliabilityOf(pv.op.action, { sizeBytes: pv.estimated })
+            return acc + (r.duration?.p90 ?? 0)
+          }, 0)
+          : null
+
+        // ── V5.4 先知战绩：预测存证 vs 实际结局的对账（问责制） ──
+        // 评分级失败/未注入 → null：战绩是增强展示，绝不阻断推演
+        let trackRecord: PredictionScorecard | null = null
+        if (deps.scorecard) {
+          try {
+            trackRecord = await deps.scorecard()
+          } catch { trackRecord = null }
+        }
+
         const report: OracleReportDetail = {
           request,
           steps,
@@ -382,8 +422,11 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           monteCarlo: mc,
           optimizedPlan,
           retryAdjustedSuccessProbability: pRetryAdjusted,
+          predictedDurationMs,
+          pessimisticDurationMs,
+          trackRecord,
           narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc,
-            priorOnlySteps, rel.globalSuccessProbability, pRetryAdjusted),
+            priorOnlySteps, rel.globalSuccessProbability, pRetryAdjusted, predictedDurationMs),
           evidence: {
             stepSamples: rel.sampleCount,
             globalSuccessProbability: rel.globalSuccessProbability,
@@ -406,6 +449,7 @@ function narrate(
   priorOnlySteps = 0,
   globalPrior = 0.95,
   pRetryAdjusted?: number,
+  predictedDurationMs?: number | null,
 ): string {
   const pct = (p: number) => `${(p * 100).toFixed(1)}%`
   const parts: string[] = []
@@ -413,6 +457,10 @@ function narrate(
   // V5.3：重试感知口径 —— 引擎将自愈瞬态失败，用户应看到"有效成功率"
   if (typeof pRetryAdjusted === 'number' && pRetryAdjusted > p + 0.0005) {
     parts.push(`引擎自动重试瞬态失败（EBUSY/超时等）后有效成功率 ${pct(pRetryAdjusted)}（+${((pRetryAdjusted - p) * 100).toFixed(1)} 个百分点）`)
+  }
+  // V5.4：耗时预测 —— 来自动作历史的时间加权中位（有据可依的"要多久"）
+  if (typeof predictedDurationMs === 'number' && predictedDurationMs > 0) {
+    parts.push(`预计耗时约 ${fmtDuration(predictedDurationMs)}`)
   }
   if (mc.trials > 0) {
     // 蒙特卡洛互证口径：P10/P90 是含失败回滚的分布分位（悲观-乐观带）

@@ -1,9 +1,9 @@
 # dsh-nuke-plugin
 
-> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习
+> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习 · 预测存证问责
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
-[![Tests](https://img.shields.io/badge/tests-528%2F528-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
+[![Tests](https://img.shields.io/badge/tests-547%2F547-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -42,7 +42,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 5. **保护名单 + 限额 + 黑窗** — 作为引擎 pre-hook veto，超限即拒绝（纵深防御，不依赖单层检查）
 6. **回收区代替物理删除** — commit 后才允许 purge；restore 失败或存在孤儿产物时绝不 purge
 
-## 工具速查（22 个）
+## 工具速查（23 个）
 
 所有工具注册为 dsh Agent 工具，安装后直接让 Agent 调用即可。
 
@@ -65,8 +65,9 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | `nuke_policy` | 查看守卫配置：保护名单 / 批量上限 / 回收上限 / 磁盘下限 / 时间黑窗 |
 | `nuke_trend` | 历史趋势：字节/天变化率、30 天外推、3σ̂ 异常检测（失控写盘早期信号） |
 | `nuke_forecast` | 磁盘写满预测：趋势 × 实时余量 → 倒计时与分级建议 |
-| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长；基于历史执行数据贝叶斯自学习，零副作用不拿锁 |
+| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长、预计耗时（p50 与悲观 p90）；基于历史执行数据贝叶斯自学习，零副作用不拿锁 |
 | `nuke_failures` | **失败档案**：每类动作的历史失败模式诊断（EBUSY 锁定/超时/权限/校验拒绝…）、瞬态份额与处方；⚡瞬态引擎自动重试、🔒永久需人工介入 |
+| `nuke_scorecard` | **先知战绩对账单**：执行前已存证进 hash chain 的预测（成功率/耗时）vs 实际结局——Brier 技能分（对照无技能基线）、逐步命中明细、耗时偏差分布、重试疗效学习值；回答"先知的数字到底可不可信" |
 
 ### 执行 — 事务化清理
 
@@ -171,6 +172,44 @@ dry-run 是确定性预演，先知是概率化推演。每次清理的每个步
          → 决策（先修最弱步骤，或换 safe 策略）
             → 再执行 → 数据更准 → ...
 ```
+
+## V5.4 先知问责制：预测若不可证伪，就与巫术无异
+
+V5.3 之前，先知在事务执行前报出"成功率 87%"，但没有任何机制核对这句话：预测过了就过了，说 60% 报 95% 无人知晓。V5.4 给预测装上**存证 + 对账**两翼，先知从"预测者"升格为"可问责的决策顾问"：
+
+```
+commit 前（写侧）：预测存证
+   逐步预测（predictedP / estimatedBytes / predictedDurationMs）
+      + 事务级成功率 → 写入 hash chain 审计链
+   ✓ 预测先于结局（时间戳为证）   ✓ 事后不可篡改（链哈希）
+   ✓ 统计增强能力：构建/存证失败只记日志，绝不阻断真实清理
+
+执行后（读侧）：nuke_scorecard 对账
+   预测存证 × 步骤结局 × 事务终结 → 三方证据对账
+      → Brier 分（预测校准度的事实标准）
+      → 技能分 SS = 1 − Brier/Brier_baseline（对照"无技能基线"：
+        总是预测平均成功率的家伙 —— 跑赢他才算有本事）
+      → 耗时偏差分布（预测 p50 / 实际耗时 的比率中位数）
+      → 逐步命中明细（预测 0.87 的那步，究竟成了没有）
+```
+
+### 耗时模型：从"会不会成"到"要等多久"
+
+- 每动作学习耗时分布（时间加权 p50/p90，半衰期 30 天，墙钟口径含重试退避等待 —— 用户等的就是这个数）；成败双向计入（失败步骤的耗时同样是"这步要多久"的证据）
+- `nuke_oracle` 报告新增**预计耗时**（各步 p50 之和）与**悲观上界**（各步 p90 之和，"每步都跑在最慢 10%"）；任一步零历史 → 整体 null **诚实留白**（不用先验冒充耗时证据）
+
+### 重试疗效学习：常数 0.5 退役
+
+V5.3 假设"单次重试对瞬态失败的成功率是 0.5"——一个没有证据的常数。V5.4 用引擎自己的历史成绩说话：
+
+```
+营救池 = 审计链中所有 retries ≥ 1 的步骤
+   → 营救率 r̂ = (rescued + a·r₀)/(pool + a)（向先验收缩，a=4）
+   → 反解单次疗效 ê = 1−(1−r̂)^(1/R)（R=引擎重试上限）
+   → 投影 p_adj = p + (1−p)·t·(1−(1−ê)^R)
+```
+
+疗效观测惨淡（比如 EBUSY 常驻锁 8 次重试 0 次救回）→ 学习值自动拉低投影，先知不再对无效重试抱有幻想；零观测时退回 0.75 总营救率先验（与 V5.3 默认一致）。严格往返保证：`r̂=0.64, R=2 → ê=0.4 → 复合回 1−(1−0.4)²=0.64`。
 
 ## V5.3 失败模式智能：从"会挂"到"为什么挂、怎么办"
 
@@ -392,7 +431,7 @@ src/
 ├── infra/       # 基建：WAL / 读写锁 / 备份区 / hash-chain 审计 / 台账 / 校验器 / 贝叶斯可靠性
 ├── engine/      # 引擎：事务 / 扫描 / 评分 / 依赖图 / 去重 / 趋势 / 守卫 / 还原点 / 先知 / 混沌演习
 ├── operations/  # 命令模式：每个动作自带 validate/preview/execute/undo
-└── index.ts     # 组装运行时（依赖注入）+ 注册 21 个工具
+└── index.ts     # 组装运行时（依赖注入）+ 注册 23 个工具
 ```
 
 数据落盘位置：`<dshHome>/.nuke/`（wal/ backups/ audit/ ledger/ history/ policy.json restore-points/）
@@ -404,7 +443,7 @@ git clone https://github.com/beijingwahw/dsh-nuke-plugin
 cd dsh-nuke-plugin
 npm install
 npm run typecheck    # tsc --noEmit（零错误）
-npm test             # vitest（444 用例 / 34 文件）
+npm test             # vitest（547 用例 / 41 文件）
 npm run build        # tsdown 构建
 npm run dev          # 开发期热更新进程（见下）
 ```
@@ -441,6 +480,9 @@ verify-then-link：canonical 与 victim 执行前重算 SHA-256 复验；跨文�
 
 **Q: 刚装好还没清理过，先知报的事务成功率可信吗？**
 可信，且要看懂它的口径。零历史时每个动作的成功率收缩向**设计先验 0.95**（V5.1.1 起）——依据是引擎本身的设计：validate 前置把失败拦在 commit 之前、编辑前快照备份、目录改名进回收区、Saga 回滚。所以"没跑过"≠"五五开"，3 步事务报 0.95³≈85.7% 而不是 0.5³=12.5%。同时它诚实标注：置信度 low、纯先验步骤标 🧭、CI 宽开。跑过约 20 次清理后历史数据权重过半，预测由你的真实历史主导。若你的环境确实更脆弱，可在可靠性模型注入 `priorSuccessProbability` 调低锚点。
+
+**Q: nuke_scorecard 的技能分是什么口径？负分说明先知在瞎猜吗？**
+Brier 分 = (预测概率 − 实际结局)² 的均值（0 完美、0.25 硬币水平）。但绝对值没有参照系，所以战绩单以**无技能基线**为对照：一个总是预测"历史平均成功率"的傻瓜预测器的 Brier 分。技能分 SS = 1 − Brier/Brier_baseline：1 = 完美校准，0 = 不比傻瓜强，负 = 比傻瓜还差。样本 < 2 时诚实显示 n/a —— 对账没有统计力时绝不给出误导性结论。
 
 **Q: nuke_oracle 和 nuke_clean --dry_run 有什么区别？**
 dry-run 回答"我打算做什么"（确定性计划明细）；先知回答"做了会怎样"（概率化后果：成功率、期望回收、最脆弱步骤）。两者互补：先知看趋势，dry-run 看细节。

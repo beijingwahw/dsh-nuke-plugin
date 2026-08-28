@@ -16,12 +16,13 @@ import type {
   TxPlan, TxSession, TxState, TxSummary,
 } from '../contracts/transaction'
 import type { IAuditLog } from '../contracts/logging'
-import { OP_AUDIT_PREFIX } from '../contracts/logging'
+import { OP_AUDIT_PREFIX, PREDICT_AUDIT_ACTION } from '../contracts/logging'
 import {
   classifyFailureMode, DEFAULT_RETRY_POLICY, MODE_TRANSIENCE,
 } from '../contracts/failure.contract'
 import type { FailureMode, RetryPolicy } from '../contracts/failure.contract'
 import type { ILockManager, LockOwner } from '../contracts/lock'
+import type { IReliabilityModel } from '../contracts/reliability.contract'
 import type { IPathResolver } from '../contracts/paths'
 import type { ILogger } from '../contracts/logging'
 import type { IHookRegistry, HookContext } from '../contracts/hooks'
@@ -42,6 +43,11 @@ export interface EngineDeps {
    *  后抛 SimulatedCrashError 穿透 commit —— 不回滚、不释放锁，
    *  语义等价于进程在该点断电死亡。仅沙箱演习/测试使用，生产永不注入。 */
   readonly crashAfterStep?: number
+  /** V5.4 预测存证：可靠性模型工厂。注入后 commit 执行前把逐步预测
+   *  （成功率/耗时）写入 hash chain —— 预测先于结局（时间戳为证）、
+   *  事后不可篡改（链哈希），先知从此可被问责（nuke_scorecard 对账）。
+   *  统计增强能力：构建/存证失败只记日志，绝不阻断真实清理。 */
+  readonly predictor?: () => Promise<IReliabilityModel>
 }
 
 /** V5：引擎行为选项（全部缺省安全，不传即沿用 V4 语义） */
@@ -457,6 +463,60 @@ export function createTransactionEngine(
 
         st = setState(rt, 'executing')
         if (!st.ok) return err(st.error)
+
+        // ── V5.4 预测存证：执行前把预测写进 hash chain ──────────
+        // 先知问责制的根基：预测时刻先于结局时刻（时间戳为证），事后
+        // 任何篡改都会被 nuke_verify 检出。存证口径 = 重试感知成功率
+        //（引擎将自动重试瞬态失败 —— 预测与执行语义对齐）。
+        // 统计增强纪律：模型构建/存证失败只记日志，绝不阻断真实清理。
+        if (deps.predictor) {
+          try {
+            const model = await deps.predictor()
+            const stepPredictions = []
+            for (const [i, op] of plan.operations.entries()) {
+              // 直连 commit（未经 plan/dryRun）时补一次 preview：
+              // 存证要带预估量（大小桶调制的协变量），且缓存后步骤
+              // 循环内的 lazy preview 变成零 IO —— 存证反而省了一次重复预演
+              let est = rt.estimates.get(op.id)
+              if (est === undefined) {
+                try {
+                  const p = await op.preview(ctx)
+                  est = p.estimatedBytesReclaimable
+                  rt.estimates.set(op.id, est)
+                } catch {
+                  est = undefined   // preview 失败：存证缺协变量，不阻断
+                }
+              }
+              const r = model.reliabilityOf(
+                op.action,
+                est !== undefined && est >= 0 ? { sizeBytes: est } : undefined,
+              )
+              stepPredictions.push({
+                index: i,
+                operationId: op.id,
+                action: op.action,
+                estimatedBytes: est ?? null,
+                predictedP: r.retryAdjustedProbability ?? r.successProbability,
+                predictedDurationMs: r.duration?.p50 ?? null,
+              })
+            }
+            const txP = stepPredictions.reduce((acc, s) => acc * s.predictedP, 1)
+            await deps.audit.append({
+              timestamp: deps.clock.now().toISOString(),
+              actor: rt.request.actor,
+              action: PREDICT_AUDIT_ACTION,
+              txId, outcome: 'success',
+              detail: {
+                steps: stepPredictions,
+                txSuccessProbability: txP,
+                // 演习事务（人为注入崩溃）标记后不计入战绩 —— 对账纪律
+                ...(deps.crashAfterStep !== undefined ? { drill: true } : {}),
+              },
+            })
+          } catch (e) {
+            deps.logger.warn('预测存证失败（战绩缺此样本）', { tx: txId, error: errorToMessage(e) })
+          }
+        }
 
         for (const [index, op] of plan.operations.entries()) {
           rt.steps.push({ index, operationId: op.id, action: op.action, status: 'pending', bytesFreed: 0, backup: null })

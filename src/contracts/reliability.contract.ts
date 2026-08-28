@@ -34,6 +34,33 @@ export interface CalibrationSummary {
  *  大目录删除更易 EBUSY/长路径/超时 —— "删 2GB 的成功率"≠"删 5MB 的成功率" */
 export type SizeBucket = 'small' | 'medium' | 'large'
 
+/** V5.4 步骤耗时分布摘要：execute 实际耗时（含重试退避等待）的
+ *  时间加权分位数 —— "这次清理要跑多久"的回答来自历史而非拍脑袋 */
+export interface DurationSummary {
+  readonly samples: number
+  /** 中位耗时 ms（时间加权：估算精度漂移时老样本自动降权） */
+  readonly p50: number
+  /** 悲观分位 ms */
+  readonly p90: number
+}
+
+/** V5.4 重试疗效统计：从"重试过"的步骤样本学习单次重试的营救率，
+ *  替代 failure.contract 的 DEFAULT_RETRY_EFFICACY 常数 ——
+ *  "重试有多有效"不再拍脑袋，由引擎自己的历史成绩说话 */
+export interface RetryEfficacyStat {
+  /** 观测最终营救率（需重试步骤中最终成功的份额，向先验收缩） */
+  readonly rescueRate: number
+  /** 投影用单次重试等效疗效（由 rescueRate 反解：观测在 R 次重试下的
+   *  营救率 → 单次疗效，随配置 R 复合 —— 配置变更时外推有依据） */
+  readonly perAttemptEfficacy: number
+  /** 营救池样本数（retries ≥ 1 的步骤 —— 成败双向计数） */
+  readonly pool: number
+  /** 池中被重试救回的样本数（最终成功） */
+  readonly rescued: number
+  /** 数据权重 pool/(pool+prior)：0 = 零观测（纯先验） */
+  readonly selfWeight: number
+}
+
 /** 调用方提供 sizeBytes 时附带的桶级证据画像 */
 export interface SizeBucketEvidence {
   readonly bucket: SizeBucket
@@ -69,6 +96,8 @@ export interface ActionReliability {
    *  语义：引擎自动重试瞬态失败（有界次数）前提下的有效成功率。
    *  基础 p 取自经验（含历史重试效果），不重复计息 —— 收敛不发散。 */
   readonly retryAdjustedProbability?: number
+  /** V5.4：步骤耗时分布（时间加权 p50/p90）；样本不足 = null（诚实留白） */
+  readonly duration?: DurationSummary | null
 }
 
 export interface IReliabilityModel {
@@ -85,4 +114,7 @@ export interface IReliabilityModel {
   readonly sampleCount: number
   /** 全局成功率均值（pooled，向设计先验收缩；零历史时即设计先验 0.95） */
   readonly globalSuccessProbability: number
+  /** V5.4：重试疗效学习值（驱动 retryAdjustedProbability 的投影参数）。
+   *  可选：旧实现/注入 mock 未提供时消费方应回退 DEFAULT_RETRY_EFFICACY。 */
+  readonly retryEfficacy?: RetryEfficacyStat
 }

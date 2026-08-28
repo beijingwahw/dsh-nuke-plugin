@@ -1,7 +1,7 @@
 {
   "name": "dsh-nuke-plugin",
-  "version": "5.3.0",
-  "description": "强力卸载 DSH 插件 — 策略分级 · 批量原子 · 指纹快照 · 健康检查 · 并发锁 · 报告导出",
+  "version": "5.4.0",
+  "description": "强力卸载 DSH 插件 — 策略分级 · 批量原子 · 指纹快照 · 健康检查 · 并发锁 · 先知问责 · 报告导出",
   "type": "module",
   "main": "lib/index.js",
   "repository": {

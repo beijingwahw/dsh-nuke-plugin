@@ -37,10 +37,16 @@ export interface ILogger {
  *  故必须收敛到契约层单一事实源。 */
 export const OP_AUDIT_PREFIX = 'op:'
 
+/** V5.4 预测存证条目的 action（`tx-predict`）。
+ *  写方（事务引擎 commit 执行前存证）与读方（预测评分级对账）共同依赖
+ *  此契约常量 —— 与 OP_AUDIT_PREFIX 同理收敛到契约层单一事实源：
+ *  任一侧硬编码漂移都会让对账静默失明（零存证 → 战绩永远空白）。 */
+export const PREDICT_AUDIT_ACTION = 'tx-predict'
+
 export interface AuditEntry {
   readonly timestamp: string
   readonly actor: string            // 操作人：CLI 用户 / tool 调用者
-  readonly action: string           // 'tx-begin' | 'dry-run' | 'tx-commit' | 'tx-rollback' | `${OP_AUDIT_PREFIX}${action}` | ...
+  readonly action: string           // 'tx-begin' | 'dry-run' | 'tx-commit' | 'tx-rollback' | PREDICT_AUDIT_ACTION | `${OP_AUDIT_PREFIX}${action}` | ...
   readonly txId?: TxId
   readonly outcome: 'success' | 'failure' | 'skipped'
   readonly detail: Readonly<Record<string, unknown>>

@@ -109,3 +109,13 @@ export function fmtBytes(n: number): string {
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)}MB`
   return `${(n / 1024 ** 3).toFixed(2)}GB`
 }
+
+/** V5.4：耗时格式化（ms → 人类可读）。与 fmtBytes 同层：
+ *  全项目唯一实现，先知渲染 / 战绩对账 / 引擎日志共用。 */
+export function fmtDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return 'n/a'
+  if (ms < 1_000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1_000).toFixed(1)}s`
+  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(1)}min`
+  return `${(ms / 3_600_000).toFixed(1)}h`
+}

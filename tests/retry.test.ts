@@ -76,7 +76,8 @@ function buildEngine(
       verifyConfirmationToken: () => true,
     },
     ops,
-    { retryPolicy },
+    // exactOptionalPropertyTypes：显式 undefined 不能赋给可选属性 —— 条件展开
+    ...(retryPolicy !== undefined ? [{ retryPolicy }] : []),
   )
   return { engine, auditPath }
 }
@@ -89,14 +90,15 @@ function request(): CleanRequest {
 }
 
 /** 提交一个事务并解包（失败时抛错使测试失败）。commit 消费的是 plan */
-async function commitOk(engine: ITransactionEngine): Promise<Awaited<ReturnType<ITransactionEngine['commit']>> extends { ok: true; value: infer V } ? V : never> {
+type CommittedSummary = Extract<Awaited<ReturnType<ITransactionEngine['commit']>>, { ok: true }>['value']
+async function commitOk(engine: ITransactionEngine): Promise<CommittedSummary> {
   const s = await engine.begin(request())
   if (!s.ok) throw new Error(`begin: ${s.error.message}`)
   const plan = await engine.plan(s.value)
   if (!plan.ok) throw new Error(`plan: ${plan.error.message}`)
   const committed = await engine.commit(plan.value)
   if (!committed.ok) throw new Error(`commit: ${committed.error.message}`)
-  return committed.value as never
+  return committed.value
 }
 
 describe('V5.3 步骤级模式感知重试', () => {

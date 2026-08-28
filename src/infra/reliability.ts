@@ -38,7 +38,8 @@
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX } from '../contracts/logging'
 import type {
-  ActionReliability, CalibrationSummary, IReliabilityModel, SizeBucket,
+  ActionReliability, CalibrationSummary, DurationSummary, IReliabilityModel,
+  RetryEfficacyStat, SizeBucket,
 } from '../contracts/reliability.contract'
 import {
   classifyFailureMode, DEFAULT_RETRY_EFFICACY, MODE_TRANSIENCE, retryAdjustedProbability,
@@ -64,6 +65,10 @@ function bucketOf(sizeBytes: number): (typeof SIZE_BUCKETS)[number] | null {
 
 /** 桶层先验强度：小于动作层 κ=10 —— 桶样本被三桶摊薄，更快向动作层让位 */
 const BUCKET_KAPPA = 5
+
+/** V5.4 重试疗效先验强度：营救池样本 << 4 时几乎完全借力先验
+ *  （1-(1-0.5)²=0.75），≥ 4 次重试观测后自身数据权重过半 */
+const RETRY_PRIOR_WEIGHT = 4
 
 export interface ReliabilityModelOptions {
   readonly audit: IAuditLog
@@ -93,7 +98,7 @@ export interface ReliabilityModelOptions {
 }
 
 interface CalibrationSample {
-  readonly ratio: number
+  readonly value: number
   readonly atMs: number   // Date.parse(timestamp)；NaN = 时间不可知
 }
 
@@ -101,6 +106,8 @@ interface ActionStats {
   successes: number
   failures: number
   samples: CalibrationSample[]
+  /** V5.4：耗时样本（value=durationMs，含重试退避等待 —— 用户视角的墙钟） */
+  durations: CalibrationSample[]
   /** V5.2：大小桶统计（estimated 可归桶的成败样本；双向归桶保证无偏） */
   buckets: Map<SizeBucket, { successes: number; failures: number }>
   /** V5.3：失败模式计数（错误文本 → 分类学；写方也可直接给 failureMode） */
@@ -184,6 +191,9 @@ export async function createReliabilityModel(
   const stats = new Map<string, ActionStats>()
   let pooledS = 0
   let pooledF = 0
+  // V5.4 重试疗效营救池（全局层 —— 按动作分层样本过稀，全局池才有统计力）
+  let retryPool = 0
+  let retryRescued = 0
   for (const e of entries) {
     if (!e.action.startsWith(OP_AUDIT_PREFIX)) continue
     if (e.outcome === 'skipped') continue   // 策略性跳过不是可靠性证据
@@ -191,17 +201,19 @@ export async function createReliabilityModel(
     const s = stats.get(action)
       ?? {
         successes: 0, failures: 0, samples: [] as CalibrationSample[],
+        durations: [] as CalibrationSample[],
         buckets: new Map<SizeBucket, { successes: number; failures: number }>(),
         modes: new Map<FailureMode, number>(),
       }
     const est = (e.detail as { estimated?: unknown }).estimated
     const act = (e.detail as { actual?: unknown }).actual
+    const durMs = (e.detail as { durationMs?: unknown }).durationMs
     if (e.outcome === 'success') {
       s.successes++
       pooledS++
       // 校准样本：detail { estimated, actual }（estimated>0 时才有意义）
       if (typeof est === 'number' && typeof act === 'number' && est > 0) {
-        s.samples.push({ ratio: act / est, atMs: Date.parse(e.timestamp) })
+        s.samples.push({ value: act / est, atMs: Date.parse(e.timestamp) })
       }
     } else {
       s.failures++
@@ -215,6 +227,18 @@ export async function createReliabilityModel(
         ? detail.failureMode as FailureMode
         : classifyFailureMode(typeof detail.error === 'string' ? detail.error : null)
       s.modes.set(mode, (s.modes.get(mode) ?? 0) + 1)
+    }
+    // V5.4 耗时样本：成败双向计入（失败步骤的耗时同样是"这步要多久"
+    // 的证据）；墙钟口径含重试退避等待 —— 用户等的就是这个数
+    if (typeof durMs === 'number' && Number.isFinite(durMs) && durMs >= 0) {
+      s.durations.push({ value: durMs, atMs: Date.parse(e.timestamp) })
+    }
+    // V5.4 重试营救池：retries ≥ 1 = 引擎真的重试过（成功条目仅在
+    // retries>0 时携带该字段，失败条目恒携带 —— 写方语义见事务引擎）
+    const retries = (e.detail as { retries?: unknown }).retries
+    if (typeof retries === 'number' && retries >= 1) {
+      retryPool++
+      if (e.outcome === 'success') retryRescued++
     }
     // V5.2 大小桶：成败双向归桶（estimated>0 即可归桶；失败样本同样
     // 带 estimated —— 事务引擎失败审计已记录预估量，负证据不丢失）
@@ -235,12 +259,36 @@ export async function createReliabilityModel(
   const mu = (pooledS + priorK * mu0) / (pooledS + pooledF + priorK)
   const sampleCount = pooledS + pooledF
 
+  // ── V5.4 重试疗效学习 ─────────────────────────────────────
+  // 营救池（retries≥1 的步骤）→ 最终营救率（向先验收缩）→ 反解单次疗效。
+  //   r̂ = (rescued + a·r₀)/(pool + a)，r₀ = 1-(1-e₀)^R（先验的"总营救率"口径）
+  //   ê = 1-(1-r̂)^(1/R)（单次疗效 —— 数据由当前 R 产生时严格往返：
+  //   r̂=0.64, R=2 → ê=0.4 → 复合回 1-(1-0.4)²=0.64；配置变更 R 时
+  //   按单次疗效外推，语义忠实于"每次重试的独立效果"）
+  // 显式配置 options.retryEfficacy 时投影取配置值（用户显式指定优先），
+  // 学习统计照常暴露（观测数据的价值不因配置覆盖而消失）。
+  const priorRescueRate = retryAdjustedProbability(0, 1, retryAttempts, retryEfficacy)
+  const learnedRescueRate = retryPool > 0
+    ? (retryRescued + RETRY_PRIOR_WEIGHT * priorRescueRate) / (retryPool + RETRY_PRIOR_WEIGHT)
+    : priorRescueRate
+  const perAttemptEfficacy = retryAttempts > 0
+    ? 1 - (1 - learnedRescueRate) ** (1 / retryAttempts)
+    : retryEfficacy
+  const retryEfficacyStat: RetryEfficacyStat = {
+    rescueRate: learnedRescueRate,
+    perAttemptEfficacy,
+    pool: retryPool,
+    rescued: retryRescued,
+    selfWeight: retryPool / (retryPool + RETRY_PRIOR_WEIGHT),
+  }
+  const efficacyForProjection = options.retryEfficacy ?? perAttemptEfficacy
+
   /** 校准样本 → 时间加权样本集（按值升序，权重随年龄指数衰减） */
   function weightedSamples(samples: readonly CalibrationSample[]): WeightedSample[] {
     const finite = samples.map(x => x.atMs).filter(v => Number.isFinite(v))
     const tRef = finite.length > 0 ? Math.max(...finite) : null
     return samples.map(x => ({
-      value: x.ratio,
+      value: x.value,
       weight: tRef !== null && Number.isFinite(x.atMs)
         ? 0.5 ** (Math.max(0, tRef - x.atMs) / halfLifeMs)
         : 1,   // 时间不可知的样本不降权（保守计入，宁可多信不可盲弃）
@@ -299,9 +347,22 @@ export async function createReliabilityModel(
       }
       : null
 
+    // V5.4 耗时分布：时间加权 p50/p90。样本不足 → null（诚实留白，
+    // 先知渲染层显示 n/a 而非假装知道）。墙钟口径含重试退避等待。
+    const durSamples = weightedSamples(s?.durations ?? [])
+    const duration: DurationSummary | null = durSamples.length >= minCal
+      ? {
+        samples: durSamples.length,
+        p50: weightedQuantile(durSamples, 0.50),
+        p90: weightedQuantile(durSamples, 0.90),
+      }
+      : null
+
     // V5.3 失败模式智能：模式分布（share 降序）+ 瞬态份额 + 重试调整投影。
     // 基础 p 是经验值（历史若已含重试效果则一并计入）—— 投影建立在
     // 经验之上而非替换经验，重试效果不会被双重计息（收敛不发散）。
+    // V5.4：疗效参数取学习值（营救池观测）—— "重试有多有效"由引擎
+    // 自己的历史成绩说话，常数 0.5 仅在零观测时兜底。
     const totalFail = fail
     const failureModes: FailureModeStat[] = []
     if (totalFail > 0 && s) {
@@ -320,7 +381,7 @@ export async function createReliabilityModel(
         .filter(([m]) => MODE_TRANSIENCE[m] === 'transient')
         .reduce((acc, [, c]) => acc + c, 0) / totalFail
       : 0
-    const retryAdj = retryAdjustedProbability(mean, transientShare, retryAttempts, retryEfficacy)
+    const retryAdj = retryAdjustedProbability(mean, transientShare, retryAttempts, efficacyForProjection)
 
     return {
       action,
@@ -334,6 +395,7 @@ export async function createReliabilityModel(
       failureModes,
       transientShare,
       retryAdjustedProbability: retryAdj,
+      duration,
     }
   }
 
@@ -343,6 +405,7 @@ export async function createReliabilityModel(
   return {
     sampleCount,
     globalSuccessProbability: mu,
+    retryEfficacy: retryEfficacyStat,
     byAction: () => snapshot,
     reliabilityOf: (action, opts) => {
       const base = stats.get(action)

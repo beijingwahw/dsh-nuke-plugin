@@ -395,3 +395,114 @@ describe('V5.3 失败模式智能（模式学习 / 瞬态份额 / 重试调整�
     expect(r.retryAdjustedProbability).toBeCloseTo(r.successProbability, 12)
   })
 })
+
+describe('V5.4 耗时分布与重试疗效学习', () => {
+  it('耗时分布：成败双向样本 → 时间加权 p50/p90；<3 样本诚实 null', async () => {
+    const audit = auditAt('duration')
+    // remove-storages 三个耗时样本：100 / 200 / 300ms（时间递增 → 全权重 1）
+    const durs = [100, 200, 300]
+    for (let i = 0; i < durs.length; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-storages',
+        outcome: i === 1 ? 'failure' : 'success',
+        detail: i === 1
+          ? { error: 'EBUSY: 占用', durationMs: durs[i], retries: 1 }
+          : { estimated: 100, actual: 90, durationMs: durs[i] },
+      })
+    }
+    const model = await createReliabilityModel({ audit })
+    const r = model.reliabilityOf('remove-storages')
+    expect(r.duration).not.toBeNull()
+    expect(r.duration!.samples).toBe(3)
+    // 排序 [100, 200, 300]：p50=200；p90 = pos 1.8 → 200+100×0.8 = 280。
+    // 样本间隔 2s / 半衰期 30 天 → 权重≈1 但非精确 1，时间加权分位数
+    // 存在 ~1e-5 量级的合法偏移（近期样本微重），断言精度取 3 位小数
+    expect(r.duration!.p50).toBeCloseTo(200, 3)
+    expect(r.duration!.p90).toBeCloseTo(280, 3)
+    // 样本不足 → null（另一个动作只有 1 个样本）
+    await audit.append({
+      timestamp: '2026-08-20T00:01:00Z',
+      actor: 't', action: 'op:clean-home-patch', outcome: 'success',
+      detail: { durationMs: 50 },
+    })
+    const model2 = await createReliabilityModel({ audit })
+    expect(model2.reliabilityOf('clean-home-patch').duration).toBeNull()
+  })
+
+  it('重试疗效学习：营救池观测 → 收缩营救率 → 反解单次疗效（严格往返）', async () => {
+    const audit = auditAt('efficacy')
+    // 营救池：2 次重试后成功（救回）+ 1 次重试耗尽失败（未救回）
+    for (let i = 0; i < 2; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-storages', outcome: 'success',
+        detail: { estimated: 100, actual: 100, durationMs: 50, retries: 2 },
+      })
+    }
+    await audit.append({
+      timestamp: '2026-08-20T00:00:05Z',
+      actor: 't', action: 'op:remove-storages', outcome: 'failure',
+      detail: { error: 'EBUSY: 仍占用', durationMs: 80, retries: 2, failureMode: 'locked' },
+    })
+    // 无关样本（retries=0 不入池）
+    await audit.append({
+      timestamp: '2026-08-20T00:00:06Z',
+      actor: 't', action: 'op:remove-storages', outcome: 'success',
+      detail: { estimated: 100, actual: 100, durationMs: 10 },
+    })
+    const model = await createReliabilityModel({ audit })
+    const eff = model.retryEfficacy!
+    expect(eff.pool).toBe(3)
+    expect(eff.rescued).toBe(2)
+    // r̂ = (2 + 4×0.75)/(3+4) = 5/7（先验 r₀ = 1-(1-0.5)² = 0.75，强度 4）
+    const rescueRate = (2 + 4 * 0.75) / (3 + 4)
+    expect(eff.rescueRate).toBeCloseTo(rescueRate, 10)
+    // ê = 1-(1-r̂)^(1/2)；复合回 1-(1-ê)² = r̂（严格往返）
+    const eHat = 1 - Math.sqrt(1 - rescueRate)
+    expect(eff.perAttemptEfficacy).toBeCloseTo(eHat, 10)
+    expect(1 - (1 - eff.perAttemptEfficacy) ** 2).toBeCloseTo(rescueRate, 10)
+    expect(eff.selfWeight).toBeCloseTo(3 / 7, 10)
+    // 学习疗效驱动投影：p_adj = p + (1-p)·t·(1-(1-ê)²)
+    const r = model.reliabilityOf('remove-storages')
+    const expected = r.successProbability
+      + (1 - r.successProbability) * r.transientShare! * (1 - (1 - eHat) ** 2)
+    expect(r.retryAdjustedProbability).toBeCloseTo(expected, 10)
+  })
+
+  it('疗效观测惨淡（0/8 救回）→ 学习值显著拉低投影（劣于默认常数）', async () => {
+    const audit = auditAt('bad-efficacy')
+    // 8 次瞬态失败重试耗尽（EBUSY 常驻锁），0 次救回
+    for (let i = 0; i < 8; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-node-modules', outcome: 'failure',
+        detail: { error: 'EBUSY: 常驻锁', durationMs: 30, retries: 2, failureMode: 'locked' },
+      })
+    }
+    const model = await createReliabilityModel({ audit })
+    const eff = model.retryEfficacy!
+    // r̂ = (0 + 3)/12 = 0.25 → ê = 1-√0.75 ≈ 0.134（远低于默认 0.5）
+    expect(eff.rescueRate).toBeCloseTo(0.25, 10)
+    expect(eff.perAttemptEfficacy).toBeLessThan(0.15)
+    // t=1：投影增益 = (1-p)·t·(1-(1-ê)²) —— 单位瞬态风险的挽回比例
+    // 从默认口径 0.75 跌至 ≈0.25，且按 (1-p) 缩放后仍显著拉低投影
+    const r = model.reliabilityOf('remove-node-modules')
+    expect(r.transientShare).toBeCloseTo(1, 10)
+    const gain = r.retryAdjustedProbability! - r.successProbability
+    expect(gain).toBeCloseTo(
+      (1 - r.successProbability) * 1 * (1 - (1 - eff.perAttemptEfficacy) ** 2), 10,
+    )
+    expect(gain).toBeLessThan(0.3)
+  })
+
+  it('零营救观测 → 纯先验（r₀=0.75, selfWeight=0），投影与 V5.3 默认一致', async () => {
+    const model = await createReliabilityModel({ audit: auditAt('cold-v54') })
+    const eff = model.retryEfficacy!
+    expect(eff.pool).toBe(0)
+    expect(eff.rescued).toBe(0)
+    expect(eff.rescueRate).toBeCloseTo(0.75, 10)   // 1-(1-0.5)²
+    expect(eff.perAttemptEfficacy).toBeCloseTo(0.5, 10)
+    expect(eff.selfWeight).toBe(0)
+  })
+})

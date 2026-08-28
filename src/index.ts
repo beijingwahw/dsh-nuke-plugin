@@ -2,7 +2,7 @@
 // 架构：contracts/（接口） → infra/（基建）+ engine/（引擎）+ operations/（命令）
 // 本文件只做两件事：
 //   1. 组装运行时（依赖注入，全部组件可替换、可测试）
-//   2. 注册 22 个工具（薄适配层：校验入参 → 调用组件 → 格式化出参）
+//   2. 注册 23 个工具（薄适配层：校验入参 → 调用组件 → 格式化出参）
 import * as fs from 'fs'
 import * as path from 'path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -35,13 +35,14 @@ import { createDiskForecaster } from './engine/disk-forecaster'
 import { createGuardian } from './engine/guardian'
 import { createLedger } from './infra/ledger'
 import { createReliabilityModel } from './infra/reliability'
+import { createPredictionScorer } from './infra/prediction-score'
 import { createOracle } from './engine/oracle'
 import { createDrill, isDrillMatrixReport } from './engine/drill'
 import { makeOperationFactory, STRATEGY_ACTIONS } from './operations'
 import { createToolRegistry } from './infra/tool-registry'
 import type { IToolRegistry } from './contracts/tool.contract'
 import type { CleanStrategy, PluginName, ProfileName, TxId } from './contracts/base'
-import { errorToMessage, fmtBytes } from './contracts/base'
+import { errorToMessage, fmtBytes, fmtDuration } from './contracts/base'
 import type { ResidualEvidence, SeverityBand } from './contracts/scoring'
 import type { ITransactionEngine } from './contracts/transaction'
 import type { DoctorPriority, DoctorVerdict } from './contracts/doctor.contract'
@@ -96,6 +97,9 @@ function buildRuntime() {
       clock: { now: () => new Date() },
       verifyConfirmationToken: (token, req) =>
         token === confirmationTokenOf(req.profile, req.plugins),
+      // V5.4 预测存证：commit 执行前把逐步预测写进 hash chain ——
+      // 预测先于结局、事后不可篡改，先知从此可被问责（nuke_scorecard）
+      predictor: () => createReliabilityModel({ audit }),
     },
     operationFactory,
   )
@@ -149,6 +153,8 @@ function buildRuntime() {
     operationFactory,
     resolver, logger, clock: { now: () => new Date() },
     blastRadius, forecaster,
+    // V5.4 先知战绩：推演时一并公开历史预测成绩单（问责制）
+    scorecard: async () => (await createPredictionScorer({ audit })).scorecard(),
   })
 
   // 混沌演习：沙箱内注入真实崩溃，持续证明崩溃可恢复性
@@ -180,8 +186,8 @@ const BAND_ICON: Record<SeverityBand, string> = {
 
 /** dsh-tools 契约：execute 返回 canonical value，先经 output.schema 校验，
  *  再由 render(args, value) 投影为 ContentBlock 数组。
- *  本插件 22 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
- *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 22 份。 */
+ *  本插件 23 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
+ *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 23 份。 */
 const TEXT_OUTPUT_SCHEMA = {
   type: 'object',
   additionalProperties: false,
@@ -461,6 +467,18 @@ export function apply(ctx: Context) {
         `   期望回收: ${fmtBytes(o.expectedReclaimBytes)}（已折算失败回滚；若成功: ${fmtBytes(o.reclaimP10IfSuccess)} ~ ${fmtBytes(o.reclaimP90IfSuccess)}）`,
         `   预估总量: ${fmtBytes(o.totalEstimatedBytes)}  |  失败期望回滚深度: ${o.expectedRollbackDepth.toFixed(1)} 步`,
       ]
+      // V5.4：耗时预测 —— 各步历史中位之和（任一步零历史则诚实不显示）
+      if (o.predictedDurationMs !== null) {
+        const pes = o.pessimisticDurationMs !== null && o.pessimisticDurationMs > o.predictedDurationMs
+          ? `（悲观上界 ${fmtDuration(o.pessimisticDurationMs)}）`
+          : ''
+        lines.push(`   ⏱️ 预计耗时: ~${fmtDuration(o.predictedDurationMs)}${pes}  ← 来自历史步骤耗时的时间加权中位`)
+      }
+      // V5.4：先知战绩 —— 预测存证 vs 实际结局的对账摘要（问责制）
+      const tr = o.trackRecord
+      if (tr !== null && tr.scoredTx > 0 && tr.skillScore !== null) {
+        lines.push(`   🏅 先知战绩: 技能分 ${tr.skillScore >= 0 ? '+' : ''}${tr.skillScore.toFixed(2)}（已对账 ${tr.scoredTx} 次预测，Brier ${(tr.brierTx ?? 0).toFixed(3)} vs 基线 ${(tr.brierBaseline ?? 0).toFixed(3)}）→ nuke_scorecard`)
+      }
       if (o.monteCarlo.trials > 0) {
         const mc = o.monteCarlo
         // 蒙特卡洛互证口径：P10/P90 是含失败回滚（=0）的无条件分布，
@@ -502,7 +520,11 @@ export function apply(ctx: Context) {
             `${m.mode}${m.transience === 'transient' ? '⚡' : '🔒'}${(m.share * 100).toFixed(0)}%`,
           ).join(' ')}`
           : ''
-        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${retryAdj}${cal}${prior}${modes}`)
+        // V5.4：该步历史耗时中位（零历史不显示 —— 不拿先验冒充耗时证据）
+        const dur = s.predictedDurationMs !== null
+          ? `  ~${fmtDuration(s.predictedDurationMs)}`
+          : ''
+        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${retryAdj}${cal}${prior}${modes}${dur}`)
       }
       // V5.2 决策智能：帕累托前沿 + 推荐计划（先知从"预测者"升级为"决策顾问"）
       // V5.3：候选成功率已取重试调整口径 —— 计划合成与引擎执行语义对齐
@@ -563,6 +585,56 @@ export function apply(ctx: Context) {
         if (a.failures === 0) lines.push('    （零失败 —— 无模式档案）')
       }
       lines.push('', '口径: ⚡瞬态 = 引擎自动重试（有界指数退避）；🔒永久 = 重试无意义，按处方处理。档案随每次清理自动更新')
+      return { content: lines.join('\n') }
+    },
+  }))
+
+  // ── nuke_scorecard（先知战绩：预测问责对账单） ─────────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_scorecard',
+    description: '先知战绩对账单：每次 nuke_clean 执行前，预测（成功率/耗时）已存证进 hash chain —— 本工具用实际结局对账这些预测：Brier 技能分（对照无技能基线）、逐步命中明细、耗时偏差分布、重试疗效学习值。回答"先知的数字到底可不可信"。预测若不可证伪就与巫术无异 —— 先知公开自己的成绩单。零副作用',
+    parameters: {},
+    execute: async () => {
+      const model = await createReliabilityModel({ audit: rt.audit })
+      const scorer = await createPredictionScorer({ audit: rt.audit })
+      const sc = await scorer.scorecard()
+      const eff = model.retryEfficacy
+      if (sc.scoredTx === 0) {
+        return {
+          content: [
+            '🏅 先知战绩: 尚无可对账的预测',
+            '',
+            '口径: 预测只在真实 nuke_clean commit 执行前存证（dry-run 不存证）；',
+            '跑一次真实清理后，这里会出现第一张成绩单。演习事务（人为注入崩溃）',
+            '不计入战绩 —— 人为的失败不是先知的预测失误。',
+          ].join('\n'),
+        }
+      }
+      const pct = (n: number) => `${(n * 100).toFixed(1)}%`
+      const skill = sc.skillScore
+      const skillLine = skill !== null
+        ? `   📐 技能分: ${skill >= 0 ? '+' : ''}${skill.toFixed(2)}（1 − Brier/基线；>0 优于"永远预测基准率"的无技能基线${skill < 0 ? ' —— 当前还不如直接报基准率，预测谨慎参考' : ''}）`
+        : '   📐 技能分: n/a（实际结局全同 —— 基线已完美，技能分无定义）'
+      const lines = [
+        `🏅 先知战绩 @ ${new Date().toISOString()}（已对账 ${sc.scoredTx} 个事务 / ${sc.scoredSteps} 个步骤）`,
+        `   🎯 事务 Brier: ${sc.brierTx !== null ? sc.brierTx.toFixed(3) : 'n/a'}（0=完美 0.25=硬币水平；基线 ${sc.brierBaseline !== null ? sc.brierBaseline.toFixed(3) : 'n/a'}）`,
+        `   📎 步骤 Brier: ${sc.brierSteps !== null ? sc.brierSteps.toFixed(3) : 'n/a'}（${sc.scoredSteps} 个有结局的步骤；回滚跳过的步骤不计分）`,
+        skillLine,
+      ]
+      if (sc.durationRatio !== null) {
+        const dr = sc.durationRatio
+        lines.push(`   ⏱️ 耗时偏差: 实际/预测 中位 ${dr.p50.toFixed(2)}× / P90 ${dr.p90.toFixed(2)}×（${dr.samples} 样本；>1 = 预测偏乐观）`)
+      }
+      if (eff !== undefined) {
+        const learned = eff.selfWeight > 0
+        lines.push(`   ♻️ 重试疗效: 观测营救率 ${pct(eff.rescueRate)}（池 ${eff.pool}，救回 ${eff.rescued}${learned ? '' : '；零观测，纯先验'}）`)
+      }
+      lines.push('', '─ 最近对账（新 → 旧）─')
+      for (const r of sc.recent) {
+        const hit = r.actual === 1
+        lines.push(`   tx ${r.txId.slice(0, 8)}…: 预测 ${pct(r.predictedP)} → ${hit ? '✅ 全成' : '❌ 回滚'}（Brier ${r.brier.toFixed(3)}）`)
+      }
+      lines.push('', '口径: 预测在 commit 执行前存证进 hash chain（时间戳先于结局，事后不可篡改）；', '   Brier = (p−y)²，技能分 > 0 表示先知优于"永远预测基准率"的无技能参照。战绩随每次真实清理自动更新')
       return { content: lines.join('\n') }
     },
   }))
