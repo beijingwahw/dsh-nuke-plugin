@@ -38,6 +38,60 @@ describe('贝叶斯可靠性模型', () => {
     expect(r.ci95[1]).toBeGreaterThan(0.95)
   })
 
+  it('V5.2 大小分桶：同动作不同体量 → 三层收缩给出差异化成功率', async () => {
+    const audit = auditAt('size-bucket')
+    // remove-node-modules 历史：小目录(<1MB) 4 成 0 败；大目录(≥100MB) 1 成 4 败（EBUSY 风险）
+    const MB = 1024 * 1024
+    for (let i = 0; i < 4; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-node-modules', outcome: 'success',
+        detail: { estimated: 0.5 * MB, actual: 0.5 * MB },
+      })
+    }
+    await audit.append({
+      timestamp: '2026-08-21T00:00:00Z',
+      actor: 't', action: 'op:remove-node-modules', outcome: 'success',
+      detail: { estimated: 2 * 1024 * MB, actual: 2 * 1024 * MB },
+    })
+    for (let i = 0; i < 4; i++) {
+      await audit.append({
+        timestamp: `2026-08-22T00:00:${String(i).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-node-modules', outcome: 'failure',
+        detail: { estimated: 2 * 1024 * MB, error: 'EBUSY' },
+      })
+    }
+    const model = await createReliabilityModel({ audit })
+    // 动作层（不分桶）：μ 全局 = (5+19)/(9+20) = 24/29 ≈ 0.8276
+    // α = 0.8276×10+5 = 13.276, β = 0.1724×10+4 = 5.724 → p ≈ 0.6986
+    const base = model.reliabilityOf('remove-node-modules')
+    expect(base.successProbability).toBeCloseTo(13.276 / 19, 2)
+    // 桶层（small）：κ_b=5，α_b = p_action×5+4 = 7.49，β_b = (1-p_action)×5+0 = 1.51
+    // → p_small = 7.49/8.997 ≈ 0.8326（显著高于动作层 0.699：小目录历史全成）
+    const small = model.reliabilityOf('remove-node-modules', { sizeBytes: 0.5 * MB })
+    expect(small.sizeBucket).toBeDefined()
+    expect(small.sizeBucket!.bucket).toBe('small')
+    expect(small.sizeBucket!.samples).toBe(4)
+    expect(small.successProbability).toBeCloseTo(7.49 / 8.997, 3)
+    expect(small.successProbability).toBeGreaterThan(base.successProbability)
+    // selfWeight 保持动作层口径（不被桶层覆盖）
+    expect(small.selfWeight).toBeCloseTo(base.selfWeight)
+    // 桶层（large）：1 成 4 败 → 显著低于动作层（大目录脆弱）
+    const large = model.reliabilityOf('remove-node-modules', { sizeBytes: 2 * 1024 * MB })
+    expect(large.sizeBucket!.bucket).toBe('large')
+    expect(large.sizeBucket!.samples).toBe(5)
+    expect(large.successProbability).toBeLessThan(base.successProbability)
+    expect(large.successProbability).toBeLessThan(0.5)
+    // 未知桶（medium 无样本）：调制不生效 → 诚实返回动作层估计
+    const medium = model.reliabilityOf('remove-node-modules', { sizeBytes: 50 * MB })
+    expect(medium.sizeBucket!.bucket).toBe('medium')
+    expect(medium.sizeBucket!.samples).toBe(0)
+    expect(medium.sizeBucket!.selfWeight).toBe(0)
+    expect(medium.successProbability).toBeCloseTo(base.successProbability)
+    // 不传 sizeBytes → 不附带桶证据（旧语义不变）
+    expect(base.sizeBucket).toBeUndefined()
+  })
+
   it('设计先验可配置：priorSuccessProbability 覆盖默认锚点', async () => {
     const model = await createReliabilityModel({
       audit: auditAt('prior-override'), priorSuccessProbability: 0.8,

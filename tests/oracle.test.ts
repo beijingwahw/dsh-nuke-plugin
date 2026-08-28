@@ -306,3 +306,75 @@ describe('先知引擎（V5.1.1 冷启动修复：零历史不再硬币塌缩）
     }
   })
 })
+
+describe('先知引擎（V5.2 决策智能：帕累托计划合成 + 大小分桶）', () => {
+  /** 桶调制 mock：remove-node-modules 带 sizeBytes 查询时降到 0.5（大目录脆弱） */
+  function bucketModel(): IReliabilityModel {
+    return {
+      sampleCount: 10,
+      globalSuccessProbability: 0.9,
+      byAction: () => new Map(),
+      reliabilityOf: (action, opts): ActionReliability => ({
+        action, successes: 0, failures: 0,
+        successProbability: opts?.sizeBytes !== undefined && action === 'remove-node-modules'
+          ? 0.5
+          : 0.99,
+        ci95: [0, 1], selfWeight: 0,
+        calibration: null,
+        ...(opts?.sizeBytes !== undefined && action === 'remove-node-modules'
+          ? { sizeBucket: { bucket: 'large' as const, rangeBytes: [104857600, null] as const, samples: 3, selfWeight: 3 / 8 } }
+          : {}),
+      }),
+    }
+  }
+
+  it('optimizedPlan：3 步全集合成前沿，剔除脆弱步骤可提升成功率（数学可验）', async () => {
+    // 步骤：patch(100B,p=0.99) → node-modules(200B,p=0.5 桶调制) → storages(400B,p=0.99)
+    // 全集 P=0.99×0.5×0.99=0.4901，E≈0.4901×(100+200+400)=343
+    // 剔除 node-modules：P=0.9801，E=0.9801×500=490 → 支配全集！
+    const oracle = buildOracle(bucketModel())
+    const r = okv(await oracle.divine(request))
+    expect(r.optimizedPlan).not.toBeNull()
+    const plan = r.optimizedPlan!
+    expect(plan.solver).toBe('exact')
+    expect(plan.fullSet.successProbability).toBeCloseTo(0.99 * 0.5 * 0.99)
+    // 前沿至少两点；激进端回收 ≥ 全集
+    expect(plan.frontier.length).toBeGreaterThanOrEqual(2)
+    expect(plan.frontier[0]!.expectedReclaimBytes)
+      .toBeGreaterThanOrEqual(plan.fullSet.expectedReclaimBytes)
+    // 拐点推荐剔除 node-modules（它同时拖累成功率且贡献少）
+    expect(plan.recommended.actions).not.toContain('remove-node-modules')
+    expect(plan.recommended.successProbability).toBeCloseTo(0.99 * 0.99)
+    // 剔除理由给出账单
+    expect(plan.drops.length).toBe(1)
+    expect(plan.drops[0]!.action).toBe('remove-node-modules')
+    expect(plan.drops[0]!.successUpliftPct).toBeGreaterThan(0)
+  })
+
+  it('步骤成功率已用大小分桶调制（oracle 传 sizeBytes 查询）', async () => {
+    const oracle = buildOracle(bucketModel())
+    const r = okv(await oracle.divine(request))
+    const nm = r.steps.find(s => s.action === 'remove-node-modules')!
+    expect(nm.successProbability).toBe(0.5)   // 桶调制生效（非动作层 0.99）
+    const patch = r.steps.find(s => s.action === 'clean-home-patch')!
+    expect(patch.successProbability).toBe(0.99)
+  })
+
+  it('优化器异常不阻断推演（optimizedPlan=null 降级）', async () => {
+    // 概率含 NaN → optimize 返回 err → divine 仍成功（决策增强非关键路径）
+    const badModel: IReliabilityModel = {
+      sampleCount: 10,
+      globalSuccessProbability: 0.9,
+      byAction: () => new Map(),
+      reliabilityOf: (action): ActionReliability => ({
+        action, successes: 0, failures: 0,
+        successProbability: action === 'remove-node-modules' ? Number.NaN : 0.9,
+        ci95: [0, 1], selfWeight: 0, calibration: null,
+      }),
+    }
+    const oracle = buildOracle(badModel)
+    const r = await oracle.divine(request)
+    // NaN 连乘传播 → 步骤成功率 NaN，但推演本身不抛错（决策链防御性）
+    expect(r.ok).toBe(true)
+  })
+})

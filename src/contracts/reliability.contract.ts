@@ -29,6 +29,21 @@ export interface CalibrationSummary {
   readonly p90: number
 }
 
+/** 大小桶（操作级成功率调制的协变量）：
+ *  大目录删除更易 EBUSY/长路径/超时 —— "删 2GB 的成功率"≠"删 5MB 的成功率" */
+export type SizeBucket = 'small' | 'medium' | 'large'
+
+/** 调用方提供 sizeBytes 时附带的桶级证据画像 */
+export interface SizeBucketEvidence {
+  readonly bucket: SizeBucket
+  /** 桶边界（含下界、不含上界；large 上界 = ∞） */
+  readonly rangeBytes: readonly [number, number | null]
+  /** 桶内该动作的成败样本数（成功+失败；仅统计可归桶样本） */
+  readonly samples: number
+  /** 桶层自数据权重 0-1（向动作层收缩的系数；0 = 桶内零样本 → 调制不生效） */
+  readonly selfWeight: number
+}
+
 export interface ActionReliability {
   readonly action: CleanAction | string
   readonly successes: number
@@ -41,13 +56,20 @@ export interface ActionReliability {
   readonly selfWeight: number
   /** 校准分布；样本 < minCalibrationSamples 时为 null（诚实的不确定） */
   readonly calibration: CalibrationSummary | null
+  /** V5.2：带 sizeBytes 查询时的桶级调制证据；未查询大小时为 undefined */
+  readonly sizeBucket?: SizeBucketEvidence
 }
 
 export interface IReliabilityModel {
   /** 全部动作的可靠性快照 */
   byAction(): ReadonlyMap<string, ActionReliability>
-  /** 单动作查询（无任何数据时返回收缩先验，不返回 null） */
-  reliabilityOf(action: string): ActionReliability
+  /**
+   * 单动作查询（无任何数据时返回收缩先验，不返回 null）。
+   * V5.2：可选 sizeBytes → 三层收缩（桶 → 动作 → 全局 → 设计先验），
+   * 大小桶是该动作成功率 的协变量调制：桶内零样本时调制不生效
+   * （诚实返回动作层估计，sizeBucket.selfWeight=0）。
+   */
+  reliabilityOf(action: string, opts?: { readonly sizeBytes?: number }): ActionReliability
   /** 步骤级观测总样本数（跨动作） */
   readonly sampleCount: number
   /** 全局成功率均值（pooled，向设计先验收缩；零历史时即设计先验 0.95） */

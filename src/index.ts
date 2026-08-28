@@ -482,8 +482,28 @@ export function apply(ctx: Context) {
         const prior = (s.selfWeight ?? 0) === 0 ? ' 🧭' : ''
         lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${cal}${prior}`)
       }
+      // V5.2 决策智能：帕累托前沿 + 推荐计划（先知从"预测者"升级为"决策顾问"）
+      const plan = o.optimizedPlan
+      if (plan) {
+        lines.push('', `─ 帕累托计划合成（${plan.solver === 'exact' ? '精确枚举' : '启发式'}）─`)
+        lines.push(`   🎯 推荐: 保留 ${plan.recommended.actions.length}/${o.steps.length} 步 → 成功率 ${pct(plan.recommended.successProbability)} / 期望回收 ${fmtBytes(plan.recommended.expectedReclaimBytes)}`)
+        lines.push(`      相对全集: 成功率 +${plan.vsFullSet.successUpliftPct.toFixed(1)} 个百分点，回收牺牲 ${plan.vsFullSet.reclaimSacrificePct.toFixed(1)}%`)
+        if (plan.frontier.length > 1) {
+          lines.push('      前沿（成功率 ↑ 回收量 ↓ 的权衡阶梯）:')
+          for (const pt of plan.frontier) {
+            const mark = pt === plan.recommended ? ' ★' : ''
+            lines.push(`        ${pct(pt.successProbability)}  ${fmtBytes(pt.expectedReclaimBytes)}  （剔 ${pt.dropped} 步）${mark}`)
+          }
+        }
+        if (plan.drops.length > 0) {
+          lines.push('      剔除理由（性价比: 每换 1 个百分点成功率所费的回收字节）:')
+          for (const d of plan.drops) {
+            lines.push(`        ✂️ ${d.action}: +${d.successUpliftPct.toFixed(1)}pct 成功率，代价 ${fmtBytes(d.reclaimCostBytes)}${d.bytesPerPct === Number.POSITIVE_INFINITY ? '' : `（${fmtBytes(d.bytesPerPct)}/pct）`}`)
+          }
+        }
+      }
       lines.push('', `💡 ${o.narrative}`)
-      lines.push('', '决策链建议: nuke_oracle（后果推演）→ nuke_clean dry_run（计划预演）→ nuke_clean（执行）')
+      lines.push('', '决策链建议: nuke_oracle（后果推演+计划合成）→ nuke_clean dry_run（计划预演）→ nuke_clean（执行）')
       return { content: lines.join('\n') }
     },
   }))

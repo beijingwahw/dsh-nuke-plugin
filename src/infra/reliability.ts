@@ -38,8 +38,28 @@
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX } from '../contracts/logging'
 import type {
-  ActionReliability, CalibrationSummary, IReliabilityModel,
+  ActionReliability, CalibrationSummary, IReliabilityModel, SizeBucket,
 } from '../contracts/reliability.contract'
+
+// ─── V5.2：大小桶边界（操作级协变量调制） ─────────────────────
+// 大目录删除的失败模式（EBUSY/长路径/超时/句柄耗尽）与 5MB 级完全不同，
+// "remove-node-modules 的成功率"应按体量分层。桶先验强度 κ_b=5：
+// 桶内样本天然稀疏（动作层样本被 3 个桶摊薄），更快向动作层让位。
+const SIZE_BUCKETS: ReadonlyArray<{ readonly bucket: SizeBucket; readonly min: number; readonly max: number | null }> = [
+  { bucket: 'small', min: 0, max: 1024 * 1024 },                    // < 1MB
+  { bucket: 'medium', min: 1024 * 1024, max: 100 * 1024 * 1024 },   // 1MB ~ 100MB
+  { bucket: 'large', min: 100 * 1024 * 1024, max: null },           // ≥ 100MB
+]
+
+function bucketOf(sizeBytes: number): (typeof SIZE_BUCKETS)[number] | null {
+  for (const b of SIZE_BUCKETS) {
+    if (sizeBytes >= b.min && (b.max === null || sizeBytes < b.max)) return b
+  }
+  return null
+}
+
+/** 桶层先验强度：小于动作层 κ=10 —— 桶样本被三桶摊薄，更快向动作层让位 */
+const BUCKET_KAPPA = 5
 
 export interface ReliabilityModelOptions {
   readonly audit: IAuditLog
@@ -72,6 +92,8 @@ interface ActionStats {
   successes: number
   failures: number
   samples: CalibrationSample[]
+  /** V5.2：大小桶统计（estimated 可归桶的成败样本；双向归桶保证无偏） */
+  buckets: Map<SizeBucket, { successes: number; failures: number }>
 }
 
 function quantile(sorted: readonly number[], q: number): number {
@@ -153,19 +175,31 @@ export async function createReliabilityModel(
     if (!e.action.startsWith(OP_AUDIT_PREFIX)) continue
     if (e.outcome === 'skipped') continue   // 策略性跳过不是可靠性证据
     const action = e.action.slice(OP_AUDIT_PREFIX.length)
-    const s = stats.get(action) ?? { successes: 0, failures: 0, samples: [] }
+    const s = stats.get(action)
+      ?? { successes: 0, failures: 0, samples: [] as CalibrationSample[], buckets: new Map<SizeBucket, { successes: number; failures: number }>() }
+    const est = (e.detail as { estimated?: unknown }).estimated
+    const act = (e.detail as { actual?: unknown }).actual
     if (e.outcome === 'success') {
       s.successes++
       pooledS++
       // 校准样本：detail { estimated, actual }（estimated>0 时才有意义）
-      const est = (e.detail as { estimated?: unknown }).estimated
-      const act = (e.detail as { actual?: unknown }).actual
       if (typeof est === 'number' && typeof act === 'number' && est > 0) {
         s.samples.push({ ratio: act / est, atMs: Date.parse(e.timestamp) })
       }
     } else {
       s.failures++
       pooledF++
+    }
+    // V5.2 大小桶：成败双向归桶（estimated>0 即可归桶；失败样本同样
+    // 带 estimated —— 事务引擎失败审计已记录预估量，负证据不丢失）
+    if (typeof est === 'number' && est > 0) {
+      const b = bucketOf(est)
+      if (b) {
+        const bs = s.buckets.get(b.bucket) ?? { successes: 0, failures: 0 }
+        if (e.outcome === 'success') bs.successes++
+        else bs.failures++
+        s.buckets.set(b.bucket, bs)
+      }
     }
     stats.set(action, s)
   }
@@ -187,14 +221,48 @@ export async function createReliabilityModel(
     })).sort((a, b) => a.value - b.value)
   }
 
-  function build(action: string, s: ActionStats | undefined): ActionReliability {
+  function build(
+    action: string,
+    s: ActionStats | undefined,
+    sizeBytes?: number,
+  ): ActionReliability {
     const succ = s?.successes ?? 0
     const fail = s?.failures ?? 0
     const alpha = mu * kappa + succ
     const beta = (1 - mu) * kappa + fail
-    const mean = alpha / (alpha + beta)
+    let mean = alpha / (alpha + beta)
+    let ci: readonly [number, number]
+    let selfWeight = (succ + fail) / (succ + fail + kappa)
+    let sizeBucket: ActionReliability['sizeBucket']
+
+    // V5.2 桶层调制：α_b = p_action·κ_b + s_b, β_b = (1-p_action)·κ_b + f_b
+    //（三层收缩：桶 → 动作 → 全局 → 设计先验；κ_b=5）
+    // 注意：selfWeight 保持动作层口径（"该动作有多少自身历史"），
+    // 桶层权重单独由 sizeBucket.selfWeight 表达 —— 两个语义不混用。
+    if (typeof sizeBytes === 'number' && sizeBytes >= 0) {
+      const b = bucketOf(sizeBytes)
+      if (b) {
+        const bs = s?.buckets.get(b.bucket) ?? { successes: 0, failures: 0 }
+        const nB = bs.successes + bs.failures
+        const alphaB = mean * BUCKET_KAPPA + bs.successes
+        const betaB = (1 - mean) * BUCKET_KAPPA + bs.failures
+        mean = alphaB / (alphaB + betaB)
+        ci = wilsonInterval(mean, alphaB + betaB)
+        sizeBucket = {
+          bucket: b.bucket,
+          rangeBytes: [b.min, b.max],
+          samples: nB,
+          selfWeight: nB / (nB + BUCKET_KAPPA),
+        }
+      } else {
+        ci = wilsonInterval(mean, alpha + beta)
+      }
+    } else {
+      ci = wilsonInterval(mean, alpha + beta)
+    }
+
     // Wilson score interval：点估计与区间同源于 Beta(α,β) 后验
-    const [lo, hi] = wilsonInterval(mean, alpha + beta)
+    const [lo, hi] = ci
     const samples = weightedSamples(s?.samples ?? [])
     const calibration: CalibrationSummary | null = samples.length >= minCal
       ? {
@@ -210,8 +278,9 @@ export async function createReliabilityModel(
       failures: fail,
       successProbability: mean,
       ci95: [lo, hi],
-      selfWeight: (succ + fail) / (succ + fail + kappa),
+      selfWeight,
       calibration,
+      ...(sizeBucket !== undefined ? { sizeBucket } : {}),
     }
   }
 
@@ -222,6 +291,9 @@ export async function createReliabilityModel(
     sampleCount,
     globalSuccessProbability: mu,
     byAction: () => snapshot,
-    reliabilityOf: (action) => snapshot.get(action) ?? build(action, undefined),
+    reliabilityOf: (action, opts) => {
+      const base = stats.get(action)
+      return build(action, base, opts?.sizeBytes)
+    },
   }
 }

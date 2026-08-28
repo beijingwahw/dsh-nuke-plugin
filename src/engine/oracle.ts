@@ -17,12 +17,14 @@ import { err, ioError, ok } from '../contracts/base'
 import type { IReliabilityModel } from '../contracts/reliability.contract'
 import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
 } from '../contracts/oracle.contract'
+import type { OptimizedPlan, OptimizerGoal } from '../contracts/optimizer.contract'
 import type { ILogger } from '../contracts/logging'
 import type { Clock } from '../contracts/base'
 import type { IPathResolver } from '../contracts/paths'
 import type { IBlastRadiusAnalyzer } from '../contracts/blast-radius.contract'
 import type { IDiskForecaster } from '../contracts/disk-forecast.contract'
 import { fmtBytes } from '../contracts/base'
+import { optimize } from './optimizer'
 
 // ─── 引擎层扩展类型（contracts 只读；新输出字段在此定义并导出） ──
 
@@ -59,6 +61,8 @@ export interface OracleReportDetail extends OracleReport {
   readonly weakestStep: OracleWeakestStepDetail | null
   /** 蒙特卡洛模拟结果（trials=0 时各分位数与均值退化为 0） */
   readonly monteCarlo: MonteCarloSummary
+  /** V5.2 决策智能：帕累托最优计划合成（优化失败不阻断推演 → null） */
+  readonly optimizedPlan: OptimizedPlan | null
 }
 
 /** IOracle 的引擎层扩展：divine 返回详情报告（协变返回类型） */
@@ -84,6 +88,8 @@ export interface OracleDeps {
   readonly monteCarloTrials?: number
   /** 蒙特卡洛随机种子（默认固定常量：跨调用可复现） */
   readonly monteCarloSeed?: number
+  /** V5.2 优化器目标（默认 { kind: 'pareto' }：前沿 + 拐点推荐） */
+  readonly optimizerGoal?: OptimizerGoal
 }
 
 /** preview 阶段触碰备份区 = 副作用逃逸，立即引爆（防御性纪律） */
@@ -208,7 +214,8 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           suffix[i] = suffix[i + 1]! + previews[i]!.estimated
         }
         for (const [i, pv] of previews.entries()) {
-          const r = rel.reliabilityOf(pv.op.action)
+          // V5.2：操作级成功率 —— 大小分桶协变量调制（"删 2GB 的成功率"）
+          const r = rel.reliabilityOf(pv.op.action, { sizeBytes: pv.estimated })
           steps.push({
             index: i,
             action: pv.op.action,
@@ -304,6 +311,24 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         // 冷启动叙事的透明度：明确告诉用户"这个数从哪来"
         const priorOnlySteps = steps.filter(s => (s.selfWeight ?? 0) === 0).length
 
+        // ── V5.2 决策智能：帕累托最优计划合成（优化失败不阻断推演） ──
+        let optimizedPlan: OptimizedPlan | null = null
+        try {
+          const candidates = previews.map((pv, i) => {
+            const r = rel.reliabilityOf(pv.op.action, { sizeBytes: pv.estimated })
+            return {
+              action: pv.op.action,
+              index: i,
+              successProbability: r.successProbability,
+              estimatedBytes: pv.estimated,
+              calibrationRatio: r.calibration ? r.calibration.p50 : 1,
+              riskLevel: 'medium' as const,
+            }
+          })
+          const opt = optimize(candidates, deps.optimizerGoal ?? { kind: 'pareto' })
+          optimizedPlan = opt.ok ? opt.value : null
+        } catch { optimizedPlan = null }
+
         const report: OracleReportDetail = {
           request,
           steps,
@@ -318,6 +343,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           diskExtensionDays,
           confidence,
           monteCarlo: mc,
+          optimizedPlan,
           narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc,
             priorOnlySteps, rel.globalSuccessProbability),
           evidence: {
