@@ -1,8 +1,10 @@
 // tests/ledger.test.ts — 空间台账单测
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { createLedger } from '../src/infra/ledger'
 
 let tmp: string
@@ -59,7 +61,7 @@ describe('空间台账', () => {
     expect(apiOnly.ok && apiOnly.value.entryCount).toBe(1)
 
     const since = await l.query({ since: '2026-01-15' })
-    expect(since.ok && since.ok && since.value.entryCount).toBe(2)
+    expect(since.ok && since.value.entryCount).toBe(2)
   })
 
   it('entries 分页降序 + 尾部半行容错', async () => {

@@ -4,7 +4,7 @@
 //  2. 删除白名单：canonicalize 解析 symlink 后必须落在白名单根内才可删
 //  3. 统一插件自身状态目录（.nuke-backups/.nuke-tx/.nuke-logs/.nuke-reports）
 
-import type { AbsolutePath, ProfileName, Result, NukeError } from './base'
+import type { AbsolutePath, ProfileName, Result } from './base'
 
 export interface PlatformInfo {
   readonly os: 'windows' | 'macos' | 'linux'
@@ -34,13 +34,13 @@ export interface IPathResolver {
   platform(): PlatformInfo
 
   /** realpath + 分隔符/大小写归一；解析 symlink，防符号链接逃逸 */
-  canonicalize(p: string): Promise<Result<AbsolutePath, NukeError>>
+  canonicalize(p: string): Promise<Result<AbsolutePath>>
 
   /** 解析后判定 child 是否位于 root 内（含 symlink 解析后重判） */
   isWithin(child: string, root: AbsolutePath): Promise<boolean>
 
   /** 删除前置闸门：策略校验 + 穿越检测。返回违规明细 */
-  assertDeletable(p: string, policy: PathPolicy): Promise<Result<AbsolutePath, NukeError>>
+  assertDeletable(p: string, policy: PathPolicy): Promise<Result<AbsolutePath>>
 
   // ─── 已知根（全部为绝对路径，构造时一次性解析） ─────────────
   profileDir(profile: ProfileName): AbsolutePath

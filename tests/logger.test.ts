@@ -1,5 +1,6 @@
 // tests/logger.test.ts — 日志器单测（V5：结构化 JSONL / 子日志器 / 人类模式保持）
 import { describe, expect, it } from 'vitest'
+
 import { createLogger } from '../src/infra/logger'
 import type { LogWriter } from '../src/infra/logger'
 

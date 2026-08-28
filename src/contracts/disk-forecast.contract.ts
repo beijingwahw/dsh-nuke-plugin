@@ -3,7 +3,7 @@
 // 数据源：趋势追踪器的回归斜率（残留增长 ≈ 磁盘占用增长）+ statfs 实时余量。
 // 输出：daysUntilFull（写满倒计时）+ 分级告警 + 可执行建议。
 
-import type { NukeError, Result } from './base'
+import type { Result } from './base'
 import type { TrendReport } from './trend.contract'
 
 export type ForecastSeverity = 'ok' | 'watch' | 'warning' | 'critical'
@@ -27,5 +27,5 @@ export interface DiskForecast {
 
 export interface IDiskForecaster {
   /** 采样一次：statfs 当前余量 × 趋势斜率 → 倒计时与建议 */
-  forecast(): Promise<Result<DiskForecast, NukeError>>
+  forecast(): Promise<Result<DiskForecast>>
 }

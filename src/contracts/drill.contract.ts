@@ -4,7 +4,7 @@
 // 落盘后模拟进程死亡（SimulatedCrashError 穿透：不回滚、不释放锁），
 // 然后走真实崩溃恢复路径 recover()，逐项断言环境被完整还原。
 // 全部通过 → 签发崩溃安全证书。
-import type { NukeError, Result } from './base'
+import type { Result } from './base'
 
 export interface DrillCheck {
   readonly name: string
@@ -26,5 +26,5 @@ export interface DrillReport {
 export interface IDrill {
   /** 在沙箱中执行一次崩溃→恢复演习（不影响真实环境）。
    *  afterStep：第几步成功落盘后模拟断电（1-based，默认 1） */
-  run(options?: { readonly afterStep?: number }): Promise<Result<DrillReport, NukeError>>
+  run(options?: { readonly afterStep?: number }): Promise<Result<DrillReport>>
 }

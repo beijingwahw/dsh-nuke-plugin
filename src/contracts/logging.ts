@@ -4,16 +4,14 @@
 //  2. IAuditLog    审计日志：hash chain 不可变，任何篡改可被 verify() 检出
 //  3. IReporter    报告导出：JSON（机器）/ Markdown（人类）
 
-import type { CleanAction, NukeError, Result, TxId } from './base'
-import type { TxSummary, DryRunReport } from './transaction'
+import type { CleanAction, Result, TxId } from './base'
 import type { HealthCheckResult } from './health.contract'
+import type { TxSummary, DryRunReport } from './transaction'
 
 // ─── 运行日志（彩色终端输出） ───────────────────────────────
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error'
 
-export interface LogFields {
-  readonly [key: string]: unknown
-}
+export type LogFields = Readonly<Record<string, unknown>>;
 
 export interface ILogger {
   log(level: LogLevel, message: string, fields?: LogFields): void
@@ -114,7 +112,6 @@ export interface ReportSummary {
 export interface IReporter {
   /** 写入 <dshHome>/.nuke/reports/<name>.<ext> 并返回路径；文件名含 txId 与时间戳 */
   export(format: ReportFormat, payload: ReportPayload): Promise<Result<
-    { path: string; bytes: number },
-    NukeError
+    { path: string; bytes: number }
   >>
 }

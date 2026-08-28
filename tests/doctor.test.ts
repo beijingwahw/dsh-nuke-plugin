@@ -1,13 +1,13 @@
 // tests/doctor.test.ts — NukeDoctor 编排器单测（stub 感知组件 + 真实评分器）
 import { describe, expect, it } from 'vitest'
-import { createDoctor } from '../src/engine/doctor'
-import { createSeverityScorer } from '../src/engine/severity-scorer'
+
 import { ok } from '../src/contracts/base'
 import type { Clock, PluginName, ProfileName, Result } from '../src/contracts/base'
-import type { NukeError } from '../src/contracts/base'
-import type { ResidualEvidence } from '../src/contracts/scoring'
 import type { HealthReport } from '../src/contracts/health.contract'
 import type { OrphanReport, ScanEvent } from '../src/contracts/scan'
+import type { ResidualEvidence } from '../src/contracts/scoring'
+import { createDoctor } from '../src/engine/doctor'
+import { createSeverityScorer } from '../src/engine/severity-scorer'
 
 const clock: Clock = { now: () => new Date('2026-01-01T00:00:00Z') }
 
@@ -26,7 +26,8 @@ function evidence(over: Partial<ResidualEvidence> = {}): ResidualEvidence {
 
 function healthStub(over: Partial<HealthReport> = {}) {
   return {
-    inspect: async (_p: ProfileName): Promise<Result<HealthReport, NukeError>> =>
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 测试桩不读 profile，参数仅对齐 IHealthInspector.inspect 契约签名
+    inspect: async (_p: ProfileName): Promise<Result<HealthReport>> =>
       ok({
         profile: 'web' as ProfileName, checkedAt: '', results: [],
         blocking: false, score: 95, ...over,
@@ -36,7 +37,7 @@ function healthStub(over: Partial<HealthReport> = {}) {
 
 function scannerStub(evidences: ResidualEvidence[]) {
   return {
-    scan: async function* (): AsyncGenerator<ScanEvent> {
+    async *scan (): AsyncGenerator<ScanEvent> {
       for (const e of evidences) yield { type: 'found', evidence: e }
       yield { type: 'done', totalFound: evidences.length, bytesReclaimable: 0 }
     },
@@ -45,7 +46,7 @@ function scannerStub(evidences: ResidualEvidence[]) {
 
 function orphansStub(report: Partial<OrphanReport> = {}) {
   return {
-    detect: async (): Promise<Result<OrphanReport, NukeError>> =>
+    detect: async (): Promise<Result<OrphanReport>> =>
       ok({
         orphanPluginDirs: [], orphanDataDirs: [], tempOrphans: [],
         totalReclaimableBytes: 0, ...report,

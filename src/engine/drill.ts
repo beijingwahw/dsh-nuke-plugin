@@ -22,20 +22,22 @@
 // 锁清理说明：真实崩溃后锁由 stale-break 协议处理（需进程死亡 + TTL）。
 // 沙箱无法伪造"本进程已死"（pid 活着），故用"模拟重启运维清锁"替代，
 // 这也是现实中管理员处理沙箱的标准动作。
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
-import type { AbsolutePath, NukeError, Result, TxId } from '../contracts/base'
+
+import type { AbsolutePath, Result, TxId } from '../contracts/base'
 import { err, ioError, ok, SimulatedCrashError } from '../contracts/base'
-import type { CleanOperation, CleanRequest, TxContext } from '../contracts/transaction'
-import type { IPathResolver } from '../contracts/paths'
-import type { ILogger } from '../contracts/logging'
 import type { IDrill, DrillCheck, DrillReport } from '../contracts/drill.contract'
-import { createLockManager } from '../infra/lock-manager'
-import { createWal } from '../infra/wal'
-import { createBackupStore } from '../infra/backup-store'
+import type { ILogger } from '../contracts/logging'
+import type { IPathResolver } from '../contracts/paths'
+import type { CleanOperation, CleanRequest, TxContext } from '../contracts/transaction'
 import { createAuditLog } from '../infra/audit-log'
+import { createBackupStore } from '../infra/backup-store'
+import { createLockManager } from '../infra/lock-manager'
 import { createLogger } from '../infra/logger'
+import { createWal } from '../infra/wal'
+
 import { createHookRegistry } from './hook-registry'
 import { createTransactionEngine } from './transaction-engine'
 
@@ -68,7 +70,7 @@ export interface DrillMatrixReport extends DrillReport {
 export interface IDrillDetail extends IDrill {
   /** 崩溃注入点矩阵：一次调用覆盖 plan 后 / 第 1 步后 / 第 2 步后三个
    *  注入点（各自独立沙箱、独立完整验证），返回证书矩阵 */
-  runMatrix(): Promise<Result<DrillMatrixReport, NukeError>>
+  runMatrix(): Promise<Result<DrillMatrixReport>>
 }
 
 /** 运行时判别：报告是否为证书矩阵（携带注入点矩阵字段）。
@@ -99,7 +101,7 @@ export function createDrill(options: DrillOptions): IDrillDetail {
 
   /** 单注入点演习：point = 'plan'（计划后死亡，零步骤执行）或 1..2（第 N
    *  步成功落盘后注入 SimulatedCrashError）。每点独立沙箱独立验证。 */
-  async function runPoint(point: 'plan' | 1 | 2): Promise<Result<DrillReport, NukeError>> {
+  async function runPoint(point: 'plan' | 1 | 2): Promise<Result<DrillReport>> {
     const startedMs = Date.now()
     const afterStep = point === 'plan' ? 0 : point
     const runId = `${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`

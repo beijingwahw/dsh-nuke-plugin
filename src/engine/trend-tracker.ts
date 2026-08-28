@@ -34,12 +34,13 @@
 //      外推：区间锚定在中心拟合线的末点取值上，宽度纯由斜率不确定性驱动，
 //      点估计恒居区间内。完美线性数据 → 零宽度区间（诚实的零不确定性）。
 import * as path from 'path'
+
 import { err, ioError, ok } from '../contracts/base'
-import type { NukeError, ProfileName, Result } from '../contracts/base'
-import { appendJsonl, readJsonl } from '../infra/fs-utils'
+import type { ProfileName, Result } from '../contracts/base'
 import type {
   ITrendTracker, TrendReport, TrendSnapshot,
 } from '../contracts/trend.contract'
+import { appendJsonl, readJsonl } from '../infra/fs-utils'
 
 // ─── 引擎层扩展类型（contracts 只读；新输出字段在此定义并导出） ──
 
@@ -71,7 +72,7 @@ export interface TrendReportDetail extends TrendReport {
 
 /** ITrendTracker 的引擎层扩展：analyze 返回详情报告（协变返回类型） */
 export interface ITrendTrackerDetail extends ITrendTracker {
-  analyze(profile?: ProfileName): Promise<Result<TrendReportDetail, NukeError>>
+  analyze(profile?: ProfileName): Promise<Result<TrendReportDetail>>
 }
 
 /** 运行时判别：报告是否为引擎层详情（携带变点与斜率 CI）。

@@ -17,6 +17,7 @@
 //      found/root-summary/done 低频高价值，不受限频影响。
 import * as fs from 'fs'
 import * as path from 'path'
+
 import type { AbsolutePath, PluginName, ProfileName } from '../contracts/base'
 import type {
   IResidualScanner, ScanEvent, ScanRequest,
@@ -43,6 +44,11 @@ const TEMP_MARKER_RE = /dsh|deepseek|cordis/i
 
 /** 数量保底：即使时钟完全停滞，积压这么多路径也强制发一次 progress */
 const PROGRESS_HARD_GAP = 1000
+
+/** JSON 值的安全对象视图：null / 非对象 → null（窄化辅助，不改变运行时取值） */
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null ? v as Record<string, unknown> : null
+}
 
 export function createResidualScanner(options: ResidualScannerOptions): IResidualScanner {
   const now = options.now ?? (() => new Date())
@@ -175,7 +181,7 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
           const cached = cache?.get(cp.location, stat.mtimeMs, stat.size) ?? null
 
           // contains 检查：缓存命中直接用 containsHit；miss 才读全文并回写
-          let containsHit = true
+          let containsHit: boolean
           if (cp.isFile && cp.contains !== undefined) {
             if (cached?.containsHit !== undefined) {
               containsHit = cached.containsHit
@@ -256,11 +262,13 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
     const set = new Set<string>()
     const pkgPath = path.join(options.dshHome, 'profiles', profile, 'package.json')
     try {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as Record<string, any>
+      const pkg = asRecord(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as unknown)
       for (const k of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
-        for (const name of Object.keys(pkg[k] ?? {})) set.add(name)
+        const sec = asRecord(pkg?.[k])
+        if (sec !== null) for (const name of Object.keys(sec)) set.add(name)
       }
-      for (const b of pkg?.dsh?.profile?.bundles ?? []) set.add(b)
+      const bundles = asRecord(asRecord(pkg?.dsh)?.profile)?.bundles ?? []
+      for (const b of bundles as string[]) set.add(b)
     } catch {}
     for (const root of [path.join(options.dshHome, 'storages'), path.join(options.dshHome, 'attachments', 'v1')]) {
       try {

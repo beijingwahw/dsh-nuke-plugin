@@ -5,28 +5,30 @@
 //   证据 < 5 步 → 不修正（诚实：没有统计力就不动）
 //   耗时中位比 3×（预测偏乐观）→ 修正因子向 3 收缩（按证据权重）
 // 应用侧（引擎存证 / 先知推演）与学习侧同源 —— 残差→0 则 δ→0（收敛）。
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createPredictionScorer } from '../src/infra/prediction-score'
-import { createOracle } from '../src/engine/oracle'
-import { createTransactionEngine } from '../src/engine/transaction-engine'
-import { createLockManager } from '../src/infra/lock-manager'
-import { createWal } from '../src/infra/wal'
-import { createBackupStore } from '../src/infra/backup-store'
-import { createLogger } from '../src/infra/logger'
-import { createHookRegistry } from '../src/engine/hook-registry'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
+import type { AuditEntry } from '../src/contracts/logging'
+import type { IPathResolver } from '../src/contracts/paths'
 import {
   applyCalibrationShift, applyDurationCorrection,
 } from '../src/contracts/prediction.contract'
 import type { CalibrationShift, PredictionScorecard } from '../src/contracts/prediction.contract'
 import type { IReliabilityModel, ActionReliability } from '../src/contracts/reliability.contract'
 import type { CleanOperation, CleanRequest, ITransactionEngine, TxContext } from '../src/contracts/transaction'
-import type { AuditEntry } from '../src/contracts/logging'
-import type { IPathResolver } from '../src/contracts/paths'
+import { createHookRegistry } from '../src/engine/hook-registry'
+import { createOracle } from '../src/engine/oracle'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createLockManager } from '../src/infra/lock-manager'
+import { createLogger } from '../src/infra/logger'
+import { createPredictionScorer } from '../src/infra/prediction-score'
+import { createWal } from '../src/infra/wal'
 
 let tmp: string
 let home: string
@@ -110,7 +112,7 @@ async function seedTx(
     steps: steps.map((s, i) => ({
       index: i, operationId: s.opId, action: s.action, estimatedBytes: 100,
       predictedP: s.p,
-      predictedDurationMs: s.durPred === undefined ? null : s.durPred,
+      predictedDurationMs: s.durPred ?? null,
     })),
     txSuccessProbability: steps.reduce((acc, s) => acc * s.p, 1),
     ...(drill ? { drill: true } : {}),
@@ -247,6 +249,7 @@ function goodOp(id: string, action: string, est: number): CleanOperation {
       return { summary: id, touchedPaths: [], estimatedBytesReclaimable: est, requiresExclusiveLock: true }
     },
     async validate() { return ok(undefined) },
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 测试桩不读执行上下文，参数仅对齐 CleanOperation.execute 契约签名
     async execute(_ctx: TxContext) {
       return ok({ outcome: { bytesFreed: est, message: 'ok' }, backup: null })
     },

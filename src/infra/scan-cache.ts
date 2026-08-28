@@ -19,6 +19,7 @@
 
 import * as fs from 'fs'
 import * as path from 'path'
+
 import { writeJsonAtomic } from './fs-utils'
 
 export interface ScanCacheEntry {
@@ -75,9 +76,10 @@ export function createScanCache(options: ScanCacheOptions): IScanCache {
     if (fs.existsSync(options.filePath)) {
       const parsed = JSON.parse(fs.readFileSync(options.filePath, 'utf-8')) as unknown
       if (typeof parsed === 'object' && parsed !== null) {
-        const shape = parsed as Partial<PersistedShape>
+        // 逐字段类型守卫窄化：JSON 值可为任意形态（含 null），全部按 unknown 校验
+        const shape = parsed as { version?: unknown; entries?: unknown }
         if (shape.version === 1 && typeof shape.entries === 'object' && shape.entries !== null) {
-          for (const [k, v] of Object.entries(shape.entries)) {
+          for (const [k, v] of Object.entries(shape.entries as Record<string, unknown>)) {
             if (typeof v === 'object' && v !== null &&
                 typeof (v as PersistedEntry).mtimeMs === 'number' &&
                 typeof (v as PersistedEntry).size === 'number' &&

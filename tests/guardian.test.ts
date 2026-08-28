@@ -1,14 +1,16 @@
 // tests/guardian.test.ts — 守卫者巡检单测（stub 采集器 + 容错验证）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import { ok } from '../src/contracts/base'
+import type { Clock, ProfileName, Result } from '../src/contracts/base'
+import type { DoctorReport, IDoctor } from '../src/contracts/doctor.contract'
+import { createDiskForecaster } from '../src/engine/disk-forecaster'
 import { createGuardian } from '../src/engine/guardian'
 import { createTrendTracker } from '../src/engine/trend-tracker'
-import { createDiskForecaster } from '../src/engine/disk-forecaster'
-import { ok } from '../src/contracts/base'
-import type { Clock, NukeError, ProfileName, Result } from '../src/contracts/base'
-import type { DoctorReport, IDoctor } from '../src/contracts/doctor.contract'
 
 let tmp: string
 const clock: Clock = { now: () => new Date('2026-01-15T00:00:00Z') }
@@ -18,7 +20,7 @@ afterAll(() => fs.rmSync(tmp, { recursive: true, force: true }))
 
 function doctorStub(report: Partial<DoctorReport> = {}) {
   return {
-    diagnose: async (): Promise<Result<DoctorReport, NukeError>> =>
+    diagnose: async (): Promise<Result<DoctorReport>> =>
       ok({
         generatedAt: '', profile: 'web' as ProfileName, verdict: 'healthy',
         healthScore: 95, blocking: false, recommendations: [],
@@ -37,7 +39,7 @@ function makeGuardian(opts: {
 }) {
   const trend = createTrendTracker({ historyDir: path.join(tmp, `t-${Math.random().toString(36).slice(2)}`) })
   for (const s of opts.snapshots ?? []) {
-    trend.record({
+    void trend.record({
       at: new Date(s.atMs).toISOString(), trigger: 'scan', profile: 'web' as any,
       bytesReclaimable: s.bytes, bytesFreed: 0, residualCount: 1, healthScore: -1,
     })

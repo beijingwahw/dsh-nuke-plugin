@@ -6,11 +6,11 @@
 //   priority 3 = 其余（info/low）→ 可选
 import type { Clock, CleanStrategy } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
-import type { ResidualEvidence, ISeverityScorer } from '../contracts/scoring'
+import type { DoctorPriority, DoctorRecommendation, DoctorReport, IDoctor } from '../contracts/doctor.contract'
 import type { IHealthInspector } from '../contracts/health.contract'
 import type { IOrphanDetector, IResidualScanner } from '../contracts/scan'
+import type { ResidualEvidence, ISeverityScorer } from '../contracts/scoring'
 import type { IToolRegistry } from '../contracts/tool.contract'
-import type { DoctorPriority, DoctorRecommendation, DoctorReport, IDoctor } from '../contracts/doctor.contract'
 
 export interface DoctorDeps {
   readonly health: IHealthInspector

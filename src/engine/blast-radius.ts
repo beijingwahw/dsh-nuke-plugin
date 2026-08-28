@@ -7,10 +7,11 @@
 //   4. 顾问建议：如何降险（加入同批 / 先摘引用）
 import * as fs from 'fs'
 import * as path from 'path'
+
 import type { AbsolutePath, PluginName } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
-import type { DependencyGraph, IDependencyAnalyzer } from '../contracts/scan'
 import type { BlastRadiusReport, IBlastRadiusAnalyzer, RiskLevel } from '../contracts/blast-radius.contract'
+import type { DependencyGraph, IDependencyAnalyzer } from '../contracts/scan'
 import { dirSize } from '../infra/fs-utils'
 
 export interface BlastRadiusOptions {

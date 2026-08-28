@@ -4,13 +4,15 @@
 // Brier = (p−y)²；技能分 = 1 − Brier/基线，基线 = ȳ(1−ȳ)。
 // 对账纪律：未终结跳过、演习跳过、畸形存证防御性跳过、回滚未执行
 // 的步骤不计分（惩罚只落在已发生的事实上）。
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import type { AuditEntry } from '../src/contracts/logging'
 import { createAuditLog } from '../src/infra/audit-log'
 import { createPredictionScorer } from '../src/infra/prediction-score'
-import type { AuditEntry } from '../src/contracts/logging'
 
 let tmp: string
 beforeAll(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'predscore-')) })

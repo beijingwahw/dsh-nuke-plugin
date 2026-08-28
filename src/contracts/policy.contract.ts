@@ -7,7 +7,7 @@
 //   blackout               时间黑窗（如工作时间禁清理）
 // 策略来源：<dshHome>/.nuke/policy.json（缺失 = 默认全放行）。
 
-import type { NukeError, PluginName, Result } from './base'
+import type { PluginName, Result } from './base'
 import type { HookDefinition } from './hooks'
 
 // ─── V4 增量（仅新增可选字段/类型/常量，缺省不启用，不改变现有行为） ──
@@ -101,7 +101,7 @@ export interface IPolicyGuard {
   load(): CleanPolicy
   /** V5 增量：同 load()，但额外返回被忽略的非法配置项明细（绝不静默接受非法配置） */
   loadValidated(): PolicyLoadReport
-  check(request: PolicyCheckRequest): Result<readonly PolicyViolation[], NukeError>
+  check(request: PolicyCheckRequest): Result<readonly PolicyViolation[]>
   /** 包装为 pre-hook（保护名单逐插件 veto）—— 纵深防御第二层 */
   asPreHook(): HookDefinition
 }

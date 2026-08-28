@@ -1,8 +1,9 @@
 // tests/optimizer.test.ts — 计划合成器单测
 // 数学正确性 / 前沿支配性 / 目标约束选点 / 启发式质量 / 剔除理由
 import { describe, expect, it } from 'vitest'
-import { optimize } from '../src/engine/optimizer'
+
 import type { CandidateAction } from '../src/contracts/optimizer.contract'
+import { optimize } from '../src/engine/optimizer'
 
 const MB = 1024 * 1024
 

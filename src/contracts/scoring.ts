@@ -3,7 +3,7 @@
 //   total = clamp(Σ factor_i × weight_i) ∈ [0,100]
 // 每个因子贡献度随分数一并返回，UI 可展开"为什么是这个分"。
 
-import type { AbsolutePath, PluginName } from './base'
+import type { AbsolutePath, CleanAction, PluginName } from './base'
 
 /** 残留物证据 —— 扫描器的统一产出（替代旧 Residual） */
 export interface ResidualEvidence {
@@ -15,7 +15,7 @@ export interface ResidualEvidence {
   readonly lastAccessedAt: Date | null
   /** 仍引用此路径的插件（来自依赖图）；空数组 = 孤儿 */
   readonly referencedBy: readonly PluginName[]
-  readonly suggestedAction: import('./base').CleanAction
+  readonly suggestedAction: CleanAction
 }
 
 export type ResidualKind =

@@ -1,10 +1,12 @@
 // tests/scan-cache.test.ts — 增量扫描缓存 + 有界并发池单测（突破升级守护）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createScanCache } from '../src/infra/scan-cache'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { dirSize, dirSizeAsync, forEachPool, fsyncDir, walk, withTransientRetry } from '../src/infra/fs-utils'
+import { createScanCache } from '../src/infra/scan-cache'
 
 let tmp: string
 

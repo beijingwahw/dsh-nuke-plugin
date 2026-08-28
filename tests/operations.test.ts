@@ -1,18 +1,19 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createPathResolver } from '../src/infra/path-resolver'
-import { createValidator } from '../src/infra/validator'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
+import type { BackupArea, TxContext  } from '../src/contracts/transaction'
 import { createBackupStore } from '../src/infra/backup-store'
 import { createLogger } from '../src/infra/logger'
+import { createPathResolver } from '../src/infra/path-resolver'
+import { createValidator } from '../src/infra/validator'
 import { configEditOps } from '../src/operations/edit-ops'
-import { dirRemoveOps, makePurgeTempOp } from '../src/operations/fs-ops'
 import { makePnpmPruneOp, makeStandardRemoveOp } from '../src/operations/exec-ops'
+import { dirRemoveOps, makePurgeTempOp } from '../src/operations/fs-ops'
 import { makeOperationFactory, STRATEGY_ACTIONS } from '../src/operations/index'
-import type { BackupArea } from '../src/contracts/transaction'
-import type { TxContext } from '../src/contracts/transaction'
-import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
 
 let home: string
 let dshHome: string

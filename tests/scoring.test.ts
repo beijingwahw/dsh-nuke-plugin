@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
-import { createSeverityScorer, DEFAULT_WEIGHTS, evidence } from '../src/engine/severity-scorer'
+
 import type { PluginName } from '../src/contracts/base'
+import { createSeverityScorer, DEFAULT_WEIGHTS, evidence } from '../src/engine/severity-scorer'
 
 const NOW = new Date('2026-08-16T00:00:00Z')
 

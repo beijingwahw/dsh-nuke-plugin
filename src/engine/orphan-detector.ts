@@ -9,7 +9,8 @@
 import * as fs from 'fs'
 import * as fsp from 'fs/promises'
 import * as path from 'path'
-import type { AbsolutePath, NukeError, Result } from '../contracts/base'
+
+import type { AbsolutePath, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type { IOrphanDetector, OrphanReport } from '../contracts/scan'
 import { DEFAULT_IO_CONCURRENCY, dirSizeAsync, forEachPool, tempOrphanEntries } from '../infra/fs-utils'
@@ -22,6 +23,11 @@ export interface OrphanDetectorOptions {
 
 const TEMP_MARKER_RE = /dsh|deepseek|cordis/i
 const PROTECTED = new Set(['@deepseek-ai/dsh-base', '.pnpm', '.bin', '.modules.yaml', 'node_modules'])
+
+/** JSON 值的安全对象视图：null / 非对象 → null（窄化辅助，不改变运行时取值） */
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null ? v as Record<string, unknown> : null
+}
 
 export function createOrphanDetector(options: OrphanDetectorOptions): IOrphanDetector {
   const now = options.now ?? (() => new Date())
@@ -58,11 +64,13 @@ export function createOrphanDetector(options: OrphanDetectorOptions): IOrphanDet
 
     // package.json 依赖 + bundles
     try {
-      const pkg = JSON.parse(await fsp.readFile(path.join(profileDir, 'package.json'), 'utf-8')) as Record<string, any>
+      const pkg = asRecord(JSON.parse(await fsp.readFile(path.join(profileDir, 'package.json'), 'utf-8')) as unknown)
       for (const k of ['dependencies', 'peerDependencies', 'optionalDependencies']) {
-        for (const name of Object.keys(pkg[k] ?? {})) refs.push(name)
+        const sec = asRecord(pkg?.[k])
+        if (sec !== null) for (const name of Object.keys(sec)) refs.push(name)
       }
-      for (const b of pkg?.dsh?.profile?.bundles ?? []) refs.push(b)
+      const bundles = asRecord(asRecord(pkg?.dsh)?.profile)?.bundles ?? []
+      for (const b of bundles as string[]) refs.push(b)
     } catch { /* 读不到/解析失败 → 该 profile 无声明引用 */ }
     // profile 级 patch 引用
     for (const id of await readPatchIds(path.join(profileDir, 'cordis.patch.yml'))) refs.push(id)
@@ -87,7 +95,7 @@ export function createOrphanDetector(options: OrphanDetectorOptions): IOrphanDet
   }
 
   return {
-    async detect(opts: { tempMaxAgeDays: number; signal?: AbortSignal }): Promise<Result<OrphanReport, NukeError>> {
+    async detect(opts: { tempMaxAgeDays: number; signal?: AbortSignal }): Promise<Result<OrphanReport>> {
       try {
         const signal = opts.signal
 

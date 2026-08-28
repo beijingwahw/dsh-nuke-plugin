@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest'
+
 import { createValidator } from '../src/infra/validator'
 
 const lin = createValidator('linux')

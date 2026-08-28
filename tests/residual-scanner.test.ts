@@ -1,11 +1,13 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createResidualScanner } from '../src/engine/residual-scanner'
-import { createScanCache } from '../src/infra/scan-cache'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { PluginName, ProfileName } from '../src/contracts/base'
 import type { ScanEvent } from '../src/contracts/scan'
+import { createResidualScanner } from '../src/engine/residual-scanner'
+import { createScanCache } from '../src/infra/scan-cache'
 
 let home: string
 let tempRoot: string

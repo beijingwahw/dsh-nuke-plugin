@@ -3,7 +3,7 @@
 // 基于依赖图传递闭包做沙盘推演：零副作用、不碰事务引擎。
 // 产出：损坏清单（broken）/ 级联可删清单（cascade）/ 风险分级 + 顾问建议。
 
-import type { AbsolutePath, NukeError, PluginName, ProfileName, Result } from './base'
+import type { AbsolutePath, PluginName, ProfileName, Result } from './base'
 
 export type RiskLevel = 'low' | 'medium' | 'high' | 'extreme'
 
@@ -33,5 +33,5 @@ export interface IBlastRadiusAnalyzer {
   simulate(
     plugins: readonly PluginName[],
     profile?: ProfileName,
-  ): Promise<Result<BlastRadiusReport, NukeError>>
+  ): Promise<Result<BlastRadiusReport>>
 }

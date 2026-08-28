@@ -2,7 +2,7 @@
 // 现有 health.ts 的升级：检查项从 5 项扩展为分层检查计划，
 // 支持 critical 阻断（critical 失败 → 拒绝进入清理事务）。
 
-import type { NukeError, ProfileName, Result } from './base'
+import type { ProfileName, Result } from './base'
 
 export interface HealthCheckResult {
   readonly check: string
@@ -31,5 +31,5 @@ export interface IHealthInspector {
    *  runtime   — dsh CLI 可用性、pnpm 可用性、锁残留、WAL 未完成事务
    *  residue   — 孤儿 bundle、膨胀的 storages/attachments 概要
    */
-  inspect(profile: ProfileName): Promise<Result<HealthReport, NukeError>>
+  inspect(profile: ProfileName): Promise<Result<HealthReport>>
 }

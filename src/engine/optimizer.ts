@@ -12,11 +12,11 @@
 //
 // 可解释性：每个被剔除动作给出 successUplift × reclaimCost 的性价比账单
 //（"剔除它花了 340MB 换 2.1 个百分点成功率"）—— 推荐不是黑箱。
+import type { Result } from '../contracts/base'
+import { err, ok } from '../contracts/base'
 import type {
   CandidateAction, DropReason, OptimizedPlan, OptimizerGoal, ParetoPoint,
 } from '../contracts/optimizer.contract'
-import type { Result } from '../contracts/base'
-import { err, ok } from '../contracts/base'
 
 /** 精确枚举的动作数上限（2^16 = 65,536 子集，评估 O(16) → 毫秒级） */
 const EXACT_LIMIT = 16

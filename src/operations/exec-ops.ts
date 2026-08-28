@@ -10,13 +10,14 @@
 //   3. 输出结构化 —— stdout/stderr/exitCode/durationMs/attempts 进入 preview（探针）
 //      与 execute（真实命令）的 detail，随 step-done 落 WAL/审计链
 import { spawnSync } from 'child_process'
+
 import type { NukeError, PluginName, ProfileName, Result } from '../contracts/base'
 import { err, ok } from '../contracts/base'
+import type { IToolRegistry, ToolResolution } from '../contracts/tool.contract'
 import type {
   CleanOperation, CommandExecutionDetail, ExecutedStep, OperationPlan, TxContext,
 } from '../contracts/transaction'
 import type { IInputValidator } from '../contracts/validation'
-import type { IToolRegistry, ToolResolution } from '../contracts/tool.contract'
 import { createToolRegistry } from '../infra/tool-registry'
 
 /** 命令运行器返回形态（error/signal 为 V4 增量可选字段，旧注入实现无需改动） */
@@ -43,7 +44,10 @@ export const defaultCommandRunner: CommandRunner = (cmd, args, opts) => {
   })
   return {
     status: r.status,
+    // 防御性归一化：spawn ENOENT 时 stdout/stderr 为 undefined（Node 类型未建模）
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部进程输出
     stdout: r.stdout ?? '',
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部进程输出
     stderr: r.stderr ?? '',
     ...(r.error !== undefined ? { error: r.error } : {}),
     ...(r.signal !== null ? { signal: r.signal } : {}),
@@ -229,7 +233,7 @@ export function makeStandardRemoveOp(
       }
     },
 
-    async validate(): Promise<Result<void, NukeError>> {
+    async validate(): Promise<Result<void>> {
       const name = options.validator.validatePluginName(target)
       if (!name.ok) {
         return err({
@@ -251,7 +255,7 @@ export function makeStandardRemoveOp(
       return requireTool(registry, 'dsh')
     },
 
-    async execute(): Promise<Result<ExecutedStep, NukeError>> {
+    async execute(): Promise<Result<ExecutedStep>> {
       const cap = await runCommandWithRetry(
         run, 'dsh', ['plugin', '--profile', profile, 'remove', target], { timeoutMs }, retry,
       )
@@ -268,7 +272,7 @@ export function makeStandardRemoveOp(
       })
     },
 
-    async undo(): Promise<Result<void, NukeError>> {
+    async undo(): Promise<Result<void>> {
       // 外部进程操作不可本地恢复；补偿动作 = 重新安装提示（不自动执行，防副作用放大）
       return ok(undefined)
     },
@@ -306,12 +310,12 @@ export function makePnpmPruneOp(
       }
     },
 
-    async validate(): Promise<Result<void, NukeError>> {
+    async validate(): Promise<Result<void>> {
       // V5.2：委托工具注册表（三段式：env 覆盖 → PATH → 救援；旗标差异不再误报）
       return requireTool(registry, 'pnpm')
     },
 
-    async execute(ctx): Promise<Result<ExecutedStep, NukeError>> {
+    async execute(ctx): Promise<Result<ExecutedStep>> {
       const cap = await runCommandWithRetry(
         run, 'pnpm', ['store', 'prune'], { cwd: profileDirOf(ctx), timeoutMs }, retry,
       )
@@ -328,6 +332,6 @@ export function makePnpmPruneOp(
       })
     },
 
-    async undo(): Promise<Result<void, NukeError>> { return ok(undefined) },
+    async undo(): Promise<Result<void>> { return ok(undefined) },
   }
 }

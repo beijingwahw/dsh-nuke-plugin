@@ -8,11 +8,12 @@
 //     guard 目录（mkdir 原子 EEXIST，不跟随符号链接）串行化 —— 旧实现的
 //     随机后缀 guard 每个进程创建不同文件名，O_EXCL 永不冲突，形同虚设。
 //  5. 等待重试 = 指数退避 + 等值抖动（防惊群）；acquire 可选自动心跳续期
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import * as crypto from 'crypto'
-import type { LockId, NukeError, Result } from '../contracts/base'
+
+import type { LockId, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type {
   ILockManager, LockHandle, LockOwner, LockRequest, LockScope, ProcessProbe, StaleProof,
@@ -50,12 +51,12 @@ export type LockRenewRequest = LockRequest & LockAutoRenewOptions
  *  任何 LockRequest 都是合法的 LockRenewRequest（扩展字段全可选），
  *  既有按 ILockManager 编写的调用方零改动。 */
 export interface LockManagerRuntime extends ILockManager {
-  acquire(request: LockRenewRequest): Promise<Result<LockHandle, NukeError>>
+  acquire(request: LockRenewRequest): Promise<Result<LockHandle>>
   tryAcquire(request: LockRenewRequest): Promise<LockHandle | null>
   withLock<T>(
     request: LockRenewRequest,
-    fn: (handle: LockHandle) => Promise<Result<T, NukeError>>,
-  ): Promise<Result<T, NukeError>>
+    fn: (handle: LockHandle) => Promise<Result<T>>,
+  ): Promise<Result<T>>
 }
 
 // ─── 等待重试：指数退避 + 等值抖动（equal jitter） ─────────────
@@ -105,10 +106,12 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       if (c.version !== 1) return null
       if (c.mode !== 'shared' && c.mode !== 'exclusive') return null
       if (!Array.isArray(c.owners)) return null
-      for (const o of c.owners) {
+      // Array.isArray 会把 readonly 数组收窄成 any[]，此处显式按 unknown 逐字段校验（磁盘数据不可信）
+      for (const o of c.owners as readonly unknown[]) {
         if (typeof o !== 'object' || o === null) return null
-        if (typeof o.owner?.pid !== 'number' || typeof o.owner?.bootToken !== 'string') return null
-        if (typeof o.expiresAt !== 'number') return null
+        const slot = o as { owner?: { pid?: unknown; bootToken?: unknown }; expiresAt?: unknown }
+        if (typeof slot.owner?.pid !== 'number' || typeof slot.owner.bootToken !== 'string') return null
+        if (typeof slot.expiresAt !== 'number') return null
       }
       return parsed as LockFileContent
     } catch { return null }
@@ -138,8 +141,8 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       // 新 shared 内容覆盖 exclusive 锁文件。
       const acquired = await withGuard(p, now, () => {
         const cur = readLock(p)
-        if (cur && cur.mode === 'exclusive') return false
-        const content: LockFileContent = cur && cur.mode === 'shared'
+        if (cur?.mode === 'exclusive') return false
+        const content: LockFileContent = cur?.mode === 'shared'
           ? { ...cur, owners: [...cur.owners.filter(o => o.expiresAt > now()), me] }
           : { version: 1, scope: scopeKey(request.scope), mode: 'shared', owners: [me] }
         const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
@@ -160,7 +163,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     let released = false
 
     // refresh/release 的核心实现：提取为闭包，供句柄方法与自动续期共用
-    const doRefresh = async (): Promise<Result<void, NukeError>> => {
+    const doRefresh = async (): Promise<Result<void>> => {
       if (released) return err({ code: 'E_LOCK_STATE', message: '锁已释放' })
       // refresh 也是读-改-写，与 acquire/release 共享同一 guard 互斥
       const done = await withGuard(p, now, () => {
@@ -179,11 +182,11 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
         return true
       })
       if (done === null) return err({ code: 'E_LOCK_STATE', message: '刷新锁失败：互斥 guard 在等待窗口内不可用' })
-      if (done === false) return err({ code: 'E_LOCK_STALE', message: '锁文件已消失或本持有者已不在锁中（可能被安全破锁）' })
+      if (!done) return err({ code: 'E_LOCK_STALE', message: '锁文件已消失或本持有者已不在锁中（可能被安全破锁）' })
       return ok(undefined)
     }
 
-    const doRelease = async (): Promise<Result<void, NukeError>> => {
+    const doRelease = async (): Promise<Result<void>> => {
       if (released) return ok(undefined) // 幂等
       released = true
       try {
@@ -250,7 +253,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     }
   }
 
-  async function acquire(request: LockRenewRequest): Promise<Result<LockHandle, NukeError>> {
+  async function acquire(request: LockRenewRequest): Promise<Result<LockHandle>> {
     const deadline = now() + request.waitTimeoutMs
     let attempt = 0
     for (;;) {
@@ -277,7 +280,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     acquire,
     async tryAcquire(request) { return await tryOnce(request) },
 
-    async withLock<T>(request: LockRenewRequest, fn: (handle: LockHandle) => Promise<Result<T, NukeError>>): Promise<Result<T, NukeError>> {
+    async withLock<T>(request: LockRenewRequest, fn: (handle: LockHandle) => Promise<Result<T>>): Promise<Result<T>> {
       const got = await acquire(request)
       if (!got.ok) return got
       try {
@@ -289,7 +292,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       }
     },
 
-    async breakStale(proof: StaleProof): Promise<Result<void, NukeError>> {
+    async breakStale(proof: StaleProof): Promise<Result<void>> {
       if (!proof.verifiedDead) {
         return err({ code: 'E_LOCK_STALE', message: '拒绝破锁：持有者进程仍存活，未满足 verifiedDead' })
       }

@@ -127,7 +127,7 @@ export function applyCalibrationShift(p: number, shift: CalibrationShift | null)
 /** 应用耗时校准：ms × durationFactor。shift 为 null / 因子缺失 /
  *  ms 非正 → 原样返回。 */
 export function applyDurationCorrection(ms: number, shift: CalibrationShift | null): number {
-  if (shift === null || shift.durationFactor === null) return ms
+  if (shift?.durationFactor == null) return ms
   if (!Number.isFinite(ms) || ms <= 0) return ms
   return ms * shift.durationFactor
 }

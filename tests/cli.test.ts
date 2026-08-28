@@ -1,10 +1,11 @@
 // tests/cli.test.ts — 独立 CLI 的 smoke 测试（子进程执行，验证协议而非内部实现）
 // 覆盖：--version / --help 环境无关性、--json 机器可读输出、V4 锁互斥与安全破锁
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import { spawnSync } from 'child_process'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 const REPO_ROOT = path.resolve(__dirname, '..')
 const CLI = path.join(REPO_ROOT, 'cli', 'dsh-nuke.cjs')
@@ -26,7 +27,7 @@ function runCli(args: string[], home = dshHome) {
     encoding: 'utf-8',
     env: { ...process.env, DSH_HOME: home },
   })
-  return { status: r.status, stdout: r.stdout ?? '', stderr: r.stderr ?? '' }
+  return { status: r.status, stdout: r.stdout, stderr: r.stderr }
 }
 
 /** 构造 V4 协议锁文件（与插件版 lock-manager 同格式） */

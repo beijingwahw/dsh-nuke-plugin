@@ -1,8 +1,10 @@
 // tests/bin-resolver.test.ts — 命令解析器（PATH 救援）单元测试
 // 场景原型：dsh 经 nvm 安装，用户 shell 的 rc 文件注入 PATH，宿主进程不加载 rc
 // → 宿主 PATH 缺失 → spawnSync ENOENT → 旧健康检查误报 critical 阻断清理
-import { describe, expect, it } from 'vitest'
 import * as path from 'path'
+
+import { describe, expect, it } from 'vitest'
+
 import {
   globalBinCandidates, resolveCommand, resolveInDirs, resolveOnPath,
 } from '../src/infra/bin-resolver'

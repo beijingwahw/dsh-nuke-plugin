@@ -2,27 +2,29 @@
 // 覆盖：exec-ops 瞬态重试/超时上限/结构化输出；fs-ops top-N 影响面明细与 skip 语义；
 //       edit-ops 幂等 skip；yaml-edit 字节级保持；index.ts 动作元数据与 makeOperationPlan；
 //       policy.contract 增量（freezeWindows fail-closed 默认）。
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createPathResolver } from '../src/infra/path-resolver'
-import { createValidator } from '../src/infra/validator'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
+import { hitFreezeWindow, NO_FREEZE_WINDOWS } from '../src/contracts/policy.contract'
+import type { BackupArea, TxContext, DryRunReport } from '../src/contracts/transaction'
 import { createBackupStore } from '../src/infra/backup-store'
 import { createLogger } from '../src/infra/logger'
-import type { BackupArea, TxContext, DryRunReport } from '../src/contracts/transaction'
-import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
+import { createPathResolver } from '../src/infra/path-resolver'
+import { createValidator } from '../src/infra/validator'
+import { configEditOps } from '../src/operations/edit-ops'
 import {
   MAX_COMMAND_TIMEOUT_MS, makePnpmPruneOp, makeStandardRemoveOp,
   type CommandResult, type CommandRunner,
 } from '../src/operations/exec-ops'
 import { DEFAULT_IMPACT_TOP_N, dirRemoveOps, makeDirRemoveOp } from '../src/operations/fs-ops'
-import { configEditOps } from '../src/operations/edit-ops'
-import { removePluginFromYaml } from '../src/operations/yaml-edit'
 import {
   ACTION_METADATA, makeOperationFactory, makeOperationPlan, STRATEGY_ACTIONS,
 } from '../src/operations/index'
-import { hitFreezeWindow, NO_FREEZE_WINDOWS } from '../src/contracts/policy.contract'
+import { removePluginFromYaml } from '../src/operations/yaml-edit'
 
 const PROFILE = 'default' as ProfileName
 const VICTIM = 'victim-plugin' as PluginName

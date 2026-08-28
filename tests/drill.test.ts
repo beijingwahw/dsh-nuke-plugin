@@ -1,8 +1,10 @@
 // tests/drill.test.ts — 混沌演习（崩溃注入 → recover 还原 → 证书签发）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { createDrill, isDrillMatrixReport } from '../src/engine/drill'
 
 let tmp: string

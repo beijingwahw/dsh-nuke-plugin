@@ -10,8 +10,8 @@ import type {
   AbsolutePath, CleanAction, CleanStrategy, Clock, LockId,
   NukeError, PluginName, ProfileName, Result, TxId,
 } from './base'
-import type { IPathResolver } from './paths'
 import type { ILogger } from './logging'
+import type { IPathResolver } from './paths'
 
 // ─── 事务状态机（迁移受 ITransactionEngine 强制校验） ──────────
 export type TxState =
@@ -77,14 +77,14 @@ export interface BackupArea {
   /** 配置编辑：先落原内容快照，再写新内容（写前 fsync） */
   stageEdit(original: AbsolutePath, nextContent: string): Promise<BackupRecord>
   /** 恢复：幂等（重复调用安全），恢复前校验备份指纹 */
-  restore(record: BackupRecord): Promise<Result<void, NukeError>>
+  restore(record: BackupRecord): Promise<Result<void>>
   /** 全部 stage 清单（含崩溃时已 stage 但未 execute 完成的）——恢复的一等依据 */
   manifest(): readonly BackupRecord[]
   /** 备份区中未被 manifest 覆盖的产物数（崩溃窗口残留）。>0 时禁止 purge：
    *  这些产物可能是数据唯一完整副本（stageDir 已把原位移走），销毁即永久丢失。 */
   orphanArtifacts(): number
   /** 事务 committed 后按保留策略（默认 7 天）清理回收区 */
-  purge(txId: TxId): Promise<Result<void, NukeError>>
+  purge(txId: TxId): Promise<Result<void>>
 }
 
 // ─── 原子操作（命令模式） ───────────────────────────────────
@@ -158,11 +158,11 @@ export interface CleanOperation {
   /** 零副作用预演：dry-run 与 commit 共享此投影 */
   preview(ctx: TxContext): Promise<OperationPlan>
   /** 前置校验：目标存在性、权限、依赖方、路径策略。失败则事务不进入 executing */
-  validate(ctx: TxContext): Promise<Result<void, NukeError>>
+  validate(ctx: TxContext): Promise<Result<void>>
   /** 执行：必须先通过 BackupArea 留下 undo 依据，再产生副作用；返回备份记录供 WAL 落盘 */
-  execute(ctx: TxContext): Promise<Result<ExecutedStep, NukeError>>
+  execute(ctx: TxContext): Promise<Result<ExecutedStep>>
   /** 反向补偿：幂等；仅依赖 BackupRecord，不依赖内存状态（崩溃恢复可用） */
-  undo(ctx: TxContext, record: BackupRecord | null): Promise<Result<void, NukeError>>
+  undo(ctx: TxContext, record: BackupRecord | null): Promise<Result<void>>
 }
 
 export interface OperationOutcome {
@@ -231,17 +231,17 @@ export interface TxSummary {
 
 export interface ITransactionEngine {
   /** 受理请求：获取锁（独占）→ 创建 WAL → 返回会话。锁由引擎全程持有 */
-  begin(request: CleanRequest): Promise<Result<TxSession, NukeError>>
+  begin(request: CleanRequest): Promise<Result<TxSession>>
   /** 编译策略为有序操作集；同时做依赖检测与确认令牌校验 */
-  plan(session: TxSession): Promise<Result<TxPlan, NukeError>>
+  plan(session: TxSession): Promise<Result<TxPlan>>
   /** 全量预演：逐操作 preview，零副作用。输出与 commit 同构的报告 */
-  dryRun(plan: TxPlan): Promise<Result<DryRunReport, NukeError>>
+  dryRun(plan: TxPlan): Promise<Result<DryRunReport>>
   /** 校验 → 逐执行 → 全成败即 commit；任一败即自动 rollback（Saga 反向补偿） */
-  commit(plan: TxPlan): Promise<Result<TxSummary, NukeError>>
+  commit(plan: TxPlan): Promise<Result<TxSummary>>
   /** 手动回滚已提交前的事务（幂等） */
-  rollback(txId: TxId): Promise<Result<TxSummary, NukeError>>
+  rollback(txId: TxId): Promise<Result<TxSummary>>
   /** 启动时扫描 .nuke-tx/ 下未终结的 WAL：有 step-done 无 tx-commit → 反向补偿 */
-  recover(): Promise<Result<readonly TxSummary[], NukeError>>
+  recover(): Promise<Result<readonly TxSummary[]>>
   status(txId: TxId): Promise<TxSummary | null>
 }
 

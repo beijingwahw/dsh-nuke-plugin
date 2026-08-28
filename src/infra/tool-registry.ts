@@ -10,9 +10,11 @@
 // 消费方（健康检查/standard-remove/pnpm-prune/doctor）一律委托本注册表，
 // 不再各自探测 —— 语义漂移在结构上不可能发生。
 import { spawnSync } from 'child_process'
+
 import type {
   IToolRegistry, ToolDescriptor, ToolMethod, ToolResolution, ToolStatus,
 } from '../contracts/tool.contract'
+
 import { resolveCommand } from './bin-resolver'
 
 /** 探测返回形态（与 health-inspector 的 CommandProbe 同构） */
@@ -79,7 +81,9 @@ function defaultProbe(cmdOrPath: string): ToolProbeResult {
   const r = spawnSync(cmdOrPath, ['--version'], { encoding: 'utf-8', timeout: 5000 })
   return {
     status: r.status,
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- spawn 失败（如 ENOENT）时 stdout 实际为 undefined（SpawnSyncReturns 类型未建模），?? '' 是必需的运行时防御
     stdout: r.stdout ?? '',
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 同上：stderr 在 spawn 失败时为 undefined
     stderr: r.stderr ?? '',
     ...(typeof (r.error as unknown as { code?: unknown } | null | undefined)?.code === 'string'
       ? { errorCode: (r.error as unknown as { code: string }).code }

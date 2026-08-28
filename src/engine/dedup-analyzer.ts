@@ -10,9 +10,10 @@
 // 并行哈希：有界并发池（默认 8 路），SSD 上接近线性加速。
 // 安全属性：跳过符号链接（防哈希到逃逸目标）；流式读取（大文件不占内存）；
 // AbortSignal 在目录遍历、采样、全量哈希三个层面响应取消。
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
+
 import type { AbsolutePath, ProfileName } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type { DedupGroup, DedupReport, IDedupAnalyzer } from '../contracts/dedup.contract'
@@ -44,7 +45,7 @@ export function createDedupAnalyzer(options: DedupAnalyzerOptions): IDedupAnalyz
 
   function profileOf(p: string): ProfileName | null {
     const m = PROFILE_RE.exec(p)
-    return (m?.[1] as ProfileName) ?? null
+    return m === null ? null : (m[1] as ProfileName)
   }
 
   /** 收集参与分析的文件：跳过符号链接、过滤小文件 */
@@ -67,7 +68,7 @@ export function createDedupAnalyzer(options: DedupAnalyzerOptions): IDedupAnalyz
         if (e.isSymbolicLink()) continue          // 防符号链接逃逸/重复计数
         if (e.isDirectory()) { if (!walk(full)) return false }
         else if (e.isFile()) {
-          let size = 0
+          let size: number
           try { size = fs.statSync(full).size } catch { continue }
           if (size < minSize) continue             // 小文件：哈希成本 > 回收价值
           filesScanned++
@@ -92,7 +93,7 @@ export function createDedupAnalyzer(options: DedupAnalyzerOptions): IDedupAnalyz
       const stream = fs.createReadStream(p)
       stream.on('data', chunk => h.update(chunk))
       stream.on('error', reject)
-      stream.on('end', () => resolve(h.digest('hex')))
+      stream.on('end', () => { resolve(h.digest('hex')); })
     })
   }
 

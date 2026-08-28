@@ -10,18 +10,19 @@
 //   2. 构建表驱动化 —— 每插件/全局动作构建器收敛为两张表，新增动作只加一行
 //   3. makeOperationPlan —— 策略+插件列表 → 动作清单+风险等级+预估影响，
 //      供上层 dry-run 增强（DryRunReport.actions 的直接供给方）
-import type { CleanAction, CleanStrategy, NukeError, PluginName, ProfileName, Result } from '../contracts/base'
+import type { CleanAction, CleanStrategy, PluginName, ProfileName, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
+import type { ILogger } from '../contracts/logging'
+import type { IPathResolver } from '../contracts/paths'
+import type { IToolRegistry } from '../contracts/tool.contract'
 import type {
   CleanOperation, CleanRequest, DryRunActionDetail, OperationPlan, OperationRiskLevel, TxContext,
 } from '../contracts/transaction'
 import type { IInputValidator } from '../contracts/validation'
-import type { IToolRegistry } from '../contracts/tool.contract'
-import type { IPathResolver } from '../contracts/paths'
-import type { ILogger } from '../contracts/logging'
+
 import { configEditOps } from './edit-ops'
-import { dirRemoveOps, makePurgeTempOp } from './fs-ops'
 import { makePnpmPruneOp, makeStandardRemoveOp, type CommandRunner } from './exec-ops'
+import { dirRemoveOps, makePurgeTempOp } from './fs-ops'
 
 export const STRATEGY_ACTIONS: Readonly<Record<CleanStrategy, readonly CleanAction[]>> = {
   safe: [
@@ -108,6 +109,9 @@ export const ACTION_METADATA: Readonly<Record<CleanAction, ActionMeta>> = {
 /** 元数据注入：工厂产出的每个操作附带 riskLevel/description（浅拷贝合并，不改行为） */
 function withActionMeta(op: CleanOperation): CleanOperation {
   const meta = ACTION_METADATA[op.action]
+  // Record<CleanAction, …> 全键覆盖 —— 类型上恒有值；防御分支保留以应对
+  // 运行时 action 超集（外部输入路径）
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：action 运行时可能超出编译期联合
   return meta ? { ...op, riskLevel: meta.riskLevel, description: meta.description } : op
 }
 
@@ -242,7 +246,7 @@ const RISK_ORDER: Readonly<Record<OperationRiskLevel, number>> = { low: 0, mediu
 export async function makeOperationPlan(
   request: CleanRequest,
   options: OperationPlanOptions,
-): Promise<Result<OperationActionPlan, NukeError>> {
+): Promise<Result<OperationActionPlan>> {
   try {
     const ops = buildOperations(request, options)
     const details: PlannedActionDetail[] = []
@@ -265,8 +269,9 @@ export async function makeOperationPlan(
       if (shadowCtx) plan = await op.preview(shadowCtx)
       details.push({
         action: op.action,
-        riskLevel: op.riskLevel ?? meta?.riskLevel ?? 'medium',
-        description: op.description ?? meta?.description ?? op.action,
+        // 双 ?? 是防御性回退链：原始操作未注入元数据时退到注册表默认值
+        riskLevel: op.riskLevel ?? meta.riskLevel,
+        description: op.description ?? meta.description,
         estimatedBytes: plan?.estimatedBytesReclaimable ?? 0,
         operationId: op.id,
         target: op.target,

@@ -1,18 +1,20 @@
 // tests/reliability.test.ts — 贝叶斯可靠性模型（经验贝叶斯收缩 / 校准分布 / 数据飞轮）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createReliabilityModel } from '../src/infra/reliability'
-import { createTransactionEngine } from '../src/engine/transaction-engine'
-import { createLockManager } from '../src/infra/lock-manager'
-import { createWal } from '../src/infra/wal'
-import { createBackupStore } from '../src/infra/backup-store'
-import { createLogger } from '../src/infra/logger'
-import { createHookRegistry } from '../src/engine/hook-registry'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
 import type { CleanOperation, CleanRequest, TxContext } from '../src/contracts/transaction'
+import { createHookRegistry } from '../src/engine/hook-registry'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createLockManager } from '../src/infra/lock-manager'
+import { createLogger } from '../src/infra/logger'
+import { createReliabilityModel } from '../src/infra/reliability'
+import { createWal } from '../src/infra/wal'
 
 let tmp: string
 beforeAll(() => { tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'reliability-')) })

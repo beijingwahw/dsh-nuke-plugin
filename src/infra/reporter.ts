@@ -3,7 +3,8 @@
 // 数据全部从传入 payload 推导，旧字段与旧段落格式不动（追加式扩展）。
 import * as fs from 'fs'
 import * as path from 'path'
-import type { CleanAction, NukeError, Result } from '../contracts/base'
+
+import type { CleanAction, Result } from '../contracts/base'
 import { err, fmtBytes, ioError, ok } from '../contracts/base'
 import type {
   ActionReclaimStat, IReporter, ReportFormat, ReportPayload, ReportSummary,
@@ -91,9 +92,10 @@ export function createReporter(options: ReporterOptions): IReporter {
       L.push(`- **事务 ID**: ${dr.txId}`)
       L.push(`- **预计回收**: ${fmtBytes(dr.estimatedBytesReclaimable)}`, '')
       for (const p of dr.plans) {
-        L.push(`### ${p.operation ?? p.summary}`)
+        L.push(`### ${p.summary}`)
         // plans 元素契约：{ operation: OperationPlan; summary: string }
         L.push(`- ${p.summary}`)
+        // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 容错防御：历史/畸形 payload 缺 operation 字段时跳过明细渲染，而非让整个导出失败
         if (p.operation) {
           L.push(`- 触及路径: ${p.operation.touchedPaths.join(', ') || '无'}`)
           L.push(`- 预计回收: ${fmtBytes(p.operation.estimatedBytesReclaimable)}`)
@@ -147,7 +149,7 @@ export function createReporter(options: ReporterOptions): IReporter {
   }
 
   const reporter: IReporter = {
-    async export(format: ReportFormat, payload: ReportPayload): Promise<Result<{ path: string; bytes: number }, NukeError>> {
+    async export(format: ReportFormat, payload: ReportPayload): Promise<Result<{ path: string; bytes: number }>> {
       try {
         fs.mkdirSync(options.reportsRoot, { recursive: true })
         const name = baseName(payload)

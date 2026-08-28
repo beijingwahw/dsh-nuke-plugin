@@ -492,7 +492,9 @@ src/
 ├── infra/       # 基建：WAL / 读写锁 / 备份区 / hash-chain 审计 / 台账 / 校验器 / 贝叶斯可靠性
 ├── engine/      # 引擎：事务 / 扫描 / 评分 / 依赖图 / 去重 / 趋势 / 守卫 / 还原点 / 先知 / 混沌演习
 ├── operations/  # 命令模式：每个动作自带 validate/preview/execute/undo
-└── index.ts     # 组装运行时（依赖注入）+ 注册 23 个工具
+├── runtime.ts   # 运行时组装：全量依赖注入的唯一场所
+├── tools/       # 工具注册层：感知 / 决策 / 执行 / 恢复保障四域 23 工具
+└── index.ts     # 插件入口（纯组装，零业务逻辑）
 ```
 
 数据落盘位置：`<dshHome>/.nuke/`（wal/ backups/ audit/ ledger/ history/ policy.json restore-points/）
@@ -504,7 +506,8 @@ git clone https://github.com/beijingwahw/dsh-nuke-plugin
 cd dsh-nuke-plugin
 npm install
 npm run typecheck    # tsc --noEmit（零错误）
-npm test             # vitest（547 用例 / 41 文件）
+npm run lint         # eslint 严格基线（strictTypeChecked，零告警门禁）
+npm test             # vitest（647 用例 / 44 文件）
 npm run build        # tsdown 构建
 npm run dev          # 开发期热更新进程（见下）
 ```

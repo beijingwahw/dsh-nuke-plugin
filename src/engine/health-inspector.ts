@@ -11,15 +11,17 @@ import { spawnSync } from 'child_process'
 import * as fs from 'fs'
 import * as fsp from 'fs/promises'
 import * as path from 'path'
+
 import { parse as parseYaml } from 'yaml'
-import type { NukeError, ProfileName, Result } from '../contracts/base'
+
+import type { ProfileName, Result } from '../contracts/base'
 import { err, errorToMessage, ioError, ok } from '../contracts/base'
 import type {
   HealthCheckResult, HealthReport, IHealthInspector,
 } from '../contracts/health.contract'
+import type { IToolRegistry } from '../contracts/tool.contract'
 import { DEFAULT_IO_CONCURRENCY, forEachPool } from '../infra/fs-utils'
 import { createToolRegistry } from '../infra/tool-registry'
-import type { IToolRegistry } from '../contracts/tool.contract'
 
 /** 命令探测的统一返回形态 */
 interface CommandProbe {
@@ -67,6 +69,11 @@ const SEVERITY_WEIGHT: Record<HealthCheckResult['severity'], number> = {
 /** inode 余量告警阈值：可用 inode 占比低于 10% 视为压力（运维惯例阈值） */
 const INODE_FREE_WARN_RATIO = 0.1
 
+/** JSON 值的安全对象视图：null / 非对象 → null（窄化辅助，不改变运行时取值） */
+function asRecord(v: unknown): Record<string, unknown> | null {
+  return typeof v === 'object' && v !== null ? v as Record<string, unknown> : null
+}
+
 export function createHealthInspector(options: HealthInspectorOptions): IHealthInspector {
   const now = options.now ?? (() => new Date())
   // spawnSync 失败时 stdout/stderr 可能为 null —— 归一化为 string（与 exec-ops 同纪律）
@@ -74,7 +81,9 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
     const r = spawnSync(cmd, args, { cwd: opts.cwd, encoding: 'utf-8', timeout: opts.timeoutMs })
     return {
       status: r.status,
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部输入（spawnSync 失败路径 stdout 运行时可能为 null，类型标注未覆盖）
       stdout: r.stdout ?? '',
+      // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部输入（spawnSync 失败路径 stderr 运行时可能为 null，类型标注未覆盖）
       stderr: r.stderr ?? '',
       // V5.1：spawn 层错误码透传（ENOENT 判定的依据）
       ...(typeof (r.error as unknown as { code?: unknown } | null | undefined)?.code === 'string'
@@ -99,11 +108,12 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
     try { pkgText = await fsp.readFile(pkgPath, 'utf-8') } catch { /* 不存在 */ }
     if (pkgText !== null) {
       try {
-        const pkg = JSON.parse(pkgText)
+        const pkg = asRecord(JSON.parse(pkgText) as unknown)
         out.push(R('package.json 语法', true, 'JSON 格式正确', 'info', 'config'))
         // 2. bundles ↔ dependencies 对齐
-        const bundles: string[] = pkg?.dsh?.profile?.bundles ?? []
-        const deps = new Set(Object.keys(pkg?.dependencies ?? {}))
+        const bundlesRaw = asRecord(asRecord(pkg?.dsh)?.profile)?.bundles
+        const bundles: string[] = Array.isArray(bundlesRaw) ? bundlesRaw as string[] : []
+        const deps = new Set(Object.keys(asRecord(pkg?.dependencies) ?? {}))
         const orphans = bundles.filter(b => !deps.has(b) && b !== '@deepseek-ai/dsh-base')
         if (orphans.length === 0) {
           out.push(R('bundles 一致性', true, '所有 bundle 均有对应依赖', 'info', 'config'))
@@ -137,7 +147,7 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
       ['cordis.patch.yml (profile)', path.join(profileDir, 'cordis.patch.yml')],
       ['cordis.patch.yml (home)', path.join(options.dshHome, 'cordis.patch.yml')],
     ] as const) {
-      let text: string | null = null
+      let text: string
       try { text = await fsp.readFile(pf, 'utf-8') } catch { continue }
       try {
         parseYaml(text)
@@ -173,8 +183,8 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
 
     // node_modules 完整性：声明的依赖都有目录
     try {
-      const pkg = JSON.parse(await fsp.readFile(pkgPath, 'utf-8'))
-      const deps = Object.keys(pkg?.dependencies ?? {})
+      const pkg = asRecord(JSON.parse(await fsp.readFile(pkgPath, 'utf-8')) as unknown)
+      const deps = Object.keys(asRecord(pkg?.dependencies) ?? {})
       const nm = path.join(profileDir, 'node_modules')
       const missing: string[] = []
       for (const d of deps) {
@@ -197,9 +207,9 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
    *  → skipped 而非 failed："探测不到"是能力缺失而非健康问题。 */
   function checkInodePressure(): HealthCheckResultV5 {
     let st: ReturnType<typeof fs.statfsSync> | null = null
-    try { st = fs.statfsSync(options.dshHome) } catch { st = null }
-    const total = st === null ? NaN : Number(st.files)
-    const free = st === null ? NaN : Number(st.ffree)
+    try { st = fs.statfsSync(options.dshHome) } catch { /* 探测不到 → st 保持 null，按 skipped 降级 */ }
+    const total = st === null ? NaN : st.files
+    const free = st === null ? NaN : st.ffree
     if (!Number.isFinite(total) || total <= 0 || !Number.isFinite(free) || free < 0) {
       return {
         check: '磁盘 inode 压力', passed: true,
@@ -307,11 +317,11 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
   }
 
   const inspector: IHealthInspector = {
-    async inspect(profile: ProfileName): Promise<Result<HealthReport, NukeError>> {
+    async inspect(profile: ProfileName): Promise<Result<HealthReport>> {
       try {
         // V5：检查组并行执行（有界并发池）。四组互不依赖，各自的 fs/命令
         // 探测可重叠等待；拼接严格按固定组序 → 输出与旧串行实现逐条一致。
-        const groups: Array<() => Promise<HealthCheckResultV5[]>> = [
+        const groups: (() => Promise<HealthCheckResultV5[]>)[] = [
           () => checkConfig(profile),
           () => checkDependency(profile),
           () => checkRuntime(),

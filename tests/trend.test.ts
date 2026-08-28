@@ -1,8 +1,10 @@
 // tests/trend.test.ts — 历史趋势追踪器单测
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { createTrendTracker } from '../src/engine/trend-tracker'
 
 let tmp: string

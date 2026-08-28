@@ -3,7 +3,7 @@
 // 孤儿检测 + 五因子评分，输出带优先级排序的可执行处方。
 // 设计约束：纯编排层，不直接碰磁盘/事务 —— 所有感知能力来自注入的四个组件。
 
-import type { CleanStrategy, NukeError, ProfileName, Result } from './base'
+import type { CleanStrategy, ProfileName, Result } from './base'
 import type { ResidualEvidence, SeverityScore } from './scoring'
 import type { ToolResolution } from './tool.contract'
 
@@ -45,5 +45,5 @@ export interface IDoctor {
   diagnose(
     profile: ProfileName,
     options?: { readonly signal?: AbortSignal },
-  ): Promise<Result<DoctorReport, NukeError>>
+  ): Promise<Result<DoctorReport>>
 }

@@ -11,25 +11,24 @@
 //
 // 影子上下文纪律：TxContext.backups 是"炸弹桩"——任何操作若胆敢在
 // preview 阶段触碰备份区（副作用逃逸），立即爆炸失败，防患于未然。
-import type { CleanOperation, CleanRequest, TxContext } from '../contracts/transaction'
-import type { CleanStrategy, PluginName, ProfileName, TxId } from '../contracts/base'
-import { err, fmtDuration, ioError, ok } from '../contracts/base'
-import type { IReliabilityModel } from '../contracts/reliability.contract'
-import type { CalibrationShift, PredictionScorecard } from '../contracts/prediction.contract'
-import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
-import type { ExplorationStepInput, ThompsonExploration } from '../contracts/exploration.contract'
-import { thompsonExplore } from '../contracts/exploration.contract'
-import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
-} from '../contracts/oracle.contract'
-import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
-import type { FailureMode, FailureModeStat } from '../contracts/failure.contract'
-import type { OptimizedPlan, OptimizerGoal } from '../contracts/optimizer.contract'
-import type { ILogger } from '../contracts/logging'
-import type { Clock } from '../contracts/base'
-import type { IPathResolver } from '../contracts/paths'
+import type { CleanStrategy, Clock, PluginName, ProfileName, Result, TxId } from '../contracts/base'
+import { err, fmtDuration, ioError, ok, fmtBytes  } from '../contracts/base'
 import type { IBlastRadiusAnalyzer } from '../contracts/blast-radius.contract'
 import type { IDiskForecaster } from '../contracts/disk-forecast.contract'
-import { fmtBytes } from '../contracts/base'
+import type { ExplorationStepInput, ThompsonExploration } from '../contracts/exploration.contract'
+import { thompsonExplore } from '../contracts/exploration.contract'
+import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
+import type { FailureMode, FailureModeStat } from '../contracts/failure.contract'
+import type { ILogger } from '../contracts/logging'
+import type { OptimizedPlan, OptimizerGoal } from '../contracts/optimizer.contract'
+import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
+} from '../contracts/oracle.contract'
+import type { IPathResolver } from '../contracts/paths'
+import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
+import type { CalibrationShift, PredictionScorecard } from '../contracts/prediction.contract'
+import type { IReliabilityModel } from '../contracts/reliability.contract'
+import type { CleanOperation, CleanRequest, TxContext } from '../contracts/transaction'
+
 import { optimize } from './optimizer'
 
 // ─── 引擎层扩展类型（contracts 只读；新输出字段在此定义并导出） ──
@@ -124,7 +123,7 @@ export interface IOracleDetail extends IOracle {
     readonly plugins: readonly PluginName[]
     readonly profile: ProfileName
     readonly strategy: CleanStrategy
-  }): Promise<import('../contracts/base').Result<OracleReportDetail, import('../contracts/base').NukeError>>
+  }): Promise<Result<OracleReportDetail>>
 }
 
 export interface OracleDeps {
@@ -217,7 +216,7 @@ function monteCarlo(
     }
   }
   const rand = lcg(seed)
-  const samples: number[] = new Array(trials)
+  const samples: number[] = new Array<number>(trials)
   let successes = 0
   for (let t = 0; t < trials; t++) {
     let reclaim = 0

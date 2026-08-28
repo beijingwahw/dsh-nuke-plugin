@@ -4,6 +4,7 @@
 import { execFile } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
+
 import type { NukeError, Result, Unsubscribe } from '../contracts/base'
 import { err, errorToMessage, ioError, ok } from '../contracts/base'
 import type {
@@ -73,10 +74,10 @@ export function createHookRegistry(options: HookRegistryOptions): HookRegistryIn
       }, (error, stdout, stderr) => {
         if (error) {
           // error.message 含退出码/被信号杀死/spawn 失败的根因，与 stderr 一并保留
-          const detail = String(stderr || stdout || '').trim().slice(0, 200)
+          const detail = (stderr || stdout || '').trim().slice(0, 200)
           resolve({ ok: false, message: `钩子命令失败(${bin}): ${error.message}${detail ? ` | ${detail}` : ''}` })
         } else {
-          resolve({ ok: true, message: String(stdout).trim().slice(0, 200) })
+          resolve({ ok: true, message: stdout.trim().slice(0, 200) })
         }
       })
     })
@@ -97,7 +98,7 @@ export function createHookRegistry(options: HookRegistryOptions): HookRegistryIn
     }
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`钩子 ${def.id} 执行超时(${timeoutMs}ms)`)), timeoutMs)
+      timer = setTimeout(() => { reject(new Error(`钩子 ${def.id} 执行超时(${timeoutMs}ms)`)); }, timeoutMs)
     })
     return Promise.race([Promise.resolve(handler.run(ctx)), timeout]).finally(() => {
       if (timer !== undefined) clearTimeout(timer)
@@ -123,7 +124,7 @@ export function createHookRegistry(options: HookRegistryOptions): HookRegistryIn
   return {
     register,
 
-    async emit(timing: HookTiming, ctx: HookContext): Promise<Result<HookEmitResult, NukeError>> {
+    async emit(timing: HookTiming, ctx: HookContext): Promise<Result<HookEmitResult>> {
       // V5 稳定排序：priority 为主键（小者先），注册序号为次键（同优先级保持注册序）
       const matching = defs
         .filter(d => d.timing === timing)
@@ -208,7 +209,7 @@ export function createHookRegistry(options: HookRegistryOptions): HookRegistryIn
       return ok({ executed, failed, verdict, errorDirective, messages })
     },
 
-    async loadFromDisk(): Promise<Result<void, NukeError>> {
+    async loadFromDisk(): Promise<Result<void>> {
       // 幂等重载：先注销上一轮磁盘钩子，再按当前磁盘状态重建
       for (const off of diskUnsubscribers) off()
       diskUnsubscribers = []

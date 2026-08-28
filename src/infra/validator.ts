@@ -1,9 +1,9 @@
 // src/infra/validator.ts — IInputValidator 实现：全量防注入校验
 import type { AbsolutePath, PluginName, ProfileName } from '../contracts/base'
+import { err, errorToMessage, ok } from '../contracts/base'
 import type {
   IInputValidator, ValidationRequest, Violation, ViolationKind,
 } from '../contracts/validation'
-import { err, errorToMessage, ok } from '../contracts/base'
 
 // npm 包名规范：[scope/]name，字符集 [a-z0-9-._~]，总长 ≤ 214
 const PLUGIN_NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/
@@ -11,7 +11,6 @@ const PLUGIN_NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$
 // 仍保留 profile 自身约束：无 @scope 前缀、总长 1~64、保留目录名拒绝）
 const PROFILE_NAME_RE = /^[a-z0-9-][a-z0-9-._~]{0,63}$/
 const RESERVED_PROFILES = new Set(['profiles', 'storages', 'attachments', 'sessions', 'node_modules', 'global'])
-const NUL_RE = /\0/
 // 注入字符：命令替换/管道/分号/反引号 —— argv 数组模式本身无 shell，
 // 此为纵深防御（万一某处实现失误把 argv 拼回 shell 字符串）。圆括号/尖括号无害，放行。
 const SHELL_META_RE = /[;|&$`\n\r]/
@@ -42,7 +41,7 @@ export function createValidator(
       const violations: Violation[] = []
       if (!input || input.length === 0) return err([v('empty', '插件名为空', 'pluginName')])
       if (input.length > 214) violations.push(v('too-long', `长度 ${input.length} 超过 npm 上限 214`, 'pluginName'))
-      if (NUL_RE.test(input)) violations.push(v('nul-byte', '包含 NUL 字节', 'pluginName'))
+      if (input.includes('\0')) violations.push(v('nul-byte', '包含 NUL 字节', 'pluginName'))
       if (!PLUGIN_NAME_RE.test(input)) {
         violations.push(v('charset',
           `仅允许小写字母/数字/-/./_/~ 与可选 @scope/ 前缀，收到: "${input}"`, 'pluginName'))
@@ -54,7 +53,7 @@ export function createValidator(
     validateProfileName(input: string) {
       const violations: Violation[] = []
       if (!input || input.length === 0) return err([v('empty', 'profile 名为空', 'profileName')])
-      if (NUL_RE.test(input)) violations.push(v('nul-byte', '包含 NUL 字节', 'profileName'))
+      if (input.includes('\0')) violations.push(v('nul-byte', '包含 NUL 字节', 'profileName'))
       if (!PROFILE_NAME_RE.test(input)) {
         violations.push(v('charset', '仅允许 [a-z0-9-._~]（与插件名同等白名单字符集），首字符须为字母/数字/连字符，长度 1~64', 'profileName'))
       }
@@ -69,7 +68,7 @@ export function createValidator(
       const violations: Violation[] = []
       const field = 'path'
       if (!input || input.length === 0) return err([v('empty', '路径为空', field)])
-      if (NUL_RE.test(input)) violations.push(v('nul-byte', '包含 NUL 字节', field))
+      if (input.includes('\0')) violations.push(v('nul-byte', '包含 NUL 字节', field))
       if (input.length > 4096) violations.push(v('too-long', '路径超过 4096 字符', field))
 
       const segments = splitSegments(input)
@@ -131,7 +130,7 @@ export function createValidator(
         violations.push(v('syntax', `可执行文件 "${base}" 不在白名单 [${allowBin.join(', ')}]`, 'command'))
       }
       for (const [i, arg] of argv.entries()) {
-        if (NUL_RE.test(arg)) { violations.push(v('nul-byte', `argv[${i}] 含 NUL`, 'command')); break }
+        if (arg.includes('\0')) { violations.push(v('nul-byte', `argv[${i}] 含 NUL`, 'command')); break }
         if (SHELL_META_RE.test(arg)) {
           violations.push(v('shell-metachar', `argv[${i}]="${arg}" 含 shell 元字符（命令必须是 argv 数组，禁止 shell 字符串）`, 'command'))
           break
@@ -171,7 +170,9 @@ export function createValidator(
     sanitizeForDisplay(input: string): string {
       // 剥离 ANSI 转义序列与其余 C0 控制字符，防终端转义注入
       return input
+        // eslint-disable-next-line no-control-regex -- 剥离 CSI 转义序列正是该正则的目的（防终端转义注入）
         .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+        // eslint-disable-next-line no-control-regex -- OSC 序列以 BEL/ST 定界，控制字符是匹配语义的组成部分
         .replace(/\x1b][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
         // eslint-disable-next-line no-control-regex
         .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')

@@ -5,22 +5,24 @@
 //   - 存证口径 = 重试感知成功率（与引擎实际执行语义对齐）
 //   - 统计增强纪律：predictor 抛错绝不阻断真实清理
 //   - 演习注入（crashAfterStep）时存证带 drill 标记（对账时跳过）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createTransactionEngine } from '../src/engine/transaction-engine'
-import { createLockManager } from '../src/infra/lock-manager'
-import { createWal } from '../src/infra/wal'
-import { createBackupStore } from '../src/infra/backup-store'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createLogger } from '../src/infra/logger'
-import { createHookRegistry } from '../src/engine/hook-registry'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
 import type { IReliabilityModel } from '../src/contracts/reliability.contract'
 import type {
   CleanOperation, CleanRequest, ITransactionEngine, TxContext,
 } from '../src/contracts/transaction'
+import { createHookRegistry } from '../src/engine/hook-registry'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createLockManager } from '../src/infra/lock-manager'
+import { createLogger } from '../src/infra/logger'
+import { createWal } from '../src/infra/wal'
 
 let tmp: string
 let home: string
@@ -58,6 +60,7 @@ function goodOp(id: string, action: string, est: number): CleanOperation {
       return { summary: id, touchedPaths: [], estimatedBytesReclaimable: est, requiresExclusiveLock: true }
     },
     async validate() { return ok(undefined) },
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 测试桩不读执行上下文，参数仅对齐 CleanOperation.execute 契约签名
     async execute(_ctx: TxContext) {
       return ok({ outcome: { bytesFreed: est, message: 'ok' }, backup: null })
     },

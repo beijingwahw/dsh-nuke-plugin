@@ -1,12 +1,14 @@
 // tests/disk-forecast.test.ts — 磁盘写满预测器单测（注入趋势 + 磁盘采样）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createDiskForecaster } from '../src/engine/disk-forecaster'
-import { createTrendTracker } from '../src/engine/trend-tracker'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
 import type { ITrendTracker } from '../src/contracts/trend.contract'
+import { createDiskForecaster } from '../src/engine/disk-forecaster'
+import { createTrendTracker } from '../src/engine/trend-tracker'
 
 let tmp: string
 
@@ -24,7 +26,7 @@ function makeForecaster(
 ) {
   const trend = createTrendTracker({ historyDir: path.join(tmp, `h-${seq++}`) })
   for (const s of snapshots) {
-    trend.record({
+    void trend.record({
       at: new Date(s.atMs).toISOString(), trigger: 'scan', profile: 'web' as any,
       bytesReclaimable: s.bytes, bytesFreed: 0, residualCount: 1, healthScore: -1,
     })
@@ -133,7 +135,7 @@ function makeForecasterTuned(
     ...(halfLifeDays !== undefined ? { halfLifeDays } : {}),
   })
   for (const s of snapshots) {
-    trend.record({
+    void trend.record({
       at: new Date(s.atMs).toISOString(), trigger: 'scan', profile: 'web' as any,
       bytesReclaimable: s.bytes, bytesFreed: 0, residualCount: 1, healthScore: -1,
     })

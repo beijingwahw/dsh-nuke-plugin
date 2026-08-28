@@ -8,15 +8,17 @@
 // 范围校验（负数上限、越界/非整数小时、畸形窗口），非法项一律忽略（视为未
 // 配置）并通过 loadValidated() 给出明确定位 —— 绝不静默接受非法配置。
 import * as fs from 'fs'
-import type { NukeError, Result } from '../contracts/base'
+
+import type { Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
-import { statfsBytes } from './fs-utils'
 import type { HookDefinition } from '../contracts/hooks'
 import type {
   CleanPolicy, FreezeWindow, IPolicyGuard, PolicyCheckRequest,
   PolicyLoadIssue, PolicyLoadReport, PolicyViolation,
 } from '../contracts/policy.contract'
 import { hitFreezeWindow } from '../contracts/policy.contract'
+
+import { statfsBytes } from './fs-utils'
 
 export interface PolicyGuardOptions {
   /** 策略文件路径（通常 <dshHome>/.nuke/policy.json） */
@@ -79,6 +81,7 @@ function parsePolicy(raw: unknown): ParsedPolicy {
     if (isCount(v)) return v
     issues.push({
       field,
+      // eslint-disable-next-line @typescript-eslint/no-base-to-string -- 诊断信息容忍 [object Object]：值来自 JSON 解析，仅用于人工定位非法配置项
       problem: `非法数值 ${String(v)}（必须是非负整数），该项已被忽略（视为未配置）；请修正 policy.json`,
     })
     return null
@@ -100,6 +103,7 @@ function parsePolicy(raw: unknown): ParsedPolicy {
 
   // 冻结窗列表：逐项校验，畸形项剔除并定位到 freezeWindows[i]
   let freezeWindows: readonly FreezeWindow[] | undefined
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- JSON 配置的 freezeWindows 可为 null（契约类型未建模），null 按未配置处理（与 blackout 同语义）
   if (obj.freezeWindows !== undefined && obj.freezeWindows !== null) {
     const list = obj.freezeWindows as readonly unknown[]
     if (Array.isArray(list)) {
@@ -163,7 +167,7 @@ export function createPolicyGuard(options: PolicyGuardOptions): IPolicyGuard {
     return loadReport().policy
   }
 
-  function check(request: PolicyCheckRequest): Result<readonly PolicyViolation[], NukeError> {
+  function check(request: PolicyCheckRequest): Result<readonly PolicyViolation[]> {
     try {
       const policy = load()
       const violations: PolicyViolation[] = []

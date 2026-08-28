@@ -1,16 +1,18 @@
 // tests/tool-registry.test.ts — 工具注册表（外部工具解析单一事实源）单测
 // 场景原型：dsh 经 nvm 安装，宿主进程 PATH 缺口 → 三处独立探测语义漂移。
 // 注册表解析链：① 显式 env（DSH_BIN/PNPM_BIN）→ ② 裸名 PATH → ③ bin 救援。
-import { describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createToolRegistry, TOOL_DESCRIPTORS, type ToolProbeResult } from '../src/infra/tool-registry'
-import { createHealthInspector } from '../src/engine/health-inspector'
-import { createDoctor } from '../src/engine/doctor'
-import { createSeverityScorer } from '../src/engine/severity-scorer'
+
+import { describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
 import type { ToolResolution } from '../src/contracts/tool.contract'
+import { createDoctor } from '../src/engine/doctor'
+import { createHealthInspector } from '../src/engine/health-inspector'
+import { createSeverityScorer } from '../src/engine/severity-scorer'
+import { createToolRegistry, TOOL_DESCRIPTORS, type ToolProbeResult } from '../src/infra/tool-registry'
 
 /** 探测桩：按命令名/路径路由，记录调用序（缓存断言用） */
 function makeProbe(routes: Record<string, ToolProbeResult | Error>) {
@@ -256,6 +258,7 @@ describe('接线注入：消费方委托共享注册表', () => {
         }
       },
       resolveAll: async () => [],
+      // eslint-disable-next-line @typescript-eslint/no-empty-function -- 测试桩：注册表失效回调与本测试无关
       invalidate: () => {},
     }
     const inspector = createHealthInspector({
@@ -284,10 +287,11 @@ describe('接线注入：消费方委托共享注册表', () => {
         affects: ['pnpm-store-prune'], fixHint: 'npm i -g pnpm', envVar: 'PNPM_BIN', probedAt: 1,
       },
     ]
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- 测试桩：注册表失效回调与本测试无关
     const reg = { resolve: async () => matrix[0], resolveAll: async () => matrix, invalidate: () => {} }
     const doctor = createDoctor({
       health: { inspect: async () => ok({ profile: 'web' as never, checkedAt: '', results: [], blocking: false, score: 95 }) } as any,
-      scanner: { scan: async function* () { yield { type: 'done', totalFound: 0, bytesReclaimable: 0 } } } as any,
+      scanner: { async *scan () { yield { type: 'done', totalFound: 0, bytesReclaimable: 0 } } } as any,
       orphans: { detect: async () => ok({ orphanPluginDirs: [], orphanDataDirs: [], tempOrphans: [], totalReclaimableBytes: 0 }) } as any,
       scorer: createSeverityScorer(),
       clock: { now: () => new Date('2026-01-01T00:00:00Z') },
@@ -302,7 +306,7 @@ describe('接线注入：消费方委托共享注册表', () => {
   it('doctor 未注入 toolRegistry → 报告不含 tools 字段（旧装配兼容）', async () => {
     const doctor = createDoctor({
       health: { inspect: async () => ok({ profile: 'web' as never, checkedAt: '', results: [], blocking: false, score: 95 }) } as any,
-      scanner: { scan: async function* () { yield { type: 'done', totalFound: 0, bytesReclaimable: 0 } } } as any,
+      scanner: { async *scan () { yield { type: 'done', totalFound: 0, bytesReclaimable: 0 } } } as any,
       orphans: { detect: async () => ok({ orphanPluginDirs: [], orphanDataDirs: [], tempOrphans: [], totalReclaimableBytes: 0 }) } as any,
       scorer: createSeverityScorer(),
       clock: { now: () => new Date('2026-01-01T00:00:00Z') },

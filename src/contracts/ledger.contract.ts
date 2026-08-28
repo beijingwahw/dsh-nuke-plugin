@@ -3,7 +3,7 @@
 // 去重潜力/孤儿发现 → 记为"应收"（pending，未真正回收）。
 // 支持按 动作 / profile / 日 三维聚合，回答"清理到底省了多少、省在哪"。
 
-import type { Brand, CleanAction, NukeError, ProfileName, Result, TxId } from './base'
+import type { Brand, CleanAction, ProfileName, Result, TxId } from './base'
 
 export type LedgerKind = 'freed' | 'pending'
 
@@ -55,8 +55,8 @@ export interface LedgerSummary {
 }
 
 export interface ILedger {
-  record(entry: LedgerEntry): Promise<Result<void, NukeError>>
-  query(filter?: LedgerQuery): Promise<Result<LedgerSummary, NukeError>>
+  record(entry: LedgerEntry): Promise<Result<void>>
+  query(filter?: LedgerQuery): Promise<Result<LedgerSummary>>
   /** 原始条目（at 降序，分页） */
   entries(filter?: LedgerQuery, limit?: number): readonly LedgerEntry[]
 }

@@ -18,5 +18,5 @@
     "declaration": true,
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "tests/**/*.ts"]
+  "include": ["src/**/*.ts", "tests/**/*.ts", "dev/**/*.ts"]
 }

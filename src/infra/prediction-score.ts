@@ -17,9 +17,9 @@
 //   - 演习事务（predict 存证带 drill 标记）→ 跳过：人为注入的崩溃不是
 //     先知的预测失误，计入只会污染战绩
 //   - 畸形存证条目（外部写入/旧版本形态）→ 防御性跳过，绝不让对账崩溃
+import type { TxId } from '../contracts/base'
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX, PREDICT_AUDIT_ACTION } from '../contracts/logging'
-import type { TxId } from '../contracts/base'
 import type {
   CalibrationShift, IPredictionScorer, PredictionRecord, PredictionScorecard,
   StepPrediction,

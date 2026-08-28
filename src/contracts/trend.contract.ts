@@ -3,7 +3,7 @@
 // 线性回归拟合"可回收空间"随时间的变化率，预测 30 天走势，
 // 并检测异常突增（可能是某插件失控写盘的早期信号）。
 
-import type { NukeError, ProfileName, Result } from './base'
+import type { ProfileName, Result } from './base'
 
 export type TrendTrigger = 'scan' | 'clean' | 'doctor'
 
@@ -39,7 +39,7 @@ export interface TrendReport {
 
 export interface ITrendTracker {
   /** 追加快照（append-only，尾部半行容错与 WAL 一致） */
-  record(snapshot: TrendSnapshot): Promise<Result<void, NukeError>>
+  record(snapshot: TrendSnapshot): Promise<Result<void>>
   /** 聚合分析；profile 省略 = 全部 */
-  analyze(profile?: ProfileName): Promise<Result<TrendReport, NukeError>>
+  analyze(profile?: ProfileName): Promise<Result<TrendReport>>
 }

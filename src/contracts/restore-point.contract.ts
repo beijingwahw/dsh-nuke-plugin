@@ -5,7 +5,7 @@
 // 还原点独立留存 —— 即使事务记录被清理，配置仍可一键恢复到任意时点。
 // 非侵入式：作为适配层前置动作调用，不侵入事务引擎内核。
 
-import type { AbsolutePath, NukeError, ProfileName, Result } from './base'
+import type { AbsolutePath, ProfileName, Result } from './base'
 
 export interface RestorePointFile {
   /** 原始位置（恢复目标） */
@@ -32,14 +32,14 @@ export interface IRestorePointManager {
     readonly actor: string
     readonly reason: string
     readonly profile: ProfileName
-  }): Promise<Result<RestorePointMeta, NukeError>>
+  }): Promise<Result<RestorePointMeta>>
 
   /** 全部还原点，createdAt 降序（最新在前） */
   list(): readonly RestorePointMeta[]
 
   /** 把快照内容原子写回原位置（逐文件 tmp+rename） */
-  restore(id: string): Promise<Result<RestorePointMeta, NukeError>>
+  restore(id: string): Promise<Result<RestorePointMeta>>
 
   /** 只保留最近 keep 个，返回删除数 */
-  prune(keep: number): Promise<Result<number, NukeError>>
+  prune(keep: number): Promise<Result<number>>
 }

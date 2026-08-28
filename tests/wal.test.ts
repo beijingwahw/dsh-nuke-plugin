@@ -1,10 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createWal } from '../src/infra/wal'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { TxId } from '../src/contracts/base'
 import type { WalRecord } from '../src/contracts/transaction'
+import { createWal } from '../src/infra/wal'
 
 let tmp: string
 

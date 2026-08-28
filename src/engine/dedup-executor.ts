@@ -13,11 +13,12 @@
 //      时替换不释放任何空间）。
 //   6. undo 可逆 —— 内容已验证与 canonical 一致，undo = 从 canonical 复制回独立文件
 //      （无需物理备份区，复制即恢复独立 inode）。
-import * as fs from 'fs'
 import * as crypto from 'crypto'
+import * as fs from 'fs'
+
 import { err, ioError, ok } from '../contracts/base'
-import type { IDedupExecutor, LinkJournalEntry } from '../contracts/dedup.contract'
 import type { NukeError } from '../contracts/base'
+import type { IDedupExecutor, LinkJournalEntry } from '../contracts/dedup.contract'
 import { copyAtomic } from '../infra/fs-utils'
 
 export function createDedupExecutor(): IDedupExecutor {
@@ -27,7 +28,7 @@ export function createDedupExecutor(): IDedupExecutor {
       const stream = fs.createReadStream(p)
       stream.on('data', chunk => h.update(chunk))
       stream.on('error', reject)
-      stream.on('end', () => resolve(h.digest('hex')))
+      stream.on('end', () => { resolve(h.digest('hex')); })
     })
   }
 

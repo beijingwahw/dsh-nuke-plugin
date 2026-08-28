@@ -3,6 +3,7 @@
 // 一个模式被判瞬态，引擎就敢重试；被判永久，立即回滚。此处穷举
 // 真实世界错误形态，锁死两侧语义永不漂移。
 import { describe, expect, it } from 'vitest'
+
 import {
   classifyFailureMode, DEFAULT_RETRY_EFFICACY, MODE_PRESCRIPTIONS, MODE_TRANSIENCE,
   retryAdjustedProbability,

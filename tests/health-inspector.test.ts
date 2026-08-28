@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createHealthInspector } from '../src/engine/health-inspector'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { ProfileName } from '../src/contracts/base'
+import { createHealthInspector } from '../src/engine/health-inspector'
 
 let home: string
 
@@ -116,6 +118,7 @@ describe('HealthInspector', () => {
     // 模拟 nvm 场景：用户 shell 有 dsh（rc 注入 PATH），宿主进程 PATH 没有它
     const probeCalls: string[] = []
     const r = await make({
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 测试桩只按 cmd 分支，args/opts 参数仅对齐 runCommand 契约签名
       runCommand: ((cmd: string, _args: readonly string[], _opts: object) => {
         probeCalls.push(cmd)
         // 'dsh' 裸名 ENOENT；救援绝对路径可执行

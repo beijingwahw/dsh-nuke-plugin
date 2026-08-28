@@ -3,10 +3,10 @@
 // 聚合为分级告警清单，每条告警附带"下一步该调哪个 nuke_* 工具"的行动建议。
 // 这是 dsh-nuke 从"被动清理工具"进化为"自治运维代理"的关键组件。
 
-import type { NukeError, ProfileName, Result } from './base'
+import type { ProfileName, Result } from './base'
 import type { DiskForecast } from './disk-forecast.contract'
-import type { TrendReport } from './trend.contract'
 import type { DoctorReport } from './doctor.contract'
+import type { TrendReport } from './trend.contract'
 
 export type AlertKind =
   | 'DISK_CRITICAL'      // 磁盘即将写满
@@ -54,7 +54,7 @@ export interface IGuardian {
   patrol(options?: {
     readonly profile?: ProfileName
     readonly thresholds?: Partial<GuardianThresholds>
-  }): Promise<Result<GuardianReport, NukeError>>
+  }): Promise<Result<GuardianReport>>
 }
 
 export const DEFAULT_GUARDIAN_THRESHOLDS: GuardianThresholds = {

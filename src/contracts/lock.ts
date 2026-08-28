@@ -5,7 +5,7 @@
 //     并携带一次性 breakToken 防止误删他人刚重建的锁
 //  3. 仅独占 → shared 模式引用计数，扫描/预演可并发，写操作才独占
 
-import type { LockId, Result, NukeError } from './base'
+import type { LockId, Result } from './base'
 
 export type LockMode = 'shared' | 'exclusive'
 
@@ -38,9 +38,9 @@ export interface LockHandle {
   readonly request: LockRequest
   readonly acquiredAt: string
   /** 续期：长事务定期调用，防止 TTL 到期被他人安全破锁 */
-  refresh(): Promise<Result<void, NukeError>>
+  refresh(): Promise<Result<void>>
   /** 释放：幂等；shared 模式递减引用计数 */
-  release(): Promise<Result<void, NukeError>>
+  release(): Promise<Result<void>>
 }
 
 /** 持有者存活探测 —— 破锁流程的依赖注入点，单测时可 mock */
@@ -57,16 +57,16 @@ export interface StaleProof {
 
 export interface ILockManager {
   /** 阻塞获取（waitTimeoutMs 内自旋/退避重试） */
-  acquire(request: LockRequest): Promise<Result<LockHandle, NukeError>>
+  acquire(request: LockRequest): Promise<Result<LockHandle>>
   /** 非阻塞：拿不到立即返回 null，不产生错误 */
   tryAcquire(request: LockRequest): Promise<LockHandle | null>
   /** RAII 式：fn 抛错/返回 err 都保证释放锁，推荐入口 */
   withLock<T>(
     request: LockRequest,
-    fn: (handle: LockHandle) => Promise<Result<T, NukeError>>,
-  ): Promise<Result<T, NukeError>>
+    fn: (handle: LockHandle) => Promise<Result<T>>,
+  ): Promise<Result<T>>
   /** 安全破锁：verifiedDead && ttlExpired 才允许，且需 breakToken 匹配 */
-  breakStale(proof: StaleProof): Promise<Result<void, NukeError>>
+  breakStale(proof: StaleProof): Promise<Result<void>>
   /** 当前某作用域下的全部持有者（调试/健康检查展示用） */
   holders(scope: LockScope): readonly LockOwner[]
 }

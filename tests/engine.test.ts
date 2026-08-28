@@ -1,18 +1,19 @@
 // tests/engine.test.ts — 事务引擎核心单测（Saga 回滚 / 崩溃恢复 / dry-run / veto）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createTransactionEngine } from '../src/engine/transaction-engine'
-import { createLockManager } from '../src/infra/lock-manager'
-import { createWal } from '../src/infra/wal'
-import { createBackupStore } from '../src/infra/backup-store'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createLogger } from '../src/infra/logger'
-import { createHookRegistry } from '../src/engine/hook-registry'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
-import type { CleanOperation, CleanRequest, TxContext } from '../src/contracts/transaction'
-import type { ITransactionEngine } from '../src/contracts/transaction'
+import type { CleanOperation, CleanRequest, TxContext, ITransactionEngine  } from '../src/contracts/transaction'
+import { createHookRegistry } from '../src/engine/hook-registry'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createLockManager } from '../src/infra/lock-manager'
+import { createLogger } from '../src/infra/logger'
+import { createWal } from '../src/infra/wal'
 
 let tmp: string
 let home: string

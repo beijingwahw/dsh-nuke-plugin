@@ -4,13 +4,14 @@
 //   1. 原子写：所有落盘走 tmp + rename，进程中断不留半写文件
 //   2. 零配置点拒绝：一个文件都找不到 → E_VALIDATION（profile 疑似不存在）
 //   3. 恢复同样原子：逐文件 tmp + rename 写回原位
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
-import type { AbsolutePath, NukeError, Result } from '../contracts/base'
+
+import type { AbsolutePath, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
-import { copyAtomic, writeJsonAtomic } from '../infra/fs-utils'
 import type { IRestorePointManager, RestorePointFile, RestorePointMeta } from '../contracts/restore-point.contract'
+import { copyAtomic, writeJsonAtomic } from '../infra/fs-utils'
 
 export interface RestorePointOptions {
   readonly dshHome: string
@@ -59,7 +60,9 @@ export function createRestorePointManager(options: RestorePointOptions): IRestor
       if (typeof m.createdAt !== 'string' || typeof m.actor !== 'string') return null
       if (!Array.isArray(m.files)) return null
       for (const f of m.files) {
-        if (typeof f?.source !== 'string' || typeof f?.snapshot !== 'string') return null
+        // Array.isArray 对 readonly 数组窄化后元素退化为 any —— 经视图类型恢复安全访问
+        const file = f as { source?: unknown; snapshot?: unknown } | null | undefined
+        if (typeof file?.source !== 'string' || typeof file.snapshot !== 'string') return null
       }
       return m
     } catch { return null }
@@ -167,7 +170,7 @@ export function createRestorePointManager(options: RestorePointOptions): IRestor
         const metaFile = path.join(dir, 'meta.json')
         const expectedText = JSON.stringify(meta, null, 2)
         writeJsonAtomic(metaFile, meta)
-        const abortPoint = (cause: string): Result<never, NukeError> => {
+        const abortPoint = (cause: string): Result<never> => {
           try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* 清理尽力而为 */ }
           return err(ioError(cause, new Error('读回内容与写入内容指纹不一致')))
         }

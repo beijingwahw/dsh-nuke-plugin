@@ -1,9 +1,9 @@
 // src/infra/fs-utils.ts — 全项目唯一的文件系统小工具集
 // 质量纪律：任何 fs 操作模式（递归体积/原子写/JSONL 容错读）只允许在此实现一次。
 // 所有 engine/infra 组件从这里导入 —— 修一处 = 修全局。
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
 
 /** 递归目录体积（符号链接不跟随；读不到的条目按 0 计）。
  *  入口 lstat 防护 + 深度上限：传入符号链接返回 0（防 symlink→/ 的全盘递归 DoS），
@@ -64,10 +64,9 @@ export function existsSafe(p: string): boolean {
 export function statfsBytes(root: string): { free: number; total: number } | null {
   try {
     const st = fs.statfsSync(root)
-    if (!st) return null
     return {
-      free: Number(st.bsize) * Number(st.bavail),
-      total: Number(st.bsize) * Number(st.blocks),
+      free: st.bsize * st.bavail,
+      total: st.bsize * st.blocks,
     }
   } catch { return null }
 }
@@ -116,6 +115,7 @@ export function writeJsonAtomic(file: string, value: unknown): void {
  * 容错式 JSONL 读取：逐行解析，损坏行（含崩溃残留的尾部半行）跳过。
  * 返回 null 表示文件不存在/不可读。
  */
+// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- JSON 解析边界：调用方以 readJsonl<T> 声明对磁盘数据的预期形状，T 单次出现在返回位是该模式的固有形态
 export function readJsonl<T>(file: string): T[] | null {
   let text: string
   try { text = fs.readFileSync(file, 'utf-8') } catch { return null }
@@ -129,7 +129,7 @@ export function readJsonl<T>(file: string): T[] | null {
 }
 
 /** 追加一行 JSON（自动建目录） */
-export function appendJsonl<T>(file: string, entry: T): void {
+export function appendJsonl(file: string, entry: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true })
   fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf-8')
 }
@@ -363,7 +363,7 @@ export function tempOrphanEntries(
   tempRoot: string,
   maxAgeDays: number,
   now: () => Date,
-  markerRe: RegExp = /dsh|deepseek|cordis/i,
+  markerRe = /dsh|deepseek|cordis/i,
 ): TempOrphanEntry[] {
   const out: TempOrphanEntry[] = []
   let entries: fs.Dirent[]

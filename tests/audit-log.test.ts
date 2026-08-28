@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createAuditLog } from '../src/infra/audit-log'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { AuditEntry } from '../src/contracts/logging'
+import { createAuditLog } from '../src/infra/audit-log'
 
 let tmp: string
 let chainPath: string

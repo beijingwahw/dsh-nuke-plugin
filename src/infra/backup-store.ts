@@ -16,14 +16,16 @@
 //   → 层内经 fs-utils forEachPool 有界并发。
 //   全部恢复完成后对恢复产物（原位路径）做 size/hash 指纹复验，任一不符
 //   → 返回错误保持未终结语义（restore 幂等，可修复后重试）。
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
-import type { AbsolutePath, NukeError, Result, TxId } from '../contracts/base'
+
+import type { AbsolutePath, Result, TxId } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type {
   BackupArea, BackupRecord, FileFingerprint, IBackupStore,
 } from '../contracts/transaction'
+
 import { DEFAULT_IO_CONCURRENCY, dirSize, forEachPool, readJsonl } from './fs-utils'
 
 // 与 wal.ts 同源的白名单：字母数字与-_，长度 ≤ 64；路径分隔符/点/空白一律非法
@@ -45,7 +47,7 @@ export interface RestoreAllOptions {
 export interface BackupAreaRuntime extends BackupArea {
   /** 批量并行恢复：默认按 manifest 全部记录（也可传入子集，按传入顺序
    *  视为 stage 序）做依赖分层 + 有界并发恢复，完成后指纹复验。 */
-  restoreAll(records?: readonly BackupRecord[], opts?: RestoreAllOptions): Promise<Result<void, NukeError>>
+  restoreAll(records?: readonly BackupRecord[], opts?: RestoreAllOptions): Promise<Result<void>>
 }
 
 /** createBackupStore 的运行时能力集：IBackupStore 契约的超集（向后兼容） */
@@ -155,7 +157,7 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
   }
 
   /** 单条恢复核心路径：restore 方法与 restoreAll 并行池共用同一实现 */
-  const doRestore = async (record: BackupRecord): Promise<Result<void, NukeError>> => {
+  const doRestore = async (record: BackupRecord): Promise<Result<void>> => {
     // 恢复前校验备份产物未被篡改（hash 与备份时不一致 → 拒绝恢复并报错）
     try {
       if (!fs.existsSync(record.backupPath)) {
@@ -307,13 +309,13 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
           return record
         },
 
-        async restore(record: BackupRecord): Promise<Result<void, NukeError>> {
+        async restore(record: BackupRecord): Promise<Result<void>> {
           return await doRestore(record)
         },
 
-        async restoreAll(records?: readonly BackupRecord[], opts: RestoreAllOptions = {}): Promise<Result<void, NukeError>> {
+        async restoreAll(records?: readonly BackupRecord[], opts: RestoreAllOptions = {}): Promise<Result<void>> {
           try {
-            const list = records !== undefined ? records : readManifest()
+            const list = records ?? readManifest()
             if (list.length === 0) return ok(undefined)
             const concurrency = Math.max(1, opts.concurrency ?? DEFAULT_IO_CONCURRENCY)
 
@@ -395,7 +397,7 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
           return entries.filter(name => !known.has(name)).length
         },
 
-        async purge(txId: TxId): Promise<Result<void, NukeError>> {
+        async purge(txId: TxId): Promise<Result<void>> {
           try {
             fs.rmSync(txArea(txId), { recursive: true, force: true })
             return ok(undefined)

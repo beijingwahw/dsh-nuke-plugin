@@ -3,21 +3,23 @@
 //   瞬态（EBUSY/超时…）→ 有界指数退避后重试，重试成功 = 事务成功
 //   永久（校验拒绝/权限…）→ 一次失败立即回滚（重试纯浪费）
 // 审计 detail 记录 retries 与 failureMode —— 可靠性模型的学习数据源。
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createTransactionEngine } from '../src/engine/transaction-engine'
-import { createLockManager } from '../src/infra/lock-manager'
-import { createWal } from '../src/infra/wal'
-import { createBackupStore } from '../src/infra/backup-store'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createLogger } from '../src/infra/logger'
-import { createHookRegistry } from '../src/engine/hook-registry'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
 import type {
   CleanOperation, CleanRequest, ITransactionEngine, TxContext,
 } from '../src/contracts/transaction'
+import { createHookRegistry } from '../src/engine/hook-registry'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createLockManager } from '../src/infra/lock-manager'
+import { createLogger } from '../src/infra/logger'
+import { createWal } from '../src/infra/wal'
 
 let tmp: string
 let home: string
@@ -197,6 +199,7 @@ describe('V5.3 步骤级模式感知重试', () => {
       target: 'victim-plugin' as never,
       async preview() { return { summary: '第二步', touchedPaths: [], estimatedBytesReclaimable: 10, requiresExclusiveLock: true } },
       async validate() { return ok(undefined) },
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 测试桩不读执行上下文，参数仅对齐 CleanOperation.execute 契约签名
       async execute(_ctx: TxContext) {
         executed.push('B')
         return ok({ outcome: { bytesFreed: 10, message: 'ok' }, backup: null })

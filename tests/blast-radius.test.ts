@@ -1,12 +1,14 @@
 // tests/blast-radius.test.ts — 爆炸半径分析器单测（stub 依赖图 + 真实磁盘 fixture）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createBlastRadiusAnalyzer } from '../src/engine/blast-radius'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
-import type { NukeError, Result } from '../src/contracts/base'
+import type { Result } from '../src/contracts/base'
 import type { DependencyGraph, IDependencyAnalyzer } from '../src/contracts/scan'
+import { createBlastRadiusAnalyzer } from '../src/engine/blast-radius'
 
 let tmp: string
 
@@ -42,7 +44,7 @@ function stubAnalyzer(edges: readonly [string, string][]): IDependencyAnalyzer {
     cycles: () => [],
   }))
   return {
-    buildGraph: async (): Promise<Result<DependencyGraph, NukeError>> => ok(graph()),
+    buildGraph: async (): Promise<Result<DependencyGraph>> => ok(graph()),
     blockersOf: async () => ok([]),
   }
 }

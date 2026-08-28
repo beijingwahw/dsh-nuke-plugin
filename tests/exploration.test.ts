@@ -8,21 +8,23 @@
 //   - 采样统计断言用大样本 + 固定种子（逐位可复现，不引入测试抖动）
 //   - Beta 采样均值/方差对理论值的收敛（±5% 容差）
 //   - 探索规划器为纯函数：同输入同种子 → 逐位相同
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { betaSd, sampleBeta, thompsonExplore } from '../src/contracts/exploration.contract'
-import type { ExplorationStepInput } from '../src/contracts/exploration.contract'
-import { createOracle } from '../src/engine/oracle'
-import { createReliabilityModel } from '../src/infra/reliability'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createLogger } from '../src/infra/logger'
-import type { IReliabilityModel } from '../src/contracts/reliability.contract'
-import type { CleanOperation, CleanRequest } from '../src/contracts/transaction'
-import type { IPathResolver } from '../src/contracts/paths'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { Result } from '../src/contracts/base'
 import { ok } from '../src/contracts/base'
+import { betaSd, sampleBeta, thompsonExplore } from '../src/contracts/exploration.contract'
+import type { ExplorationStepInput } from '../src/contracts/exploration.contract'
+import type { IPathResolver } from '../src/contracts/paths'
+import type { IReliabilityModel } from '../src/contracts/reliability.contract'
+import type { CleanOperation, CleanRequest } from '../src/contracts/transaction'
+import { createOracle } from '../src/engine/oracle'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createLogger } from '../src/infra/logger'
+import { createReliabilityModel } from '../src/infra/reliability'
 
 const logger = createLogger({ sink: 'plain', minLevel: 'error' })
 

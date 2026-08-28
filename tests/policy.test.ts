@@ -1,8 +1,10 @@
 // tests/policy.test.ts — 策略守卫单测
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { createPolicyGuard } from '../src/infra/policy-guard'
 
 let tmp: string
@@ -103,10 +105,13 @@ describe('pre-hook 纵深防御', () => {
     expect(hook.timing).toBe('pre')
     expect(hook.priority).toBeLessThan(0)   // 闸门最先执行
 
-    const blocked = await (hook.handler as any).run({ plugin: '@corp/critical' })
+    // 窄化 inline handler 的 run 签名：测试只喂部分 HookContext（plugin）
+    type InlineRun = (ctx: { plugin: string }) => Promise<{ kind: string; reason: string } | undefined>
+    const run = (hook.handler as unknown as { run: InlineRun }).run
+    const blocked = await run({ plugin: '@corp/critical' })
     expect(blocked).toEqual({ kind: 'veto', reason: expect.stringContaining('保护名单') })
 
-    const allowed = await (hook.handler as any).run({ plugin: 'normal' })
+    const allowed = await run({ plugin: 'normal' })
     expect(allowed).toBeUndefined()
   })
 })

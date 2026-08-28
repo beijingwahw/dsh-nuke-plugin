@@ -2,17 +2,19 @@
 // 验证 maxFilesPerTx 的完整数据供给链：
 //   dirStats（infra）→ fs-ops/edit-ops preview 填充 OperationPlan.fileCount
 //   → policy-guard.check({ fileCount }) 执行 TOO_MANY_FILES 规则
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
+import type { TxContext } from '../src/contracts/transaction'
 import { dirStats } from '../src/infra/fs-utils'
 import { createPathResolver } from '../src/infra/path-resolver'
 import { createPolicyGuard } from '../src/infra/policy-guard'
 import { configEditOps } from '../src/operations/edit-ops'
 import { dirRemoveOps, makePurgeTempOp } from '../src/operations/fs-ops'
-import type { TxContext } from '../src/contracts/transaction'
-import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
 
 let home: string
 let dshHome: string
@@ -47,6 +49,7 @@ beforeAll(() => {
     },
     resolver: createPathResolver({ env: { HOME: home, DSH_HOME: dshHome, TMPDIR: tempRoot } }),
     backups: null as never,   // preview 零副作用，不触备份区
+    // eslint-disable-next-line @typescript-eslint/no-empty-function -- 测试桩：preview 零副作用路径上不应有任何输出
     logger: { log: () => {}, progress: () => {} } as never,
     clock: { now: () => new Date() },
   }

@@ -1,12 +1,14 @@
 // tests/reporter-summary.test.ts — V5 报告汇总统计区单测
 // 覆盖：Markdown 汇总段 / JSON 追加 summary 键（旧字段不动）/ dry-run 预估聚合 / 空报告零值
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createReporter } from '../src/infra/reporter'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { TxId } from '../src/contracts/base'
 import type { ReportPayload, ReportSummary } from '../src/contracts/logging'
+import { createReporter } from '../src/infra/reporter'
 
 let tmp: string
 let reportsRoot: string

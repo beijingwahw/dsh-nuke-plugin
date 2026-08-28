@@ -1,10 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
+import type { TxId } from '../src/contracts/base'
 import { createBackupStore } from '../src/infra/backup-store'
 import type { BackupStoreRuntime } from '../src/infra/backup-store'
-import type { TxId } from '../src/contracts/base'
 
 let tmp: string
 let store: BackupStoreRuntime

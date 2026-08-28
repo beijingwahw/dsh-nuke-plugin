@@ -73,6 +73,7 @@ export function createLogger(options: LoggerOptions = {}): ILogger {
 
   function fmtVal(v: unknown): string {
     if (typeof v === 'string') return v.includes(' ') ? JSON.stringify(v) : v
+    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- JSON.stringify 对 undefined/函数/symbol 运行时返回 undefined（TS 签名未建模该行为），?? 兜底保证 fmtVal 恒返回字符串
     try { return JSON.stringify(v) ?? String(v) } catch { return String(v) }
   }
 

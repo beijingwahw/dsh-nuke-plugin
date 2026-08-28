@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createPathResolver } from '../src/infra/path-resolver'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { PathPolicy } from '../src/contracts/paths'
+import { createPathResolver } from '../src/infra/path-resolver'
 
 let tmp: string
 let fakeDshHome: string

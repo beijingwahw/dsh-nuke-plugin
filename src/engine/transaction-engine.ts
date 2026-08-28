@@ -6,28 +6,28 @@
 //   Consistent plan 阶段做依赖/令牌/路径校验，aggressive 无令牌拒绝进入 commit
 import * as crypto from 'crypto'
 import * as os from 'os'
+
 import type {
-  Clock, NukeError, Result, TxId,
+  Clock, Result, TxId,
 } from '../contracts/base'
 import { err, errorToMessage, ioError, ok, SimulatedCrashError } from '../contracts/base'
+import {
+  classifyFailureMode, DEFAULT_RETRY_POLICY, MODE_TRANSIENCE,
+} from '../contracts/failure.contract'
+import type { FailureMode, RetryPolicy } from '../contracts/failure.contract'
+import type { IHookRegistry, HookContext } from '../contracts/hooks'
+import type { ILockManager, LockOwner } from '../contracts/lock'
+import { OP_AUDIT_PREFIX, PREDICT_AUDIT_ACTION } from '../contracts/logging'
+import type { IAuditLog, ILogger  } from '../contracts/logging'
+import type { IPathResolver } from '../contracts/paths'
+import type { CalibrationShift } from '../contracts/prediction.contract'
+import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
+import type { IReliabilityModel } from '../contracts/reliability.contract'
 import type {
   BackupRecord, CleanOperation, CleanRequest, DryRunActionDetail, DryRunReport,
   IBackupStore, ITransactionEngine, IWal, OperationPlan, PlanWarning, TxContext,
   TxPlan, TxSession, TxState, TxSummary,
 } from '../contracts/transaction'
-import type { IAuditLog } from '../contracts/logging'
-import { OP_AUDIT_PREFIX, PREDICT_AUDIT_ACTION } from '../contracts/logging'
-import type { CalibrationShift } from '../contracts/prediction.contract'
-import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
-import {
-  classifyFailureMode, DEFAULT_RETRY_POLICY, MODE_TRANSIENCE,
-} from '../contracts/failure.contract'
-import type { FailureMode, RetryPolicy } from '../contracts/failure.contract'
-import type { ILockManager, LockOwner } from '../contracts/lock'
-import type { IReliabilityModel } from '../contracts/reliability.contract'
-import type { IPathResolver } from '../contracts/paths'
-import type { ILogger } from '../contracts/logging'
-import type { IHookRegistry, HookContext } from '../contracts/hooks'
 import { forEachPool } from '../infra/fs-utils'
 
 export interface EngineDeps {
@@ -108,7 +108,7 @@ interface TxRuntime {
   steps: TxStepWithDuration[]
   startedAt: string
   finishedAt?: string
-  lockHandle: Awaited<ReturnType<ILockManager['acquire']>> extends Result<infer H, any> ? H : never
+  lockHandle: Awaited<ReturnType<ILockManager['acquire']>> extends Result<infer H, unknown> ? H : never
   backupsArea: Awaited<ReturnType<IBackupStore['reserve']>>
   /** operationId → preview 预估回收字节数（plan/dryRun 时填充，
    *  commit 复用 → 步骤审计里的 estimated 零额外 IO；外部直连 commit
@@ -124,7 +124,7 @@ export function createTransactionEngine(
   const runtimes = new Map<TxId, TxRuntime>()
   /** dryRun 并发度：非法值（0/负/非整数）回退默认，永不产生无界并发 */
   const previewConcurrency = Number.isInteger(options.previewConcurrency) && (options.previewConcurrency ?? 0) >= 1
-    ? (options.previewConcurrency as number)
+    ? (options.previewConcurrency!)
     : DEFAULT_PREVIEW_CONCURRENCY
   /** V5.3 步骤级重试：负值/非整数钳制为 0（关闭），永不产生无界重试 */
   const retryMax = Number.isInteger(options.retryPolicy?.maxRetries)
@@ -146,7 +146,7 @@ export function createTransactionEngine(
     finished.set(txId, summary)
   }
 
-  function setState(rt: TxRuntime, next: TxState): Result<void, NukeError> {
+  function setState(rt: TxRuntime, next: TxState): Result<void> {
     if (!TRANSITIONS[rt.state].includes(next)) {
       return err({
         code: 'E_TX_STATE',
@@ -767,7 +767,7 @@ export function createTransactionEngine(
       const records = await deps.wal.replay(txId)
       if (records.length === 0) return null
       const begin = records.find(r => r.type === 'tx-begin')
-      if (!begin || begin.type !== 'tx-begin') return null
+      if (begin?.type !== 'tx-begin') return null
       // step-done 记录不含 action：以 step-intent 的 action 按 index 关联回填，
       // 否则所有步骤都会被误报为 standard-remove
       const actionByIndex = new Map<number, string>()

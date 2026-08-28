@@ -6,14 +6,17 @@
 // （不报错、不产生空操作），上层可机器读出"这一步本来就无事可做"。
 import * as fs from 'fs'
 import * as path from 'path'
-import type { AbsolutePath, NukeError, PluginName, Result } from '../contracts/base'
+
+import type { AbsolutePath, PluginName, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
+import type { PathPolicy } from '../contracts/paths'
 import type {
   CleanOperation, ExecutedStep, OperationPlan, TxContext,
 } from '../contracts/transaction'
-import type { PathPolicy } from '../contracts/paths'
-import { removePluginFromYaml } from './yaml-edit'
 import { existsSafe } from '../infra/fs-utils'
+
+import { removePluginFromYaml } from './yaml-edit'
+
 
 export interface EditOpSpec {
   readonly id: string
@@ -57,7 +60,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
       }
     },
 
-    async validate(ctx: TxContext): Promise<Result<void, NukeError>> {
+    async validate(ctx: TxContext): Promise<Result<void>> {
       // 路径策略先于存在性检查：即使文件不存在，越白名单的目标也必须拒绝（纵深防御）
       const file = spec.fileOf(ctx)
       const check = await ctx.resolver.assertDeletable(file, spec.policy)
@@ -65,7 +68,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
       return ok(undefined)
     },
 
-    async execute(ctx: TxContext): Promise<Result<ExecutedStep, NukeError>> {
+    async execute(ctx: TxContext): Promise<Result<ExecutedStep>> {
       const file = spec.fileOf(ctx)
       if (!existsSafe(file)) {
         return ok({
@@ -92,7 +95,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
       }
     },
 
-    async undo(ctx: TxContext, record): Promise<Result<void, NukeError>> {
+    async undo(ctx: TxContext, record): Promise<Result<void>> {
       if (!record) return ok(undefined)
       return ctx.backups.restore(record)
     },

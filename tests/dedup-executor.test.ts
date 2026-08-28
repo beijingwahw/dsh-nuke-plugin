@@ -1,11 +1,13 @@
 // tests/dedup-executor.test.ts — 硬链接去重执行器单测（突破升级守护）
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import * as crypto from 'crypto'
-import { createDedupExecutor } from '../src/engine/dedup-executor'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { DedupReport } from '../src/contracts/dedup.contract'
+import { createDedupExecutor } from '../src/engine/dedup-executor'
 
 let tmp: string
 

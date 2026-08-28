@@ -66,7 +66,7 @@ export const MODE_PRESCRIPTIONS: Readonly<Record<FailureMode, string>> = {
 
 /** 模式匹配规则表（有序：首个命中生效）。
  *  码类模式优先匹配（`E_XXX` 前缀/errno 字面量），再落到措辞类。 */
-const MODE_RULES: ReadonlyArray<{ readonly mode: FailureMode; readonly patterns: readonly RegExp[] }> = [
+const MODE_RULES: readonly { readonly mode: FailureMode; readonly patterns: readonly RegExp[] }[] = [
   // 契约错误码（errorToMessage 对 NukeError 形态产出 `[E_XXX] msg`）
   { mode: 'validation', patterns: [/\[E_VALIDATION\]/, /\[E_HOOK_VETO\]/, /\[E_POLICY\]/] },
   { mode: 'dependency', patterns: [/\[E_TOOL_MISSING\]/, /\[E_NOT_FOUND\]/, /spawn .* ENOENT/i, /command not found/i] },

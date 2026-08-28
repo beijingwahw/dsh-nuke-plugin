@@ -15,15 +15,15 @@
 //     · severity 升级走新键（DISK_WARNING → DISK_CRITICAL 是不同 kind），
 //       恶化升级永远立即上报，绝不被窗口捂住
 //   suppressionWindowMs = 0 关闭抑制（旧的逐次全报行为）。
-import type { Clock, NukeError, ProfileName, Result } from '../contracts/base'
+import type { Clock, ProfileName, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type { IDiskForecaster } from '../contracts/disk-forecast.contract'
-import type { ITrendTracker, TrendReport } from '../contracts/trend.contract'
 import type { IDoctor, DoctorReport } from '../contracts/doctor.contract'
 import type {
   GuardianAlert, GuardianReport, GuardianThresholds, IGuardian,
 } from '../contracts/guardian.contract'
 import { DEFAULT_GUARDIAN_THRESHOLDS } from '../contracts/guardian.contract'
+import type { ITrendTracker, TrendReport } from '../contracts/trend.contract'
 
 // ─── 引擎层扩展类型（contracts 只读；新输出经协变子类型暴露） ──
 
@@ -45,7 +45,7 @@ export interface IGuardianDetail extends IGuardian {
   patrol(options?: {
     readonly profile?: ProfileName
     readonly thresholds?: Partial<GuardianThresholds>
-  }): Promise<Result<GuardianReportDetail, NukeError>>
+  }): Promise<Result<GuardianReportDetail>>
 }
 
 export interface GuardianDeps {

@@ -1,10 +1,12 @@
 // src/infra/wal.ts — IWal 实现：JSONL 追加 + fdatasync + 崩溃重放 + CRC 完整性
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
-import type { NukeError, Result, TxId } from '../contracts/base'
+
+import type { Result, TxId } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type { IWal, WalRecord } from '../contracts/transaction'
+
 import { fsyncDir } from './fs-utils'
 
 export interface WalOptions {
@@ -44,6 +46,7 @@ type CrcCarrier = WalRecord & { __crc?: string }
 /** 规范化 CRC：键序稳定的 JSON 序列化后取 SHA-256 前 16 hex */
 function computeCrc(record: WalRecord): string {
   const { ...rest } = record as CrcCarrier
+  // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- 剔除 __crc 字段后做规范化序列化（delete 动态键是契约字段名的直接表达）
   delete (rest as Record<string, unknown>)[CRC_FIELD]
   const canonical = JSON.stringify(rest, Object.keys(rest).sort())
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16)
@@ -59,6 +62,7 @@ function lineVerdict(line: string): { verdict: LineVerdict; record: WalRecord | 
   try {
     parsed = JSON.parse(line) as CrcCarrier
   } catch { return { verdict: 'partial', record: null } }
+  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- JSON.parse("null") 运行时得到 null（typeof null === 'object' 会漏过首判），此判据是 fail-closed 必需
   if (typeof parsed !== 'object' || parsed === null || typeof parsed.type !== 'string') {
     return { verdict: 'corrupt', record: null }
   }
@@ -67,6 +71,7 @@ function lineVerdict(line: string): { verdict: LineVerdict; record: WalRecord | 
       return { verdict: 'corrupt', record: null }   // CRC 不匹配：静默篡改/位腐烂
     }
     const { ...clean } = parsed
+    // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- 返回前剥离 __crc 载荷字段（调用方拿到的是纯 WalRecord）
     delete (clean as Record<string, unknown>)[CRC_FIELD]
     return { verdict: 'ok', record: clean as WalRecord }
   }
@@ -95,10 +100,10 @@ export interface WalRuntime extends IWal {
   /** 归档已终结事务：WAL 文件移入 archive/（幂等，可重复调用）。
    *  损坏文件（中间行/CRC）fail-closed 不归档 —— 无法确认事务真实
    *  状态，留在活跃区交由人工介入。返回本次归档的 txId 列表。 */
-  archiveFinished(): Promise<Result<readonly TxId[], NukeError>>
+  archiveFinished(): Promise<Result<readonly TxId[]>>
   /** 尾部半行自动修复：截断到最后一行完整记录（含 fsync）。
    *  完整行损坏（CRC/结构）→ 拒绝修复保留现场（fail-closed）。 */
-  repairTail(txId: TxId): Promise<Result<WalTailRepair, NukeError>>
+  repairTail(txId: TxId): Promise<Result<WalTailRepair>>
 }
 
 /** 活跃文件扫描结果：未终结判定与归档判定共用 */
@@ -218,7 +223,7 @@ export function createWal(options: WalOptions): WalRuntime {
         .map(s => s.txId)
     },
 
-    async archiveFinished(): Promise<Result<readonly TxId[], NukeError>> {
+    async archiveFinished(): Promise<Result<readonly TxId[]>> {
       try {
         const moved: TxId[] = []
         for (const s of scanActiveFiles()) {
@@ -244,7 +249,7 @@ export function createWal(options: WalOptions): WalRuntime {
       }
     },
 
-    async repairTail(txId: TxId): Promise<Result<WalTailRepair, NukeError>> {
+    async repairTail(txId: TxId): Promise<Result<WalTailRepair>> {
       // 目标解析：活跃区优先（进行中的文件），缺失再看归档区（同样可修复）
       let target: string
       let text: string

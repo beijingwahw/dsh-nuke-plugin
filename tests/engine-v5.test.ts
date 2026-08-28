@@ -5,35 +5,38 @@
 //   orphan-detector：多 profile 并行检测（引用并集 / 孤儿 / 稳定排序）
 //   restore-point：maxPoints 保留策略（在用跳过 / 拿不到事务信息保守跳过）、读回校验
 //   health-inspector：检查组并行 + 输出稳定序、inode 压力检查（skipped 语义）
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import * as fs from 'fs'
+import type * as FsModule from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createTransactionEngine } from '../src/engine/transaction-engine'
-import type { TxStepWithDuration, TxSummaryWithStepTimings } from '../src/engine/transaction-engine'
-import { createHookRegistry } from '../src/engine/hook-registry'
-import { createBlastRadiusAnalyzer } from '../src/engine/blast-radius'
+
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+
+import { ok } from '../src/contracts/base'
+import type { Result } from '../src/contracts/base'
+import type { HookContext, HookVerdict, ErrorDirective } from '../src/contracts/hooks'
+import type { DependencyGraph, IDependencyAnalyzer } from '../src/contracts/scan'
+import type { CleanOperation, CleanRequest, OperationPlan } from '../src/contracts/transaction'
 import type { BlastRadiusReportV5 } from '../src/engine/blast-radius'
+import { createBlastRadiusAnalyzer } from '../src/engine/blast-radius'
+import type { HealthCheckResultV5 } from '../src/engine/health-inspector'
+import { createHealthInspector } from '../src/engine/health-inspector'
+import type { HookRegistrationInput } from '../src/engine/hook-registry'
+import { createHookRegistry } from '../src/engine/hook-registry'
 import { createOrphanDetector } from '../src/engine/orphan-detector'
 import { createRestorePointManager } from '../src/engine/restore-point'
-import { createHealthInspector } from '../src/engine/health-inspector'
-import type { HealthCheckResultV5 } from '../src/engine/health-inspector'
-import { createLockManager } from '../src/infra/lock-manager'
-import { createWal } from '../src/infra/wal'
-import { createBackupStore } from '../src/infra/backup-store'
+import { createTransactionEngine } from '../src/engine/transaction-engine'
+import type { TxStepWithDuration, TxSummaryWithStepTimings } from '../src/engine/transaction-engine'
 import { createAuditLog } from '../src/infra/audit-log'
+import { createBackupStore } from '../src/infra/backup-store'
+import { createLockManager } from '../src/infra/lock-manager'
 import { createLogger } from '../src/infra/logger'
-import { ok } from '../src/contracts/base'
-import type { NukeError, Result } from '../src/contracts/base'
-import type { CleanOperation, CleanRequest, OperationPlan } from '../src/contracts/transaction'
-import type { HookContext, HookVerdict, ErrorDirective } from '../src/contracts/hooks'
-import type { HookRegistrationInput } from '../src/engine/hook-registry'
-import type { DependencyGraph, IDependencyAnalyzer } from '../src/contracts/scan'
+import { createWal } from '../src/infra/wal'
 
 // 读回校验故障注入开关：仅 restore-point 的 fail-closed 测试置 true，其余时刻透传真实 fs
 const tamperMetaJson = vi.hoisted(() => ({ enabled: false }))
 vi.mock('fs', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('fs')>()
+  const actual = await importOriginal<typeof FsModule>()
   return {
     ...actual,
     readFileSync: ((p: unknown, opts: unknown) => {
@@ -292,6 +295,7 @@ function hookCtx(): HookContext {
 function inlineHook(
   id: string,
   priority: number | undefined,
+  // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- 与契约 hooks.ts 的 HookHandler.run 同款签名：联合中的 void 表示"钩子可无返回（无意见）"，保持桩与契约可赋值
   fn: () => Promise<HookVerdict | ErrorDirective | void>,
 ): HookRegistrationInput {
   return {
@@ -462,7 +466,7 @@ function stubGraphAnalyzer(
     cycles: () => [],
   })
   return {
-    buildGraph: async (): Promise<Result<DependencyGraph, NukeError>> => ok(graph()),
+    buildGraph: async (): Promise<Result<DependencyGraph>> => ok(graph()),
     blockersOf: async () => ok([]),
   }
 }

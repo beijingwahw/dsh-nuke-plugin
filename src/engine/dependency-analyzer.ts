@@ -18,9 +18,11 @@
 //   cacheStats() 暴露上次构建的命中/读盘计数（可观测性：增量是否生效）。
 import * as fs from 'fs'
 import * as path from 'path'
+
 import { parse as parseYaml } from 'yaml'
+
 import type {
-  AbsolutePath, NukeError, PluginName, ProfileName, Result,
+  AbsolutePath, PluginName, ProfileName, Result,
 } from '../contracts/base'
 import { err, errorToMessage, ioError, ok } from '../contracts/base'
 import type {
@@ -52,7 +54,7 @@ interface FingerprintEntry<T> {
 
 export function createDependencyAnalyzer(options: DependencyAnalyzerOptions): IDependencyAnalyzerDetail {
   const fsys = options.fs_ ?? fs
-  const yamlParse = options.yamlParse ?? parseYaml
+  const yamlParse: (s: string) => unknown = options.yamlParse ?? parseYaml
 
   // 指纹缓存：绝对路径 → 解析产物。analyzer 生命周期内跨 buildGraph 复用
   const pkgCache = new Map<string, FingerprintEntry<Record<string, unknown> | null>>()
@@ -85,7 +87,7 @@ export function createDependencyAnalyzer(options: DependencyAnalyzerOptions): ID
       return null
     }
     const hit = cache.get(file)
-    if (hit !== undefined && hit.size === st.size && hit.mtimeMs === st.mtimeMs) {
+    if (hit?.size === st.size && hit.mtimeMs === st.mtimeMs) {
       cacheHits++
       return hit.value
     }
@@ -267,9 +269,9 @@ export function createDependencyAnalyzer(options: DependencyAnalyzerOptions): ID
     ): PluginName[] => {
       const seen = new Set<PluginName>()
       const queue: PluginName[] = [start]
-      // 游标索引替代 shift()：shift 是 O(N) 数组搬移，大图上传递闭包退化为 O(N²)
-      for (let head = 0; head < queue.length; head++) {
-        const cur = queue[head]!
+      // for-of 迭代增长中的数组（内部即游标索引，push 的元素会被后续轮次
+      // 自然遍历到）替代 shift()：shift 是 O(N) 数组搬移，大图上传递闭包退化为 O(N²)
+      for (const cur of queue) {
         for (const n of next(cur)) {
           if (n !== start && !seen.has(n)) { seen.add(n); queue.push(n) }
         }
@@ -351,7 +353,7 @@ export function createDependencyAnalyzer(options: DependencyAnalyzerOptions): ID
   }
 
   const analyzer: IDependencyAnalyzerDetail = {
-    async buildGraph(profile?: ProfileName): Promise<Result<DependencyGraph, NukeError>> {
+    async buildGraph(profile?: ProfileName): Promise<Result<DependencyGraph>> {
       try {
         return ok(buildGraph(profile))
       } catch (e) {

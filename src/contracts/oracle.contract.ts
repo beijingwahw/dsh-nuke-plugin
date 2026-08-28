@@ -9,7 +9,7 @@
 //   回收区间     [Q10, Q90]    —— 成功前提下的校准分位区间（诚实标注口径）
 //   最脆弱步骤   argmax (1-p_i)·exposure_i   —— 敞口 = 该步起的预估总量
 //   回滚深度     Σ i·P(首败于 i)  —— 失败时的期望补偿步数
-import type { CleanAction, CleanStrategy, PluginName, ProfileName } from './base'
+import type { CleanAction, CleanStrategy, PluginName, ProfileName, Result } from './base'
 import type { CalibrationSummary } from './reliability.contract'
 
 export type OracleConfidence = 'high' | 'medium' | 'low'
@@ -77,5 +77,5 @@ export interface IOracle {
     readonly plugins: readonly PluginName[]
     readonly profile: ProfileName
     readonly strategy: CleanStrategy
-  }): Promise<import('./base').Result<OracleReport, import('./base').NukeError>>
+  }): Promise<Result<OracleReport>>
 }

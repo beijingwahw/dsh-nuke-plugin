@@ -5,7 +5,7 @@
 //  3. IOrphanDetector  全局孤儿：全 profile 引用集合 vs 磁盘实存 + TEMP
 
 import type {
-  AbsolutePath, CleanStrategy, NukeError, PluginName, ProfileName, Result,
+  AbsolutePath, CleanStrategy, PluginName, ProfileName, Result,
 } from './base'
 import type { ResidualEvidence } from './scoring'
 
@@ -56,13 +56,13 @@ export interface DependencyGraph {
 
 export interface IDependencyAnalyzer {
   /** 构建全量图：跨所有 profile 的 package.json + cordis.patch.yml */
-  buildGraph(profile?: ProfileName): Promise<Result<DependencyGraph, NukeError>>
+  buildGraph(profile?: ProfileName): Promise<Result<DependencyGraph>>
   /** 便捷查询：是否存在会被本次删除波及的插件 */
   blockersOf(plugins: readonly PluginName[]): Promise<Result<readonly {
     plugin: PluginName
     blockedBy: readonly PluginName[]
     reason: string
-  }[], NukeError>>
+  }[]>>
 }
 
 // ─── 全局孤儿检测 ─────────────────────────────────────────
@@ -80,5 +80,5 @@ export interface IOrphanDetector {
   detect(options: {
     tempMaxAgeDays: number
     signal?: AbortSignal
-  }): Promise<Result<OrphanReport, NukeError>>
+  }): Promise<Result<OrphanReport>>
 }

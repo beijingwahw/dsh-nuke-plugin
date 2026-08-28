@@ -9,12 +9,13 @@
 //      不报错、不产生空操作（机器可读，供上层统计与展示）
 import * as fs from 'fs'
 import * as path from 'path'
-import type { AbsolutePath, NukeError, PluginName, Result } from '../contracts/base'
+
+import type { AbsolutePath, PluginName, Result } from '../contracts/base'
 import { err, errorToMessage, ioError, ok } from '../contracts/base'
+import type { PathPolicy } from '../contracts/paths'
 import type {
   CleanOperation, DirImpactDetail, DirImpactEntry, ExecutedStep, OperationPlan, TxContext,
 } from '../contracts/transaction'
-import type { PathPolicy } from '../contracts/paths'
 import { dirSize, dirStats, existsSafe, tempOrphanEntries } from '../infra/fs-utils'
 
 const DENY = ['**/@deepseek-ai/dsh-base*', '**/.nuke/**', '**/node_modules/.pnpm/**']
@@ -89,7 +90,7 @@ export function makeDirRemoveOp(spec: DirOpSpec): CleanOperation {
       }
     },
 
-    async validate(ctx): Promise<Result<void, NukeError>> {
+    async validate(ctx): Promise<Result<void>> {
       // 路径策略先于存在性检查：目录不存在也要先过白名单闸门（纵深防御）
       const dir = spec.dirOf(ctx)
       const check = await ctx.resolver.assertDeletable(dir, spec.policy)
@@ -97,7 +98,7 @@ export function makeDirRemoveOp(spec: DirOpSpec): CleanOperation {
       return ok(undefined)
     },
 
-    async execute(ctx): Promise<Result<ExecutedStep, NukeError>> {
+    async execute(ctx): Promise<Result<ExecutedStep>> {
       const dir = spec.dirOf(ctx)
       if (!existsSafe(dir)) {
         return ok({
@@ -118,7 +119,7 @@ export function makeDirRemoveOp(spec: DirOpSpec): CleanOperation {
       }
     },
 
-    async undo(ctx, record): Promise<Result<void, NukeError>> {
+    async undo(ctx, record): Promise<Result<void>> {
       if (!record) return ok(undefined)
       return ctx.backups.restore(record)
     },
@@ -204,9 +205,9 @@ export function makePurgeTempOp(options: PurgeTempOptions): CleanOperation {
       }
     },
 
-    async validate(): Promise<Result<void, NukeError>> { return ok(undefined) },
+    async validate(): Promise<Result<void>> { return ok(undefined) },
 
-    async execute(ctx): Promise<Result<ExecutedStep, NukeError>> {
+    async execute(ctx): Promise<Result<ExecutedStep>> {
       const entries = staleEntries()
       if (entries.length === 0) {
         return ok({
@@ -245,7 +246,7 @@ export function makePurgeTempOp(options: PurgeTempOptions): CleanOperation {
       })
     },
 
-    async undo(ctx, record): Promise<Result<void, NukeError>> {
+    async undo(ctx, record): Promise<Result<void>> {
       if (!record) return ok(undefined)
       return ctx.backups.restore(record)
     },

@@ -1,10 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createReporter } from '../src/infra/reporter'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { TxId } from '../src/contracts/base'
 import type { ReportPayload } from '../src/contracts/logging'
+import { createReporter } from '../src/infra/reporter'
 
 let tmp: string
 let reportsRoot: string
@@ -82,6 +84,7 @@ describe('Reporter', () => {
   })
 
   it('dryRun payload：渲染预演段落与阻断警告', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- rest 解构剔除 tx 字段是惯用法（同 src/infra/audit-log.ts），被剔除的兄弟变量是该模式的固有噪音
     const { tx: _tx, ...payloadWithoutTx } = payload
     const r = await make().export('markdown', {
       ...payloadWithoutTx,

@@ -22,11 +22,12 @@
 //      不可漏警的运维立场）。完美线性数据 CI 退化为零宽 → 悲观界 =
 //      点估计 → 行为与旧版逐位一致（向后兼容的锚点）。
 //      severityBasis 记录判定依据（哪个值、哪条阈值）—— 分级不是黑盒。
-import type { Clock, NukeError, Result } from '../contracts/base'
+import type { Clock, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
-import { statfsBytes } from '../infra/fs-utils'
-import type { ITrendTracker } from '../contracts/trend.contract'
 import type { DiskForecast, ForecastSeverity, IDiskForecaster } from '../contracts/disk-forecast.contract'
+import type { ITrendTracker } from '../contracts/trend.contract'
+import { statfsBytes } from '../infra/fs-utils'
+
 import { isTrendReportDetail } from './trend-tracker'
 
 // ─── 引擎层扩展类型（contracts 只读；新输出字段在此定义并导出） ──
@@ -49,7 +50,7 @@ export interface DiskForecastDetail extends DiskForecast {
 
 /** IDiskForecaster 的引擎层扩展：forecast 返回详情报告（协变返回类型） */
 export interface IDiskForecasterDetail extends IDiskForecaster {
-  forecast(): Promise<Result<DiskForecastDetail, NukeError>>
+  forecast(): Promise<Result<DiskForecastDetail>>
 }
 
 export interface DiskForecasterOptions {
@@ -171,10 +172,11 @@ export function createDiskForecaster(options: DiskForecasterOptions): IDiskForec
           case 'watch':
             recommendation = '保持观察：残留仍在增长，建议运行 nuke_doctor 获取处方'
             break
-          default:
+          case 'ok':
             recommendation = trend.snapshotCount < 2
               ? '趋势数据不足：多跑几次 nuke_scan 后即可获得预测能力'
               : '磁盘健康，按需清理即可'
+            break
         }
 
         const forecast: DiskForecastDetail = {

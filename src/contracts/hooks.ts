@@ -36,6 +36,7 @@ export type HookVerdict =
 export type ErrorDirective = 'rollback' | 'skip-and-continue' | 'abort'
 
 export type HookHandler =
+  // eslint-disable-next-line @typescript-eslint/no-invalid-void-type -- 联合中的 void 表示"钩子可无返回（无意见）"：改用 undefined 会使 Promise<void> 实现（async 无 return 的钩子）不可赋值，破坏导出契约兼容
   | { readonly type: 'inline'; run(ctx: HookContext): Promise<HookVerdict | ErrorDirective | void> }
   | {
       readonly type: 'command'
@@ -71,8 +72,8 @@ export interface HookEmitResult {
 export interface IHookRegistry {
   register(def: HookDefinition): Unsubscribe
   /** pre：聚合 verdict；error：聚合 directive；全部并发执行受 timeoutMs 约束 */
-  emit(timing: HookTiming, ctx: HookContext): Promise<Result<HookEmitResult, NukeError>>
+  emit(timing: HookTiming, ctx: HookContext): Promise<Result<HookEmitResult>>
   /** 持久化到 <dshHome>/.nuke/hooks/{pre,post,error}.json（schema 升级版） */
-  loadFromDisk(): Promise<Result<void, NukeError>>
+  loadFromDisk(): Promise<Result<void>>
   list(): readonly HookDefinition[]
 }

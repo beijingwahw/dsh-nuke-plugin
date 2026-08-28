@@ -13,13 +13,15 @@
 // 信任模型（诚实声明）：锚点之前的前缀被视为可信，其历史篡改不在增量
 // 路径的检出范围内 —— 需要完整保证时用 verify()（全链语义，绝不缓存
 // 哈希结果偷懒）。哨兵缺失/损坏时增量路径退化为全链重算（fail-closed）。
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as path from 'path'
-import * as crypto from 'crypto'
+
 import type { TxId } from '../contracts/base'
 import type {
   AuditEntry, ChainVerification, IAuditLog, HashedAuditEntry,
 } from '../contracts/logging'
+
 import { readJsonl, writeJsonAtomic } from './fs-utils'
 
 export interface AuditLogOptions {
@@ -174,6 +176,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLogRuntime {
       let prev = GENESIS
       for (const [i, e] of all.entries()) {
         // 重算哈希时剔除链自身字段，与 append 时的输入保持一致
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars -- rest 解构剔除 seq/prevHash/hash 是惯用法，被剔除的兄弟变量是该模式的固有噪音
         const { seq: _s, prevHash: _p, hash: _h, ...raw } = e
         if (e.seq !== i || e.prevHash !== prev || e.hash !== computeHash(prev, raw)) {
           return { valid: false, firstBrokenSeq: e.seq, totalEntries: all.length }
@@ -217,6 +220,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLogRuntime {
       let prev = anchorHash
       for (let i = anchorSeq + 1; i < all.length; i++) {
         const e = all[i]!
+        // eslint-disable-next-line @typescript-eslint/no-unused-vars -- 同 verify()：rest 解构剔除链自身字段，兄弟变量是固有噪音
         const { seq: _s, prevHash: _p, hash: _h, ...raw } = e
         if (e.prevHash !== prev || e.hash !== computeHash(prev, raw)) {
           return { valid: false, firstBrokenSeq: e.seq, totalEntries: all.length }

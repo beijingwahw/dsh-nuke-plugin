@@ -2,8 +2,9 @@
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
+
 import type {
-  AbsolutePath, NukeError, ProfileName, Result,
+  AbsolutePath, ProfileName, Result,
 } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type {
@@ -25,6 +26,7 @@ export interface PathResolverOptions {
 }
 
 /** 路径中的控制字符（C0 控制区 \x00-\x1f + DEL \x7f）—— 拒绝处理的硬边界 */
+// eslint-disable-next-line no-control-regex -- 检测控制字符正是该正则的目的（拒绝路径注入载荷的硬边界）
 const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
 
 /** 简化 glob → RegExp：支持 * ? **（仅用于 denyGlobs 匹配） */
@@ -42,6 +44,15 @@ export function globToRegex(glob: string): RegExp {
   return new RegExp(`^${re}$`, 'i')
 }
 
+/** 环境变量取值：空串/null 与未设置等价 —— HOME='' 若被当作有效值会派生出
+ *  相对路径，破坏删除白名单的绝对路径前提，故刻意保持真值回退语义（不可改成 ??） */
+function firstEnv(...vals: readonly (string | null | undefined)[]): string | undefined {
+  for (const v of vals) {
+    if (v !== undefined && v !== null && v !== '') return v
+  }
+  return undefined
+}
+
 export function createPathResolver(options: PathResolverOptions = {}): IPathResolver {
   const env = options.env ?? process.env
   const platform = options.platform ?? os.platform()
@@ -50,11 +61,11 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
   // 的白名单匹配做 casefold；linux 保持大小写敏感。
   const caseInsensitive = isWin || platform === 'darwin'
 
-  const homeAbs = (env.HOME || env.USERPROFILE || os.homedir()) as AbsolutePath
+  const homeAbs = (firstEnv(env.HOME, env.USERPROFILE) ?? os.homedir()) as AbsolutePath
   const tempAbs = (isWin
-    ? (env.TEMP || env.APPDATA)
-    : (env.TMPDIR || '/tmp')) as AbsolutePath
-  const dshHomeAbs = (env.DSH_HOME || path.join(homeAbs, '.dsh')) as AbsolutePath
+    ? firstEnv(env.TEMP, env.APPDATA)
+    : (firstEnv(env.TMPDIR) ?? '/tmp')) as AbsolutePath
+  const dshHomeAbs = (firstEnv(env.DSH_HOME) ?? path.join(homeAbs, '.dsh')) as AbsolutePath
 
   const info: PlatformInfo = {
     os: isWin ? 'windows' : platform === 'darwin' ? 'macos' : 'linux',
@@ -76,7 +87,7 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
   const resolver: IPathResolver = {
     platform() { return info },
 
-    async canonicalize(p: string): Promise<Result<AbsolutePath, NukeError>> {
+    async canonicalize(p: string): Promise<Result<AbsolutePath>> {
       try {
         const resolved = path.resolve(p)
         const real = await fs.promises.realpath(resolved).catch(() => resolved)
@@ -96,7 +107,7 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
       return cn === rn || cn.startsWith(rn + '/')
     },
 
-    async assertDeletable(p: string, policy: PathPolicy): Promise<Result<AbsolutePath, NukeError>> {
+    async assertDeletable(p: string, policy: PathPolicy): Promise<Result<AbsolutePath>> {
       // 0) 控制字符一票否决（\x00-\x1f 与 DEL \x7f）：控制字符可干扰终端/
       //     日志/JSON 序列化，且常为路径注入载荷 —— 先于一切解析拒绝
       if (CONTROL_CHAR_RE.test(p)) {

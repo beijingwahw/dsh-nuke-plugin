@@ -1,10 +1,12 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createLockManager } from '../src/infra/lock-manager'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import { ok } from '../src/contracts/base'
 import type { LockOwner, LockRequest } from '../src/contracts/lock'
+import { createLockManager } from '../src/infra/lock-manager'
 
 let tmp: string
 const nowStub = { value: 1_000_000 }
@@ -189,7 +191,7 @@ describe('锁升级（指数退避等待 + 自动心跳续期）', () => {
 
   it('等待重试（指数退避+抖动）：超时返回 E_LOCK_HELD 并报告当前持有者', async () => {
     const { m } = realManager()
-    await okv(await m.acquire(req(ownerA, 'exclusive')))
+    okv(await m.acquire(req(ownerA, 'exclusive')))
     const r = await m.acquire({ ...req(ownerB, 'exclusive'), waitTimeoutMs: 120 })
     expect(r.ok).toBe(false)
     if (r.ok) return
@@ -200,7 +202,7 @@ describe('锁升级（指数退避等待 + 自动心跳续期）', () => {
 
   it('等待重试：锁释放后等待者在截止线内成功获取', async () => {
     const { m } = realManager()
-    const h1 = await okv(await m.acquire(req(ownerA, 'exclusive')))
+    const h1 = okv(await m.acquire(req(ownerA, 'exclusive')))
     // 80ms 后释放；ownerB 等待窗口 2s，退避期间应等到
     void (async () => { await sleep(80); await h1.release() })()
     const r = await m.acquire({ ...req(ownerB, 'exclusive'), waitTimeoutMs: 2_000 })
@@ -225,7 +227,7 @@ describe('锁升级（指数退避等待 + 自动心跳续期）', () => {
 
   it('对照：无自动续期的锁在 TTL 后自然失效', async () => {
     const { m } = realManager()
-    await okv(await m.acquire(req(ownerA, 'exclusive', 150)))
+    okv(await m.acquire(req(ownerA, 'exclusive', 150)))
     await sleep(400)
     expect(m.holders({ kind: 'global' }).length).toBe(0)
   })

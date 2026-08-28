@@ -4,7 +4,7 @@
 // 精确定位重复文件群，量化"若去重（hardlink/回收冗余拷贝）可回收多少空间"。
 // 只读分析：不执行任何去重动作，结论供策略引擎与 UI 决策。
 
-import type { AbsolutePath, NukeError, ProfileName, Result } from './base'
+import type { AbsolutePath, ProfileName, Result } from './base'
 
 export interface DedupCopy {
   readonly path: AbsolutePath
@@ -57,7 +57,7 @@ export interface IDedupAnalyzer {
    *   2. 头尾采样指纹（各 4KB）—— 采样不同即淘汰（不全量读）
    *   3. 全量 SHA-256 —— 仅对采样碰撞者，保证零误报
    */
-  analyze(options?: DedupOptions): Promise<Result<DedupReport, NukeError>>
+  analyze(options?: DedupOptions): Promise<Result<DedupReport>>
 }
 
 // ─── 硬链接执行器：分析 → 实收 ──────────────────────────────
@@ -94,8 +94,8 @@ export interface DedupUndoReport {
 export interface IDedupExecutor {
   /** 将分析报告中的重复组转化为硬链接（verify-then-link，逐组 TOCTOU 复验）。
    *  中途取消返回 ok(cancelled=true)：journal 保留已完成部分供 undo。 */
-  apply(report: DedupReport, options?: { signal?: AbortSignal }): Promise<Result<DedupExecResult, NukeError>>
+  apply(report: DedupReport, options?: { signal?: AbortSignal }): Promise<Result<DedupExecResult>>
   /** 反向补偿（best-effort）：journal 中的 victim 从 canonical 复制回独立文件。
    *  单条失败不中断其余恢复，进度与失败明细随报告返回。 */
-  undo(journal: readonly LinkJournalEntry[]): Promise<Result<DedupUndoReport, NukeError>>
+  undo(journal: readonly LinkJournalEntry[]): Promise<Result<DedupUndoReport>>
 }

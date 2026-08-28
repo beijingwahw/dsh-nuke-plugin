@@ -35,22 +35,22 @@
 //   分位数在"权重代表位置"上做线性插值 —— 全 1 权重时严格退化为
 //   旧公式 pos=(n-1)·q（兼容既有语义），近期样本权重更高则区间整体
 //   向近期观测偏移。
+import {
+  classifyFailureMode, DEFAULT_RETRY_EFFICACY, MODE_TRANSIENCE, retryAdjustedProbability,
+} from '../contracts/failure.contract'
+import type { FailureMode, FailureModeStat } from '../contracts/failure.contract'
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX } from '../contracts/logging'
 import type {
   ActionReliability, CalibrationSummary, DurationSummary, IReliabilityModel,
   RetryEfficacyStat, SizeBucket,
 } from '../contracts/reliability.contract'
-import {
-  classifyFailureMode, DEFAULT_RETRY_EFFICACY, MODE_TRANSIENCE, retryAdjustedProbability,
-} from '../contracts/failure.contract'
-import type { FailureMode, FailureModeStat } from '../contracts/failure.contract'
 
 // ─── V5.2：大小桶边界（操作级协变量调制） ─────────────────────
 // 大目录删除的失败模式（EBUSY/长路径/超时/句柄耗尽）与 5MB 级完全不同，
 // "remove-node-modules 的成功率"应按体量分层。桶先验强度 κ_b=5：
 // 桶内样本天然稀疏（动作层样本被 3 个桶摊薄），更快向动作层让位。
-const SIZE_BUCKETS: ReadonlyArray<{ readonly bucket: SizeBucket; readonly min: number; readonly max: number | null }> = [
+const SIZE_BUCKETS: readonly { readonly bucket: SizeBucket; readonly min: number; readonly max: number | null }[] = [
   { bucket: 'small', min: 0, max: 1024 * 1024 },                    // < 1MB
   { bucket: 'medium', min: 1024 * 1024, max: 100 * 1024 * 1024 },   // 1MB ~ 100MB
   { bucket: 'large', min: 100 * 1024 * 1024, max: null },           // ≥ 100MB
@@ -306,7 +306,7 @@ export async function createReliabilityModel(
     const beta = (1 - mu) * kappa + fail
     let mean = alpha / (alpha + beta)
     let ci: readonly [number, number]
-    let selfWeight = (succ + fail) / (succ + fail + kappa)
+    const selfWeight = (succ + fail) / (succ + fail + kappa)
     let sizeBucket: ActionReliability['sizeBucket']
 
     // V5.2 桶层调制：α_b = p_action·κ_b + s_b, β_b = (1-p_action)·κ_b + f_b

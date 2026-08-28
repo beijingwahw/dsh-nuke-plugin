@@ -1,19 +1,20 @@
 // tests/oracle.test.ts — 先知引擎（概率融合 / 置信区间 / 最脆弱步骤 / 磁盘延长）
-import { describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createOracle } from '../src/engine/oracle'
-import { createLogger } from '../src/infra/logger'
-import { createAuditLog } from '../src/infra/audit-log'
-import { createReliabilityModel } from '../src/infra/reliability'
-import type { IReliabilityModel, ActionReliability } from '../src/contracts/reliability.contract'
-import type { CleanOperation, CleanRequest } from '../src/contracts/transaction'
-import type { IPathResolver } from '../src/contracts/paths'
-import type { IDiskForecaster } from '../src/contracts/disk-forecast.contract'
+
+import { describe, expect, it } from 'vitest'
+
 import type { Result } from '../src/contracts/base'
 import { ok } from '../src/contracts/base'
-import type { DiskForecast } from '../src/contracts/disk-forecast.contract'
+import type { IDiskForecaster, DiskForecast  } from '../src/contracts/disk-forecast.contract'
+import type { IPathResolver } from '../src/contracts/paths'
+import type { IReliabilityModel, ActionReliability } from '../src/contracts/reliability.contract'
+import type { CleanOperation, CleanRequest } from '../src/contracts/transaction'
+import { createOracle } from '../src/engine/oracle'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createLogger } from '../src/infra/logger'
+import { createReliabilityModel } from '../src/infra/reliability'
 
 const logger = createLogger({ sink: 'plain', minLevel: 'error' })
 

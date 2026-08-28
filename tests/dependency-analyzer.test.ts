@@ -1,9 +1,11 @@
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
-import { createDependencyAnalyzer } from '../src/engine/dependency-analyzer'
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+
 import type { PluginName, ProfileName } from '../src/contracts/base'
+import { createDependencyAnalyzer } from '../src/engine/dependency-analyzer'
 
 let home: string
 

@@ -269,12 +269,7 @@ function txDir() {
   return d;
 }
 
-function saveTx(tx) { fs.writeFileSync(path.join(txDir(), `${tx.id}.json`), JSON.stringify(tx, null, 2)); }
-function loadTx(id) {
-  const p = path.join(txDir(), `${id}.json`);
-  if (!fs.existsSync(p)) return null;
-  return JSON.parse(fs.readFileSync(p, 'utf-8'));
-}
+function saveTx(tx) { withRetrySync(() => fs.writeFileSync(path.join(txDir(), `${tx.id}.json`), JSON.stringify(tx, null, 2))); }
 function clearTx(id) {
   const p = path.join(txDir(), `${id}.json`);
   if (fs.existsSync(p)) fs.unlinkSync(p);
@@ -799,7 +794,7 @@ function cmdClean(positional, flags) {
     report.push(`  残留: ${totalResBefore} → ${totalResAfter}`);
 
     if (!dryRun) {
-      const saved = saveReport(tx, profile, strategy, totalSpaceFreed, totalResBefore, totalResAfter, healthResults, allBackups, allWarnings);
+      saveReport(tx, profile, strategy, totalSpaceFreed, totalResBefore, totalResAfter, healthResults, allBackups, allWarnings);
       report.push(c.dim(`  📄 JSON 报告: ${path.join(DSH_HOME, '.nuke-reports', `nuke-${txId}.json`)}`));
       report.push(c.dim(`  📄 Markdown 报告: ${path.join(DSH_HOME, '.nuke-reports', `nuke-${txId}.md`)}`));
       clearTx(txId);
