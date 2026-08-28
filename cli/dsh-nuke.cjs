@@ -28,12 +28,28 @@ const c = {
   bold:   s => `\x1b[1m${s}\x1b[0m`,
 };
 
+// npm 包名结构校验：字符白名单 + 结构规则。
+// 旧版只有字符白名单 —— 而 "../.." 恰由白名单字符（. 和 /）构成，
+// path.join(DSH_HOME, 'storages', '../..') 直接逃逸出 DSH_HOME，
+// 删除工具的致命路径穿越。结构规则堵死：
+//   仅允许 "name" 或 "@scope/name"（≤1 层斜杠且必须 @ 开头），
+//   禁止 .. 段 / 前导 . 或 / / 反斜杠 / 空段。
 const SAFE_RE = /^[a-z0-9@/\-_.]+$/;
 function assertSafe(value, label) {
-  if (!SAFE_RE.test(value)) {
-    console.error(c.red(`❌ ${label} 包含非法字符: "${value}"`));
+  const fail = (why) => {
+    console.error(c.red(`❌ ${label} 非法（${why}）: "${value}"`));
     process.exit(1);
-  }
+  };
+  if (typeof value !== 'string' || value.length === 0) fail('空值');
+  if (value.length > 214) fail('超长（npm 包名上限 214）');
+  if (!SAFE_RE.test(value)) fail('包含非法字符');
+  if (value.includes('\\')) fail('包含反斜杠');
+  if (value.startsWith('/') || value.startsWith('.')) fail('以 / 或 . 开头');
+  if (value.includes('..')) fail('包含 .. 路径段');
+  const parts = value.split('/');
+  if (parts.length > 2) fail('层级过深（最多 @scope/name）');
+  if (parts.length === 2 && !parts[0].startsWith('@')) fail('多段名必须以 @scope 开头');
+  if (parts.some(p => p === '')) fail('空路径段');
 }
 
 function formatBytes(bytes) {
@@ -1029,6 +1045,12 @@ function cmdRestore(positional) {
     return;
   }
 
+  // 备份文件名拼入备份目录路径 —— 只接受纯文件名（无路径分隔符，
+  // path.join(backupDir, '../../x') 会逃逸出备份区读任意文件）
+  if (file.includes('/') || file.includes('\\') || file.includes('..') || path.basename(file) !== file) {
+    console.error(c.red(`❌ 备份文件名非法: "${file}"`));
+    process.exit(1);
+  }
   const src = path.join(backupDir, file);
   if (!fs.existsSync(src)) { console.error(c.red(`❌ 文件不存在: ${file}`)); process.exit(1); }
 
@@ -1054,6 +1076,12 @@ function cmdRestore(positional) {
 
 function cmdLogs(positional) {
   const date = positional[0] || new Date().toISOString().slice(0, 10);
+  // date 拼入日志文件路径 —— 只接受 YYYY-MM-DD（其余形态一律拒绝，
+  // "../../x" 之类的注入会逃逸出日志目录读任意 .log 文件）
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    console.error(c.red(`❌ 日期格式非法（应为 YYYY-MM-DD）: "${date}"`));
+    process.exit(1);
+  }
   const logFile = path.join(DSH_HOME, '.nuke-logs', `${date}.log`);
   if (!fs.existsSync(logFile)) { console.log(`${date} 无记录。`); return; }
   const lines = fs.readFileSync(logFile, 'utf-8').split('\n').filter(Boolean);
@@ -1063,17 +1091,28 @@ function cmdLogs(positional) {
 
 function cmdReports(positional) {
   const reportDir = path.join(DSH_HOME, '.nuke-reports');
-  if (!fs.existsSync(reportDir)) { console.log('没有历史报告。'); return; }
 
+  // view by tx id：txId 与 format 均拼入报告文件路径 —— txId 只允许
+  // 事务 ID 字符集（字母数字-，无点无斜杠），format 只允许 json/md。
+  // 校验先于目录存在性早退（恶意输入无论目录状态都必须被拒）
   if (positional[0]) {
-    // view by tx id
     const txId = positional[0];
+    if (!/^[a-zA-Z0-9-]{1,64}$/.test(txId)) {
+      console.error(c.red(`❌ 事务 ID 非法: "${txId}"`));
+      process.exit(1);
+    }
     const format = positional[1] || 'md';
+    if (format !== 'json' && format !== 'md') {
+      console.error(c.red(`❌ 报告格式非法（json/md）: "${format}"`));
+      process.exit(1);
+    }
     const f = path.join(reportDir, `nuke-${txId}.${format}`);
     if (!fs.existsSync(f)) { console.error(c.red(`❌ 报告不存在: ${txId}`)); process.exit(1); }
     console.log(fs.readFileSync(f, 'utf-8'));
     return;
   }
+
+  if (!fs.existsSync(reportDir)) { console.log('没有历史报告。'); return; }
 
   const files = fs.readdirSync(reportDir).sort().reverse();
   if (files.length === 0) { console.log('没有历史报告。'); return; }
@@ -1084,6 +1123,11 @@ function cmdReports(positional) {
 function cmdSnapshot(positional) {
   const pluginName = positional[0];
   const txId = positional[1];
+
+  // 校验先于一切副作用（含 snapDir 存在性早退）—— 恶意输入必须
+  // 无论目录状态如何都被拒，不能因"没有快照"而放行穿透探测
+  if (pluginName !== undefined) assertSafe(pluginName, '插件名');
+  if (txId !== undefined) assertSafe(txId, '事务 ID');
 
   const snapDir = path.join(DSH_HOME, '.nuke-snapshots');
   if (!fs.existsSync(snapDir)) { console.log('没有快照。'); return; }
