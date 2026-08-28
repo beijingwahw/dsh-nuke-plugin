@@ -24,6 +24,9 @@ export interface PathResolverOptions {
   readonly platform?: NodeJS.Platform
 }
 
+/** 路径中的控制字符（C0 控制区 \x00-\x1f + DEL \x7f）—— 拒绝处理的硬边界 */
+const CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
+
 /** 简化 glob → RegExp：支持 * ? **（仅用于 denyGlobs 匹配） */
 export function globToRegex(glob: string): RegExp {
   let re = ''
@@ -43,6 +46,9 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
   const env = options.env ?? process.env
   const platform = options.platform ?? os.platform()
   const isWin = platform === 'win32'
+  // 大小写不敏感文件系统感知：win32 与 darwin（APFS/HFS+ 默认 case-insensitive）
+  // 的白名单匹配做 casefold；linux 保持大小写敏感。
+  const caseInsensitive = isWin || platform === 'darwin'
 
   const homeAbs = (env.HOME || env.USERPROFILE || os.homedir()) as AbsolutePath
   const tempAbs = (isWin
@@ -58,10 +64,12 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
     pathSep: isWin ? '\\' : '/',
   }
 
-  /** 归一化：win 反斜杠 → /，统一小写比较（win 大小写不敏感） */
+  /** 归一化（比较专用）：win 反斜杠 → /；NFC Unicode 归一（杜绝同形异码
+   *  —— NFD 组合字符与 NFC 预组合字符视觉相同但字节不同，不归一则白名单
+   *  可被 NFD 变体绕过）；大小写不敏感平台再统一小写（近似 casefold） */
   function normalizeForCompare(p: string): string {
-    let s = p.replace(/\\/g, '/')
-    if (isWin) s = s.toLowerCase()
+    let s = p.replace(/\\/g, '/').normalize('NFC')
+    if (caseInsensitive) s = s.toLowerCase()
     return s
   }
 
@@ -89,6 +97,15 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
     },
 
     async assertDeletable(p: string, policy: PathPolicy): Promise<Result<AbsolutePath, NukeError>> {
+      // 0) 控制字符一票否决（\x00-\x1f 与 DEL \x7f）：控制字符可干扰终端/
+      //     日志/JSON 序列化，且常为路径注入载荷 —— 先于一切解析拒绝
+      if (CONTROL_CHAR_RE.test(p)) {
+        return err({
+          code: 'E_PATH_POLICY',
+          message: `路径包含控制字符，拒绝处理: ${JSON.stringify(p.slice(0, 60))}`,
+          details: { path: p },
+        })
+      }
       const canon = await resolver.canonicalize(p)
       if (!canon.ok) return canon
 
@@ -141,10 +158,12 @@ export function createPathResolver(options: PathResolverOptions = {}): IPathReso
     },
   }
 
-  /** denyGlob 匹配：全路径命中，或（多段 glob 时）路径尾部等长段命中，或（单段时）basename 命中 */
+  /** denyGlob 匹配：全路径命中，或（多段 glob 时）路径尾部等长段命中，或（单段时）basename 命中。
+   *  glob 与路径同经 normalizeForCompare（NFC + 平台 casefold）—— 两侧归一域
+   *  一致，NFD 变体无法在任一侧绕过拒绝清单。 */
   function matchesGlob(canonPath: string, glob: string): boolean {
     const norm = normalizeForCompare(canonPath)
-    const re = globToRegex(glob)
+    const re = globToRegex(normalizeForCompare(glob))
     if (re.test(norm)) return true
     const globSegs = glob.split('/').filter(Boolean)
     if (globSegs.length > 1) {

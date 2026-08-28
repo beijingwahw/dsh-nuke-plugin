@@ -1,12 +1,52 @@
 // src/engine/severity-scorer.ts — ISeverityScorer 实现：五因子加权评分（可解释）
 // 模型：total = clamp(100 × Σ(weight_i × raw_i) / Σweight_i) ∈ [0,100]
 // 每个因子返回 raw 值、权重、贡献度与人类可读注释，UI 可展开"为什么是这个分"。
+//
+// 本轮升级（部分权重覆盖 + 贡献度百分比明细；契约字段语义不变，新输出经
+// SeverityScoreDetail / FactorContributionDetail 以协变子类型暴露）：
+//
+//   1. 部分权重覆盖：weights 从"整份 ScoringWeights"放宽为部分覆盖 ——
+//      只调想调的因子（如 aggressive 策略仅抬 reference），其余沿用
+//      DEFAULT_WEIGHTS；嵌套 bands 逐键合并（如仅抬高 high 阈值）。
+//      完整权重对象仍是合法入参（宽化向后兼容）。Σweight ≤ 0 的病态
+//      覆盖以 0 分收场（fail-closed），绝不泄漏 NaN 进 total/band。
+//
+//   2. 贡献度百分比：每个因子附带 pctOfTotal（占已挣分数的百分比，
+//      分母 = Σcontribution）—— "这个分主要是谁贡献的"一眼可见，
+//      排序/UI 高亮共用同一口径。Σcontribution = 0 → 全因子 0%。
 import type { PluginName } from '../contracts/base'
 import { fmtBytes } from '../contracts/base'
 import type {
   FactorContribution, ISeverityScorer, ResidualEvidence, ResidualKind,
   ScoringWeights, SeverityBand, SeverityScore,
 } from '../contracts/scoring'
+
+// ─── 引擎层扩展类型（contracts 只读；新输出字段在此定义并导出） ──
+
+/** 因子贡献度详情：新增"占总分的百分比"（贡献度明细） */
+export interface FactorContributionDetail extends FactorContribution {
+  /** 该因子贡献占已挣分数的百分比（%，四舍五入 1 位小数）；
+   *  Σcontribution = 0（零分或病态权重）→ 全因子 0 */
+  readonly pctOfTotal: number
+}
+
+/** 评分详情：breakdown 携带贡献度百分比（契约字段语义不变） */
+export interface SeverityScoreDetail extends SeverityScore {
+  readonly breakdown: readonly FactorContributionDetail[]
+}
+
+/** ISeverityScorer 的引擎层扩展：score/rank 返回详情（协变返回类型） */
+export interface ISeverityScorerDetail extends ISeverityScorer {
+  score(evidence: ResidualEvidence): SeverityScoreDetail
+  rank(evidences: readonly ResidualEvidence[]):
+    readonly (ResidualEvidence & { score: SeverityScoreDetail })[]
+}
+
+/** 部分权重覆盖：因子级可省略（省略 = 沿用默认）；bands 逐键合并 */
+export type WeightOverrides =
+  Omit<Partial<ScoringWeights>, 'bands'> & {
+    readonly bands?: Partial<Record<SeverityBand, number>>
+  }
 
 export const DEFAULT_WEIGHTS: ScoringWeights = {
   type: 30,      // 残留类型基础风险
@@ -32,12 +72,18 @@ const TYPE_BASE: Record<ResidualKind, number> = {
 const DAY_MS = 86_400_000
 
 export interface SeverityScorerOptions {
-  readonly weights?: ScoringWeights
+  /** 部分权重覆盖（省略的因子沿用 DEFAULT_WEIGHTS；bands 逐键合并） */
+  readonly weights?: WeightOverrides
   readonly now?: () => Date
 }
 
-export function createSeverityScorer(options: SeverityScorerOptions = {}): ISeverityScorer {
-  const w = options.weights ?? DEFAULT_WEIGHTS
+export function createSeverityScorer(options: SeverityScorerOptions = {}): ISeverityScorerDetail {
+  // 深合并：因子级 + bands 键级。整份 ScoringWeights 也是合法覆盖（向后兼容）
+  const w: ScoringWeights = {
+    ...DEFAULT_WEIGHTS,
+    ...options.weights,
+    bands: { ...DEFAULT_WEIGHTS.bands, ...options.weights?.bands },
+  }
   const now = options.now ?? (() => new Date())
   const weightSum = w.type + w.recency + w.depth + w.reference + w.size
 
@@ -102,14 +148,25 @@ export function createSeverityScorer(options: SeverityScorerOptions = {}): ISeve
     }
   }
 
-  const scorer: ISeverityScorer = {
-    score(evidence: ResidualEvidence): SeverityScore {
-      const breakdown = [
+  const scorer: ISeverityScorerDetail = {
+    score(evidence: ResidualEvidence): SeverityScoreDetail {
+      const base = [
         factorType(evidence), factorRecency(evidence), factorDepth(evidence),
         factorReference(evidence), factorSize(evidence),
       ]
+      const sumContribution = base.reduce((s, f) => s + f.contribution, 0)
+      // 贡献度百分比：占"已挣分数"的份额（分母 = Σcontribution，与 total 同源）。
+      // Σcontribution ≤ 0（零分或病态负权重）→ 全 0：不给无意义的负百分比
+      const breakdown: FactorContributionDetail[] = base.map(f => ({
+        ...f,
+        pctOfTotal: sumContribution > 0
+          ? Math.round((1000 * f.contribution) / sumContribution) / 10
+          : 0,
+      }))
+      // Σweight ≤ 0 的病态覆盖：分母退化为 1 → 分数收敛（fail-closed，防 NaN 出笼）
+      const denom = weightSum > 0 ? weightSum : 1
       const total = Math.round(
-        Math.max(0, Math.min(100, (100 * breakdown.reduce((s, f) => s + f.contribution, 0)) / weightSum)),
+        Math.max(0, Math.min(100, (100 * sumContribution) / denom)),
       )
       return {
         total,

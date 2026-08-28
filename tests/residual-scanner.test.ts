@@ -153,6 +153,43 @@ describe('ResidualScanner', () => {
     }
   })
 
+  it('progress 限频：窗口内事件合并为最后一个计数，首事件必发', async () => {
+    // 40 个插件的 profile：全局模式 = 40+ 插件 × 6 检查点 ≈ 246 个路径。
+    // 10s 窗口下真实执行远小于窗口 → 只有首事件逃出限频（洪泛被抑制）
+    const profDir = path.join(home, 'profiles', 'many-prof')
+    fs.mkdirSync(profDir, { recursive: true })
+    const deps: Record<string, string> = {}
+    for (let i = 0; i < 40; i++) deps[`p${i}-plugin`] = '^1'
+    fs.writeFileSync(path.join(profDir, 'package.json'), JSON.stringify({ dependencies: deps }))
+    try {
+      const events = await collect(createResidualScanner({
+        dshHome: home, tempRoot, progressIntervalMs: 10_000,
+      }).scan({ profile: 'many-prof' as ProfileName, strategy: 'safe', includeTemp: false }))
+      const progress = events.filter(e => e.type === 'progress')
+      expect(progress.length).toBe(1)                       // 只有首事件
+      expect((progress[0] as any).scannedPaths).toBe(1)     // 首事件在路径 1 发出
+      // found 不受限频影响：victim-plugin 的 storages 残留照常产出
+      expect(events.some(e =>
+        e.type === 'found' && (e as any).evidence.kind === 'storage')).toBe(true)
+    } finally {
+      fs.rmSync(profDir, { recursive: true, force: true })
+    }
+  })
+
+  it('progressIntervalMs=0：关闭限频，逐路径事件（旧行为兼容）', async () => {
+    const events = await collect(createResidualScanner({
+      dshHome: home, tempRoot, progressIntervalMs: 0,
+    }).scan({
+      plugin: 'victim-plugin' as PluginName,
+      profile: 'default' as ProfileName,
+      strategy: 'safe', includeTemp: false,
+    }))
+    const progress = events.filter(e => e.type === 'progress')
+    // 单插件 6 检查点：progress 在 stat 之前发出，存在与否不影响计数
+    expect(progress.length).toBe(6)
+    expect(progress.map(e => (e as any).scannedPaths)).toEqual([1, 2, 3, 4, 5, 6])
+  })
+
   it('增量缓存（突破升级）：二次扫描结果一致且全量命中缓存', async () => {
     const cacheFile = path.join(home, '.cache', 'scan-cache.json')
     const req = {

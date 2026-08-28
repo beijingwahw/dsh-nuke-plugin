@@ -32,6 +32,8 @@ function makeGuardian(opts: {
   snapshots?: { atMs: number; bytes: number }[]
   doctor?: IDoctor
   unfinished?: string[]
+  suppressionWindowMs?: number
+  clock?: Clock
 }) {
   const trend = createTrendTracker({ historyDir: path.join(tmp, `t-${Math.random().toString(36).slice(2)}`) })
   for (const s of opts.snapshots ?? []) {
@@ -41,14 +43,15 @@ function makeGuardian(opts: {
     })
   }
   const forecaster = createDiskForecaster({
-    diskRoot: tmp, trend, clock,
+    diskRoot: tmp, trend, clock: opts.clock ?? clock,
     sampleDisk: () => opts.disk,
   })
   return createGuardian({
     forecaster, trend,
     doctor: opts.doctor ?? doctorStub(),
     unfinishedTxIds: () => opts.unfinished ?? [],
-    clock,
+    clock: opts.clock ?? clock,
+    ...(opts.suppressionWindowMs !== undefined ? { suppressionWindowMs: opts.suppressionWindowMs } : {}),
   })
 }
 
@@ -144,5 +147,90 @@ describe('守卫者巡检', () => {
     expect(r.value.partialFailures.some(p => p.startsWith('disk:'))).toBe(true)
     expect(r.value.doctor).not.toBeNull()   // 体检未受影响
     expect(r.value.alerts.length).toBe(0)
+  })
+})
+
+describe('守卫者巡检（告警去重键 + 抑制窗口）', () => {
+  it('同键告警窗口内不重发，记入 suppressedAlertKeys（可观测）', async () => {
+    const g = makeGuardian({
+      disk: { free: 50 * 1024 ** 3, total: 100 * 1024 ** 3 },
+      unfinished: ['tx-abc'],
+    })
+    // 第一次：正常发出，附带去重键
+    const r1 = await g.patrol()
+    expect(r1.ok).toBe(true)
+    if (!r1.ok) return
+    expect(r1.value.alerts.length).toBe(1)
+    expect(r1.value.alerts[0]!.dedupKey).toBe('UNFINISHED_TX:tx-abc')
+    expect(r1.value.suppressedAlertKeys).toEqual([])
+    // 第二次（固定 clock → 窗口内）：同键被抑制，不再重复打扰
+    const r2 = await g.patrol()
+    expect(r2.ok).toBe(true)
+    if (!r2.ok) return
+    expect(r2.value.alerts.length).toBe(0)
+    expect(r2.value.suppressedAlertKeys).toEqual(['UNFINISHED_TX:tx-abc'])
+  })
+
+  it('窗口过期 → 同键重新发出；suppressionWindowMs=0 → 关闭抑制（旧行为）', async () => {
+    // 可变 clock：t0 巡检 → 推进 7h（越过 6h 默认窗口）→ 再巡检
+    let nowMs = Date.parse('2026-01-15T00:00:00Z')
+    const mutableClock: Clock = { now: () => new Date(nowMs) }
+    const g = makeGuardian({
+      disk: { free: 50 * 1024 ** 3, total: 100 * 1024 ** 3 },
+      unfinished: ['tx-a'],
+      clock: mutableClock,
+    })
+    const r1 = await g.patrol()
+    if (!r1.ok) return
+    expect(r1.value.alerts.length).toBe(1)
+    nowMs += 7 * 3600_000
+    const r2 = await g.patrol()
+    if (!r2.ok) return
+    expect(r2.value.alerts.length).toBe(1)            // 窗口过期 → 重发
+    expect(r2.value.suppressedAlertKeys).toEqual([])
+
+    // 窗口 = 0：每次全报（升级前的逐次行为）
+    const g0 = makeGuardian({
+      disk: { free: 50 * 1024 ** 3, total: 100 * 1024 ** 3 },
+      unfinished: ['tx-a'],
+      suppressionWindowMs: 0,
+    })
+    const a1 = await g0.patrol()
+    const a2 = await g0.patrol()
+    if (!a1.ok || !a2.ok) return
+    expect(a1.value.alerts.length).toBe(1)
+    expect(a2.value.alerts.length).toBe(1)
+    expect(a2.value.suppressedAlertKeys).toEqual([])
+  })
+
+  it('告警解除后复发 → 重新计时；事务集合变化 → 新键立即上报', async () => {
+    const opts: { disk: { free: number; total: number }; unfinished: string[] } = {
+      disk: { free: 50 * 1024 ** 3, total: 100 * 1024 ** 3 },
+      unfinished: ['tx-a'],
+    }
+    const g = makeGuardian(opts)
+    // 发出 tx-a
+    const r1 = await g.patrol()
+    if (!r1.ok) return
+    expect(r1.value.alerts.map(a => a.dedupKey)).toEqual(['UNFINISHED_TX:tx-a'])
+    // 告警解除（事务已恢复）→ 无告警也无抑制
+    opts.unfinished = []
+    const r2 = await g.patrol()
+    if (!r2.ok) return
+    expect(r2.value.alerts.length).toBe(0)
+    expect(r2.value.suppressedAlertKeys).toEqual([])
+    // 复发（新事务 tx-b）：旧记忆已清除 → 立即上报
+    opts.unfinished = ['tx-b']
+    const r3 = await g.patrol()
+    if (!r3.ok) return
+    expect(r3.value.alerts.map(a => a.dedupKey)).toEqual(['UNFINISHED_TX:tx-b'])
+    // 同集合重复 → 抑制；集合扩容（新的事务组合）→ 新键立即上报
+    const r4 = await g.patrol()
+    if (!r4.ok) return
+    expect(r4.value.suppressedAlertKeys).toEqual(['UNFINISHED_TX:tx-b'])
+    opts.unfinished = ['tx-a', 'tx-b']
+    const r5 = await g.patrol()
+    if (!r5.ok) return
+    expect(r5.value.alerts.map(a => a.dedupKey)).toEqual(['UNFINISHED_TX:tx-a,tx-b'])
   })
 })

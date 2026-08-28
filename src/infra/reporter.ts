@@ -1,10 +1,12 @@
 // src/infra/reporter.ts — IReporter 实现：JSON（机器）/ Markdown（人类）双格式导出
+// V5：双格式均追加汇总统计区（按动作分组的回收量/事务数/成功率/总回收）——
+// 数据全部从传入 payload 推导，旧字段与旧段落格式不动（追加式扩展）。
 import * as fs from 'fs'
 import * as path from 'path'
-import type { NukeError, Result } from '../contracts/base'
+import type { CleanAction, NukeError, Result } from '../contracts/base'
 import { err, fmtBytes, ioError, ok } from '../contracts/base'
 import type {
-  IReporter, ReportFormat, ReportPayload,
+  ActionReclaimStat, IReporter, ReportFormat, ReportPayload, ReportSummary,
 } from '../contracts/logging'
 
 export interface ReporterOptions {
@@ -23,6 +25,44 @@ export function createReporter(options: ReporterOptions): IReporter {
 
   function statusIcon(passed: boolean): string {
     return passed ? '✅' : '❌'
+  }
+
+  /** 汇总统计：按动作分组的回收量 / 事务数 / 步骤成功率 / 总回收。
+   *  事务取实际回收（tx.steps），纯预演取预估（dryRun.actions），均无则零值。 */
+  function buildSummary(payload: ReportPayload): ReportSummary {
+    const byAction = new Map<CleanAction, ActionReclaimStat>()
+
+    if (payload.tx) {
+      for (const s of payload.tx.steps) {
+        const prev = byAction.get(s.action)
+        byAction.set(s.action, {
+          action: s.action,
+          steps: (prev?.steps ?? 0) + 1,
+          bytesFreed: (prev?.bytesFreed ?? 0) + s.bytesFreed,
+        })
+      }
+    } else if (payload.dryRun?.actions) {
+      for (const a of payload.dryRun.actions) {
+        const prev = byAction.get(a.action)
+        byAction.set(a.action, {
+          action: a.action,
+          steps: (prev?.steps ?? 0) + 1,
+          bytesFreed: (prev?.bytesFreed ?? 0) + a.estimatedBytes,
+        })
+      }
+    }
+
+    const steps = payload.tx?.steps ?? []
+    const succeeded = steps.filter(s => s.status === 'done' || s.status === 'skipped').length
+    const rate = steps.length > 0 ? succeeded / steps.length : null
+
+    return {
+      totalBytesFreed: payload.tx?.bytesFreedTotal
+        ?? payload.dryRun?.estimatedBytesReclaimable ?? 0,
+      txCount: payload.tx ? 1 : 0,
+      successRate: rate,
+      byAction: [...byAction.values()].sort((a, b) => b.bytesFreed - a.bytesFreed),
+    }
   }
 
   function renderMarkdown(payload: ReportPayload): string {
@@ -70,6 +110,20 @@ export function createReporter(options: ReporterOptions): IReporter {
       }
     }
 
+    // ── V5 汇总统计区（追加式：数据由 payload 推导，旧段落不受影响） ──
+    const summary = buildSummary(payload)
+    L.push('## 汇总统计', '')
+    L.push(`- **总回收**: ${fmtBytes(summary.totalBytesFreed)}`)
+    L.push(`- **事务数**: ${summary.txCount}`)
+    L.push(`- **步骤成功率**: ${summary.successRate === null ? '—' : `${(summary.successRate * 100).toFixed(0)}%`}`)
+    if (summary.byAction.length > 0) {
+      L.push('', '| 动作 | 步骤数 | 释放量 |', '|---|---|---|')
+      for (const a of summary.byAction) {
+        L.push(`| ${a.action} | ${a.steps} | ${fmtBytes(a.bytesFreed)} |`)
+      }
+    }
+    L.push('')
+
     L.push('## 健康检查', '')
     L.push('| 状态 | 检查项 | 结果 | 级别 | 分组 |', '|---|---|---|---|---|')
     for (const h of payload.health) {
@@ -99,7 +153,8 @@ export function createReporter(options: ReporterOptions): IReporter {
         const name = baseName(payload)
         const file = path.join(options.reportsRoot, `${name}.${format === 'json' ? 'json' : 'md'}`)
         const content = format === 'json'
-          ? JSON.stringify(payload, null, 2)
+          // JSON 追加式扩展：旧字段原样保留，仅新增 summary 汇总统计键
+          ? JSON.stringify({ ...payload, summary: buildSummary(payload) }, null, 2)
           : renderMarkdown(payload)
         fs.writeFileSync(file, content, 'utf-8')
         return ok({ path: file, bytes: Buffer.byteLength(content) })

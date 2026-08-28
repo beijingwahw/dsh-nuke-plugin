@@ -108,10 +108,16 @@ export function createScanCache(options: ScanCacheOptions): IScanCache {
       // maxAgeMs=0 语义 = 禁用缓存（age >= 0 恒真）
       if (Date.now() - hit.cachedAt >= maxAgeMs) { misses++; return null }
       hits++
-      // LRU 热度刷新
+      // 命中 touch：刷新 LRU 热度【且】重置新鲜度（cachedAt 从最近命中
+      // 重新起算 —— 持续被使用的热条目不会因 TTL 过期而被驱逐；
+      // 嵌套原地改写的兜底由未被再次命中的冷条目 TTL 承担，语义更贴合
+      // "活跃数据信任、闲置数据过期"的缓存直觉）。
+      // 仅更新内存态、不置 dirty：命中路径必须保持零 IO（逐次落盘会把
+      // 加速器退化成 IO 放大器），重启后新鲜度回到上次 flush 时点。
+      const touched: PersistedEntry = { ...hit, cachedAt: Date.now() }
       cache.delete(filePath)
-      cache.set(filePath, hit)
-      return hit
+      cache.set(filePath, touched)
+      return touched
     },
 
     set(filePath, entry) {

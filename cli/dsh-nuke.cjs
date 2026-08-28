@@ -1,11 +1,14 @@
 #!/usr/bin/env node
-// dsh-nuke CLI V3 — DeepSeek Harness 插件强力卸载工具
+// dsh-nuke CLI V4 — DeepSeek Harness 插件强力卸载工具
 // 零依赖，仅需 Node.js。dsh 系统崩溃时仍可运行。
-// 与插件版共享锁、备份、日志、快照目录。
+// 与插件版共享 V4 锁协议（.nuke/locks/）与备份、日志、快照目录 —— 并发清理真正互斥。
+// V4 升级：锁协议对齐插件版（O_EXCL + bootToken + 安全破锁）· --json 机器可读输出
+//          --version · 崩溃兜底 · symlink/深度防护遍历 · 瞬态 IO 重试 · 修复 strategies undefined 缺陷
 
 const { spawnSync } = require('child_process');
 const crypto = require('crypto');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 
 // ═══════════════════════════════════════════════════════════
@@ -40,17 +43,37 @@ function formatBytes(bytes) {
   return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
+// 遍历纪律（与插件版 fs-utils 对齐）：不走 symlink（防逃逸与环）、限制深度（防病态深目录拖死）
+const MAX_WALK_DEPTH = 64;
+
+// 瞬态错误集合（与插件版 TRANSIENT_ERRNO_CODES 同源）：这类失败退避重试通常可自愈
+const TRANSIENT_ERRNOS = new Set(['EMFILE', 'ENFILE', 'EBUSY', 'EAGAIN', 'EINTR']);
+
+/** 同步瞬态重试：指数退避（25ms → 100ms 封顶）。仅包装关键 IO，非瞬态错误立即抛出 */
+function withRetrySync(fn, attempts = 3) {
+  for (let i = 0; ; i++) {
+    try { return fn(); } catch (e) {
+      const code = e && e.code;
+      if (i >= attempts - 1 || !TRANSIENT_ERRNOS.has(code)) throw e;
+      const delay = Math.min(25 * Math.pow(2, i), 100);
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay); // 同步 sleep
+    }
+  }
+}
+
 function dirSize(dirPath) {
   if (!fs.existsSync(dirPath)) return 0;
   let total = 0;
-  const stack = [dirPath];
+  const stack = [{ dir: dirPath, depth: 0 }];
   while (stack.length > 0) {
-    const dir = stack.pop();
+    const { dir, depth } = stack.pop();
+    if (depth > MAX_WALK_DEPTH) continue;
     try {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, entry.name);
+        // entry.isSymbolicLink() 显式排除：symlink 目录既不下钻也不计体积（防逃逸/防环）
         if (entry.isFile()) { try { total += fs.statSync(full).size; } catch {} }
-        else if (entry.isDirectory()) { stack.push(full); }
+        else if (entry.isDirectory() && !entry.isSymbolicLink()) { stack.push({ dir: full, depth: depth + 1 }); }
       }
     } catch {}
   }
@@ -67,11 +90,13 @@ function hashDir(dirPath) {
   return hash.digest('hex').slice(0, 16);
 }
 
-function walkDir(dir, cb) {
+function walkDir(dir, cb, depth = 0) {
+  if (depth > MAX_WALK_DEPTH) return;
   try {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walkDir(full, cb);
+      // 不沿 symlink 下钻：目录环（a→b→a）会在深度限制内绕死进程
+      if (entry.isDirectory() && !entry.isSymbolicLink()) walkDir(full, cb, depth + 1);
       else if (entry.isFile()) cb(full);
     }
   } catch {}
@@ -107,35 +132,131 @@ function backupFile(filePath) {
 //  并发锁（与插件版共享）
 // ═══════════════════════════════════════════════════════════
 
-const LOCK_FILE = path.join(DSH_HOME, '.nuke.lock');
+const LOCK_DIR = path.join(DSH_HOME, '.nuke', 'locks');
+const LOCK_FILE = path.join(LOCK_DIR, 'global.lock');       // CLI 全局独占锁（V4 协议）
+const LEGACY_LOCK_FILE = path.join(DSH_HOME, '.nuke.lock'); // V3 遗留锁（兼容探测）
+const LOCK_TTL_MS = 300000;
+const CLI_BOOT_TOKEN = `cli-${crypto.randomBytes(8).toString('hex')}`;
+
+/** 进程存活探测（与插件版 ProcessProbe 同语义：pid + hostname 双重核验） */
+function isProcessAlive(pid, hostname) {
+  if (hostname && hostname !== os.hostname()) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** 读取 V4 锁文件（结构非法视为无锁） */
+function readV4Lock(p) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(p, 'utf-8'));
+    if (typeof parsed !== 'object' || parsed === null) return null;
+    if (parsed.version !== 1) return null;
+    if (!Array.isArray(parsed.owners)) return null;
+    return parsed;
+  } catch { return null; }
+}
+
+/** 判断一个 V4 锁文件是否存在"活跃"持有者（未过期且进程存活） */
+function hasActiveOwner(lock) {
+  if (!lock) return false;
+  const now = Date.now();
+  return lock.owners.some(o => {
+    const alive = o.owner && typeof o.owner.pid === 'number' && isProcessAlive(o.owner.pid, o.owner.hostname);
+    return o.expiresAt > now && alive;
+  });
+}
+
+/** 扫描插件版/CLI 留下的全部 V4 锁，返回活跃锁描述（供互斥判断与提示） */
+function findActiveV4Locks() {
+  const active = [];
+  try {
+    for (const f of fs.readdirSync(LOCK_DIR)) {
+      if (!f.endsWith('.lock')) continue;
+      const p = path.join(LOCK_DIR, f);
+      const lock = readV4Lock(p);
+      if (hasActiveOwner(lock)) {
+        const o = lock.owners[0].owner;
+        active.push({ file: f, pid: o.pid, purpose: o.purpose || 'unknown' });
+      }
+    }
+  } catch {}
+  return active;
+}
+
+/** 安全破锁：所有 owner 均过期且死亡 → 清除；任一活跃 → 返回 false */
+function breakStaleV4Lock(p) {
+  const lock = readV4Lock(p);
+  if (!lock) return true; // 已消失
+  if (hasActiveOwner(lock)) return false;
+  try { fs.unlinkSync(p); } catch {}
+  return true;
+}
 
 function acquireLock(operation) {
-  if (fs.existsSync(LOCK_FILE)) {
+  fs.mkdirSync(LOCK_DIR, { recursive: true });
+
+  // 1) V3 遗留锁兼容探测：未超时的旧锁同样构成互斥（升级窗口期保护）
+  if (fs.existsSync(LEGACY_LOCK_FILE)) {
     try {
-      const info = JSON.parse(fs.readFileSync(LOCK_FILE, 'utf-8'));
+      const info = JSON.parse(fs.readFileSync(LEGACY_LOCK_FILE, 'utf-8'));
       const elapsed = Date.now() - new Date(info.startedAt).getTime();
-      if (elapsed > info.timeout) { fs.unlinkSync(LOCK_FILE); }
-      else {
-        console.error(c.red(`🔒 另一个 nuke 操作正在进行（PID: ${info.pid}，操作: ${info.operation}，已运行 ${Math.round(elapsed / 1000)}s）`));
+      if (elapsed <= (info.timeout || 300000)) {
+        console.error(c.red(`🔒 检测到 V3 遗留锁（PID: ${info.pid}，已运行 ${Math.round(elapsed / 1000)}s）。请等待其完成或升级插件版后重试。`));
         process.exit(1);
       }
-    } catch { fs.unlinkSync(LOCK_FILE); }
+      fs.unlinkSync(LEGACY_LOCK_FILE);
+    } catch { try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch {} }
   }
+
+  // 2) V4 互斥：global.lock 已存在 → 尝试安全破锁，破不动即拒绝
+  if (fs.existsSync(LOCK_FILE)) {
+    const holder = readV4Lock(LOCK_FILE);
+    if (holder && !breakStaleV4Lock(LOCK_FILE)) {
+      const o = holder.owners[0].owner;
+      console.error(c.red(`🔒 另一个 nuke 操作持有全局锁（PID: ${o.pid}，用途: ${o.purpose || 'unknown'}）`));
+      console.error(c.dim('   破锁纪律：仅当持有者进程死亡且 TTL 过期时自动清除；否则请等待其完成。'));
+      process.exit(1);
+    }
+  }
+
+  // 3) 探测其他作用域的活跃 exclusive 锁（插件版并发清理中 → CLI 让路）
+  const others = findActiveV4Locks().filter(l => l.file !== 'global.lock');
+  if (others.length > 0) {
+    const desc = others.map(l => `${l.file}(PID ${l.pid}, ${l.purpose})`).join(', ');
+    console.error(c.red(`🔒 检测到并发清理进行中: ${desc}`));
+    process.exit(1);
+  }
+
+  // 4) O_EXCL 原子创建（与插件版 writeLockAtomic 同构）
   try {
     const fd = fs.openSync(LOCK_FILE, 'wx');
     fs.writeSync(fd, JSON.stringify({
-      pid: process.pid, startedAt: new Date().toISOString(),
-      operation, timeout: 300000,
+      version: 1,
+      scope: 'global',
+      mode: 'exclusive',
+      owners: [{
+        owner: {
+          pid: process.pid, hostname: os.hostname(),
+          bootToken: CLI_BOOT_TOKEN, purpose: `cli:${operation}`,
+        },
+        acquiredAt: new Date().toISOString(),
+        expiresAt: Date.now() + LOCK_TTL_MS,
+      }],
     }, null, 2));
     fs.closeSync(fd);
   } catch {
-    console.error(c.red('❌ 无法创建锁文件'));
+    console.error(c.red('❌ 无法创建锁文件（可能存在并发竞争，请重试）'));
     process.exit(1);
   }
 }
 
 function releaseLock() {
-  try { if (fs.existsSync(LOCK_FILE)) fs.unlinkSync(LOCK_FILE); } catch {}
+  // 只清除自己的锁：确认锁内 bootToken 归属，防止误删他人刚重建的锁
+  try {
+    const lock = readV4Lock(LOCK_FILE);
+    if (lock && lock.owners.some(o => o.owner && o.owner.bootToken === CLI_BOOT_TOKEN)) {
+      fs.unlinkSync(LOCK_FILE);
+    }
+  } catch {}
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -694,9 +815,23 @@ function cmdScan(positional, flags) {
   assertSafe(profile, 'profile');
 
   const residuals = scanResiduals(profile, pluginName);
+  const totalSize = residuals.reduce((s, r) => s + r.sizeBytes, 0);
+
+  // --json：机器可读输出（CI/脚本消费），一条 JSON 到 stdout，人类提示全部进 stderr
+  if (flags.json) {
+    console.log(JSON.stringify({
+      command: 'scan', plugin: pluginName, profile,
+      residuals: residuals.map(r => ({
+        description: r.description, location: r.location,
+        severity: r.severity, sizeBytes: r.sizeBytes, action: r.action || null,
+      })),
+      totalResiduals: residuals.length, totalSizeBytes: totalSize,
+    }));
+    return;
+  }
+
   if (residuals.length === 0) { console.log(c.green(`✅ "${pluginName}" 无残留。`)); return; }
 
-  const totalSize = residuals.reduce((s, r) => s + r.sizeBytes, 0);
   console.log(c.yellow(`⚠️ 发现 ${residuals.length} 处残留（共 ${formatBytes(totalSize)}）：`));
   residuals.forEach((r, i) => {
     const bar = '█'.repeat(r.severity) + '░'.repeat(5 - r.severity);
@@ -714,6 +849,13 @@ function cmdDeps(positional, flags) {
   assertSafe(profile, 'profile');
 
   const deps = checkDependents(profile, pluginName);
+  if (flags.json) {
+    console.log(JSON.stringify({
+      command: 'deps', plugin: pluginName, profile,
+      dependents: deps, blocked: deps.length > 0,
+    }));
+    return;
+  }
   if (deps.length === 0) { console.log(c.green(`✅ 没有其他插件依赖 "${pluginName}"。`)); return; }
   console.log(c.red(`🚨 ${deps.length} 个插件依赖 "${pluginName}"：`));
   deps.forEach((d, i) => console.log(c.red(`  ${i + 1}. ${d}`)));
@@ -721,10 +863,17 @@ function cmdDeps(positional, flags) {
 
 function cmdSweep(flags) {
   const profiles = listProfiles();
-  if (profiles.length === 0) { console.log('未找到任何 profile。'); return; }
+  if (profiles.length === 0) {
+    if (flags.json) console.log(JSON.stringify({ command: 'sweep', profiles: [], orphans: [], total: 0 }));
+    else console.log('未找到任何 profile。');
+    return;
+  }
 
-  console.log(c.bold('🧹 全局孤儿扫描'));
-  console.log('═'.repeat(55));
+  const jsonOut = { command: 'sweep', profiles, orphans: [], total: 0 };
+  if (!flags.json) {
+    console.log(c.bold('🧹 全局孤儿扫描'));
+    console.log('═'.repeat(55));
+  }
   let total = 0;
 
   for (const profile of profiles) {
@@ -742,18 +891,21 @@ function cmdSweep(flags) {
       }
     }
 
-    if (orphans.size > 0) {
-      console.log(`\n${c.cyan(`📁 profile "${profile}"`)}`);
-      for (const id of orphans) {
-        total++;
-        const res = scanResiduals(profile, id);
+    if (orphans.size > 0 && !flags.json) console.log(`\n${c.cyan(`📁 profile "${profile}"`)}`);
+    for (const id of orphans) {
+      total++;
+      const res = scanResiduals(profile, id);
+      const size = res.reduce((s, r) => s + r.sizeBytes, 0);
+      jsonOut.orphans.push({ profile, id, residuals: res.length, sizeBytes: size });
+      if (!flags.json) {
         const icon = res.length > 0 ? c.red('🔴') : c.green('🟢');
-        const size = res.reduce((s, r) => s + r.sizeBytes, 0);
         console.log(`  ${icon} ${id} (${res.length} 处残留, ${formatBytes(size)})`);
       }
     }
   }
+  jsonOut.total = total;
 
+  if (flags.json) { console.log(JSON.stringify(jsonOut)); return; }
   if (total === 0) console.log('\n' + c.green('✅ 系统干干净净！'));
   else console.log(`\n共 ${total} 个孤儿配置。使用 clean 子命令清理。`);
 }
@@ -762,6 +914,13 @@ function cmdHealth(flags) {
   const profile = flags.profile || 'web';
   assertSafe(profile, 'profile');
   const results = runHealthChecks(profile);
+  if (flags.json) {
+    console.log(JSON.stringify({
+      command: 'health', profile,
+      checks: results, passed: results.filter(r => r.passed).length, total: results.length,
+    }));
+    return;
+  }
   console.log(c.bold(`🏥 系统健康检查 (${profile})\n`));
   results.forEach(hr => {
     const icon = hr.passed ? c.green('✅') : c.red('🔴');
@@ -870,8 +1029,8 @@ function cmdSnapshot(positional) {
 
 function cmdStrategies() {
   console.log(c.bold('可用清理策略：\n'));
-  for (const [, s] of Object.entries(STRATEGIES)) {
-    console.log(`${c.bold(s.label)} (${s.name})`);
+  for (const [name, s] of Object.entries(STRATEGIES)) {
+    console.log(`${c.bold(s.label)} (${name})`);
     console.log(`  ${s.description}`);
     console.log(`  动作: ${s.actions.join(', ')}\n`);
   }
@@ -894,10 +1053,32 @@ for (let i = 0; i < restArgs.length; i++) {
   else if (restArgs[i] === '--strategy') { flags.strategy = restArgs[++i]; }
   else if (restArgs[i] === '--skip-standard') { flags.skipStandard = true; }
   else if (restArgs[i] === '--skip-health')   { flags.skipHealth = true; }
+  else if (restArgs[i] === '--json')     { flags.json = true; }   // 机器可读输出（scan/deps/health/sweep）
+  else if (restArgs[i] === '--version' || restArgs[i] === '-v') { flags.version = true; }
   else { positional.push(restArgs[i]); }
 }
 
+// 崩溃兜底：任何未捕获异常都以 fail-closed 姿态退出并提示，不裸抛栈压过用户视线
+process.on('uncaughtException', err => {
+  try { releaseLock(); } catch {}
+  console.error(c.red(`❌ dsh-nuke 发生未捕获异常: ${err && err.message ? err.message : err}`));
+  console.error(c.dim('   这不应发生，请携带以上信息提 issue: https://github.com/beijingwahw/dsh-nuke-plugin/issues'));
+  process.exit(1);
+});
+
+// help/version 不依赖 DSH_HOME（排障时可能恰好环境损坏，最需要看到用法）
+// 注意 --version 可独立于子命令出现（此时它占据 command 位，不进 flags 解析）
+if (flags.version || command === '--version' || command === '-v') {
+  console.log(require('../package.json').version || '0.0.0');
+  process.exit(0);
+}
+
 if (!fs.existsSync(DSH_HOME)) {
+  // help 例外：环境缺失时仍允许看用法
+  if (command === '-h' || command === '--help' || command === 'help' || command === undefined) {
+    printHelp();
+    process.exit(0);
+  }
   console.error(c.red(`❌ DSH_HOME 不存在: ${DSH_HOME}`));
   console.error(c.dim('   请确认 DeepSeek Harness 已安装，或设置 DSH_HOME 环境变量。'));
   process.exit(1);
@@ -931,7 +1112,8 @@ function printHelp() {
 ${c.bold('dsh-nuke')} — DeepSeek Harness 插件强力卸载工具（独立 CLI 版）
 
 ${c.cyan('特点:')} 零依赖，仅需 Node.js。dsh 系统崩溃时仍可运行。
-       与插件版共享锁、备份、日志、快照目录。
+       与插件版共享 V4 锁协议（.nuke/locks/）与备份/日志/快照目录，
+       CLI 与插件并发清理真正互斥。
 
 ${c.cyan('子命令:')}
   clean <插件...>       强力卸载（支持多个，逗号或空格分隔）
@@ -951,15 +1133,18 @@ ${c.cyan('通用选项:')}
   --dry-run             仅预览，不执行
   --skip-standard       跳过标准卸载
   --skip-health         跳过健康检查
+  --json                机器可读输出（scan / deps / sweep / health）
+  --version, -v         输出版本号
 
 ${c.cyan('示例:')}
   node dsh-nuke.js clean powercontext-dsh
   node dsh-nuke.js clean plugin-a plugin-b --strategy aggressive
   node dsh-nuke.js clean powercontext-dsh --dry-run
   node dsh-nuke.js scan powercontext-dsh
+  node dsh-nuke.js scan powercontext-dsh --json
   node dsh-nuke.js deps powercontext-dsh
   node dsh-nuke.js sweep
-  node dsh-nuke.js health
+  node dsh-nuke.js health --json
   node dsh-nuke.js restore
   node dsh-nuke.js restore cordis.patch.yml.2026-08-16T10-00-00-000Z.bak
   node dsh-nuke.js logs

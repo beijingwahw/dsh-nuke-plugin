@@ -183,6 +183,38 @@ describe('事务引擎', () => {
     expect(fs.readFileSync(path.join(home, 'cordis.patch.yml'), 'utf-8')).toContain('victim-plugin')
   })
 
+  it('V4.1 dry-run 动作明细：带 riskLevel 元数据的操作 → actions 填充；旧式操作 → actions 缺省', async () => {
+    seedWorkspace()
+    // 1) 带 V4 元数据的操作 → actions 逐条填充（action/target/riskLevel/estimatedBytes）
+    const withMeta = opRemoveStorage()
+    const detailed = {
+      ...withMeta,
+      riskLevel: 'medium' as const,
+      description: '删除插件 storages 数据目录',
+    }
+    const engine1 = buildEngine(() => [detailed, opEditPatch()])
+    const s1 = await engine1.begin(request({ dryRun: true }))
+    const rep1 = await engine1.dryRun(okv(await engine1.plan(okv(s1))))
+    expect(rep1.ok).toBe(true)
+    if (rep1.ok) {
+      expect(rep1.value.actions).toBeDefined()
+      const actions = rep1.value.actions!
+      expect(actions.length).toBe(1)   // 只有带元数据的操作进入明细
+      expect(actions[0]!.action).toBe('remove-storages')
+      expect(actions[0]!.target).toBe('victim-plugin')
+      expect(actions[0]!.riskLevel).toBe('medium')
+      expect(actions[0]!.estimatedBytes).toBeGreaterThan(0)
+    }
+    // 2) 旧式操作（无 riskLevel）→ actions 保持 undefined（向后兼容）
+    await engine1.rollback(okv(s1).txId)   // 释放锁，与生产路径 dry-run 后 rollback 一致
+    const engine2 = buildEngine(() => [opRemoveStorage(), opEditPatch()])
+    const s2 = await engine2.begin(request({ dryRun: true }))
+    const rep2 = await engine2.dryRun(okv(await engine2.plan(okv(s2))))
+    expect(rep2.ok).toBe(true)
+    if (rep2.ok) expect(rep2.value.actions).toBeUndefined()
+    await engine2.rollback(okv(s2).txId)
+  })
+
   it('aggressive 无令牌 → begin 拒绝', async () => {
     seedWorkspace()
     const engine = buildEngine(() => [opRemoveStorage()])

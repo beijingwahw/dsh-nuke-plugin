@@ -4,7 +4,7 @@
 //  2. IAuditLog    审计日志：hash chain 不可变，任何篡改可被 verify() 检出
 //  3. IReporter    报告导出：JSON（机器）/ Markdown（人类）
 
-import type { NukeError, Result, TxId } from './base'
+import type { CleanAction, NukeError, Result, TxId } from './base'
 import type { TxSummary, DryRunReport } from './transaction'
 import type { HealthCheckResult } from './health.contract'
 
@@ -78,6 +78,31 @@ export interface ReportPayload {
   readonly auditTrail: readonly HashedAuditEntry[]
   readonly generatedAt: string
   readonly chainValid: boolean   // 审计链是否验证通过
+}
+
+// ─── V5 增量：报告汇总统计区 ────────────────────────────────
+// 数据全部从传入 payload 推导（tx.steps / dryRun.actions），不改变
+// ReportPayload 既有字段语义；reporter 导出时追加呈现，旧字段不动。
+
+/** 按动作分组的回收量统计（事务取实际回收，预演取预估量） */
+export interface ActionReclaimStat {
+  readonly action: CleanAction
+  /** 该动作的步骤数（事务步骤 / 预演动作条目） */
+  readonly steps: number
+  /** 该动作累计回收字节（事务 = 实际 bytesFreed；预演 = estimatedBytes） */
+  readonly bytesFreed: number
+}
+
+/** 报告级汇总统计 */
+export interface ReportSummary {
+  /** 总回收字节（tx 存在取 bytesFreedTotal；否则 dryRun 预估；均无 = 0） */
+  readonly totalBytesFreed: number
+  /** 覆盖的事务数（含 tx = 1，纯预演不计） */
+  readonly txCount: number
+  /** 步骤成功率（done+skipped / 全部步骤），0~1；无步骤时为 null */
+  readonly successRate: number | null
+  /** 按动作分组的回收量统计（按 bytesFreed 降序） */
+  readonly byAction: readonly ActionReclaimStat[]
 }
 
 export interface IReporter {

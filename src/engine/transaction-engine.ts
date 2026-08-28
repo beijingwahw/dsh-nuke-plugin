@@ -11,9 +11,9 @@ import type {
 } from '../contracts/base'
 import { err, errorToMessage, ioError, ok, SimulatedCrashError } from '../contracts/base'
 import type {
-  BackupRecord, CleanOperation, CleanRequest, DryRunReport, IBackupStore,
-  ITransactionEngine, IWal, OperationPlan, PlanWarning, TxContext, TxPlan,
-  TxSession, TxState, TxSummary,
+  BackupRecord, CleanOperation, CleanRequest, DryRunActionDetail, DryRunReport,
+  IBackupStore, ITransactionEngine, IWal, OperationPlan, PlanWarning, TxContext,
+  TxPlan, TxSession, TxState, TxSummary,
 } from '../contracts/transaction'
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX } from '../contracts/logging'
@@ -21,6 +21,7 @@ import type { ILockManager, LockOwner } from '../contracts/lock'
 import type { IPathResolver } from '../contracts/paths'
 import type { ILogger } from '../contracts/logging'
 import type { IHookRegistry, HookContext } from '../contracts/hooks'
+import { forEachPool } from '../infra/fs-utils'
 
 export interface EngineDeps {
   readonly lockManager: ILockManager
@@ -39,6 +40,26 @@ export interface EngineDeps {
   readonly crashAfterStep?: number
 }
 
+/** V5：引擎行为选项（全部缺省安全，不传即沿用 V4 语义） */
+export interface TransactionEngineOptions {
+  /** dryRun 预演并发度（有界并发池 lane 数），默认 4。
+   *  并发只加速 IO 等待，输出仍严格按 plan 顺序收集（索引序而非完成序）。 */
+  readonly previewConcurrency?: number
+}
+
+/** V5：步骤运行时形态 —— 在契约步骤之上可选携带 execute 耗时（毫秒）。
+ *  durationMs 为本模块新增的可选字段，非字面量赋值对契约消费方结构兼容。 */
+export type TxStepWithDuration = TxSummary['steps'][number] & {
+  readonly durationMs?: number
+}
+
+/** V5：附带各步耗时的事务摘要（TxSummary 的结构化超集，向后兼容） */
+export type TxSummaryWithStepTimings = Omit<TxSummary, 'steps'> & {
+  readonly steps: readonly TxStepWithDuration[]
+}
+
+const DEFAULT_PREVIEW_CONCURRENCY = 4
+
 /** 状态机合法迁移表 */
 const TRANSITIONS: Record<TxState, readonly TxState[]> = {
   draft: ['planned'],
@@ -54,7 +75,7 @@ interface TxRuntime {
   readonly txId: TxId
   state: TxState
   request: CleanRequest
-  steps: TxSummary['steps'][number][]
+  steps: TxStepWithDuration[]
   startedAt: string
   finishedAt?: string
   lockHandle: Awaited<ReturnType<ILockManager['acquire']>> extends Result<infer H, any> ? H : never
@@ -68,8 +89,13 @@ interface TxRuntime {
 export function createTransactionEngine(
   deps: EngineDeps,
   operationFactory: (request: CleanRequest) => CleanOperation[],
+  options: TransactionEngineOptions = {},
 ): ITransactionEngine {
   const runtimes = new Map<TxId, TxRuntime>()
+  /** dryRun 并发度：非法值（0/负/非整数）回退默认，永不产生无界并发 */
+  const previewConcurrency = Number.isInteger(options.previewConcurrency) && (options.previewConcurrency ?? 0) >= 1
+    ? (options.previewConcurrency as number)
+    : DEFAULT_PREVIEW_CONCURRENCY
   /** 终结事务摘要缓存（commit/rollback 后仍可 status 查询；进程重启后回退 WAL 重建）。
    *  LRU 上限：长驻进程中无限增长的 Map 是慢性内存泄漏；溢出逐最旧，
    *  被逐条目仍可从 WAL 重建（status 的第三路径）。 */
@@ -177,7 +203,7 @@ export function createTransactionEngine(
     runtimes.delete(rt.txId)
   }
 
-  function summarize(rt: TxRuntime, txId: TxId): TxSummary {
+  function summarize(rt: TxRuntime, txId: TxId): TxSummaryWithStepTimings {
     return {
       txId,
       state: rt.state,
@@ -316,19 +342,46 @@ export function createTransactionEngine(
       const rt = runtimes.get(plan.txId)
       if (!rt) return err({ code: 'E_TX_NOT_FOUND', message: `事务不存在: ${plan.txId}` })
       const ctx = makeCtxFromRt(rt)
+      // V5：预演并行化（有界并发池）。forEachPool 的结果槽按输入索引填充，
+      // 因此无论各 preview 完成先后，输出顺序都与 plan.operations 严格一致。
+      const settled = await forEachPool(plan.operations, previewConcurrency,
+        async op => ({ op, preview: await op.preview(ctx) }))   // 零副作用
       const reports: { operation: OperationPlan; summary: string }[] = []
+      const actionDetails: DryRunActionDetail[] = []
       let total = 0
-      for (const op of plan.operations) {
-        const p = await op.preview(ctx)   // 零副作用
+      let firstFailure: unknown
+      for (const r of settled) {
+        // 单个 preview 异常不再炸掉整批：结果仍按索引序产出，首个异常统一上报
+        if (r.status === 'rejected') {
+          if (firstFailure === undefined) firstFailure = r.reason
+          continue
+        }
+        const { op, preview: p } = r.value
         rt.estimates.set(op.id, p.estimatedBytesReclaimable)
         total += p.estimatedBytesReclaimable
         reports.push({ operation: p, summary: p.summary })
+        // V4.1：动作级明细（操作集编译器注入了 riskLevel 元数据时填充；旧注入路径保持旧形态）
+        if (op.riskLevel !== undefined) {
+          actionDetails.push({
+            action: op.action,
+            target: op.target,
+            riskLevel: op.riskLevel,
+            description: op.description ?? op.action,
+            estimatedBytes: p.estimatedBytesReclaimable,
+            ...(p.skipped !== undefined ? { skipped: p.skipped } : {}),
+          })
+        }
       }
+      if (firstFailure !== undefined) {
+        return err(ioError('dry-run 预演失败', firstFailure))
+      }
+      const actions = actionDetails.length > 0 ? actionDetails : undefined
       const report: DryRunReport = {
         txId: plan.txId,
         plans: reports,
         estimatedBytesReclaimable: total,
         warnings: plan.warnings,
+        ...(actions ? { actions } : {}),
       }
       await deps.audit.append({
         timestamp: deps.clock.now().toISOString(), actor: rt.request.actor, action: 'dry-run',
@@ -409,36 +462,45 @@ export function createTransactionEngine(
                 estimated = undefined   // preview 失败不影响执行，只是缺校准样本
               }
             }
-            const executed = await op.execute(ctx)
-            if (!executed.ok) {
-              rt.steps[index] = { ...rt.steps[index]!, status: 'failed', backup: null }
-              await deps.wal.append(txId, { type: 'step-failed', index, error: executed.error })
+            const executed = await (async () => {
+              // V5：步骤计时 —— execute 前后取注入时钟，耗时随 step-done 审计与摘要下发
+              const startedAt = deps.clock.now().getTime()
+              const r = await op.execute(ctx)
+              const durationMs = Math.max(0, deps.clock.now().getTime() - startedAt)
+              return { r, durationMs }
+            })()
+            if (!executed.r.ok) {
+              rt.steps[index] = { ...rt.steps[index]!, status: 'failed', backup: null, durationMs: executed.durationMs }
+              await deps.wal.append(txId, { type: 'step-failed', index, error: executed.r.error })
               await auditStep(rt, op, 'failure', {
                 operationId: op.id, estimated: estimated ?? null,
-                error: executed.error.message,
+                error: executed.r.error.message,
+                durationMs: executed.durationMs,
               })
               // error 钩子可建议处置
               const errHook = await deps.hooks.emit('error', {
-                ...hookCtx(txId, rt.request, op), error: executed.error,
+                ...hookCtx(txId, rt.request, op), error: executed.r.error,
               })
               const directive = errHook.ok ? errHook.value.errorDirective : null
               if (directive === 'skip-and-continue') {
-                rt.steps[index] = { ...rt.steps[index]!, status: 'skipped' }
+                rt.steps[index] = { ...rt.steps[index]!, status: 'skipped', durationMs: executed.durationMs }
                 continue
               }
-              await rollbackRuntime(rt, `步骤 ${index}(${op.id}) 失败: ${executed.error.message}`)
+              await rollbackRuntime(rt, `步骤 ${index}(${op.id}) 失败: ${executed.r.error.message}`)
               await finalize(rt)
-              return err(executed.error)
+              return err(executed.r.error)
             }
-            const { outcome, backup } = executed.value
+            const { outcome, backup } = executed.r.value
             rt.steps[index] = {
               ...rt.steps[index]!, status: 'done', bytesFreed: outcome.bytesFreed, backup,
+              durationMs: executed.durationMs,
             }
             await deps.wal.append(txId, { type: 'step-done', index, operationId: op.id, outcome, backup })
             await auditStep(rt, op, 'success', {
               operationId: op.id,
               estimated: estimated ?? null,
               actual: outcome.bytesFreed,
+              durationMs: executed.durationMs,
               ...(estimated !== undefined && estimated > 0
                 ? { ratio: outcome.bytesFreed / estimated }
                 : {}),

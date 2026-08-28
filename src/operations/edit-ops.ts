@@ -1,6 +1,9 @@
 // src/operations/edit-ops.ts — 配置引用清理（workspace yaml / profile patch / home patch）
 // 命令模式：preview 零副作用；execute 先 stageEdit 留快照再写新内容（fsync）；
 // undo = BackupArea.restore（yaml-edit 记录含 originalContent，幂等）。
+//
+// V4 升级：幂等 skip 语义 —— 引用已不存在时 preview/execute 均标记 skipped
+// （不报错、不产生空操作），上层可机器读出"这一步本来就无事可做"。
 import * as fs from 'fs'
 import * as path from 'path'
 import type { AbsolutePath, NukeError, PluginName, Result } from '../contracts/base'
@@ -34,6 +37,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
         return {
           summary: `${spec.description}: 文件不存在，跳过（${file}）`,
           touchedPaths: [], estimatedBytesReclaimable: 0, requiresExclusiveLock: false,
+          skipped: true,
         }
       }
       const content = fs.readFileSync(file, 'utf-8')
@@ -46,6 +50,10 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
         touchedPaths: touched,
         estimatedBytesReclaimable: 0,   // 配置编辑不回收磁盘空间
         requiresExclusiveLock: false,
+        // V5：涉及文件数（maxFilesPerTx 数据源；实际编辑的 YAML 恰为 1 个文件）
+        ...(next === null ? { fileCount: 0 } : { fileCount: 1 }),
+        // 幂等语义：引用已不存在 → 机器可读的 skipped 标记（不报错、不产生空操作）
+        ...(next === null ? { skipped: true } : {}),
       }
     },
 
@@ -60,12 +68,18 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
     async execute(ctx: TxContext): Promise<Result<ExecutedStep, NukeError>> {
       const file = spec.fileOf(ctx)
       if (!existsSafe(file)) {
-        return ok({ outcome: { bytesFreed: 0, message: '文件不存在，跳过' }, backup: null })
+        return ok({
+          outcome: { bytesFreed: 0, message: '文件不存在，跳过', skipped: true },
+          backup: null,
+        })
       }
       const content = fs.readFileSync(file, 'utf-8')
       const next = removePluginFromYaml(content, spec.target)
       if (next === null) {
-        return ok({ outcome: { bytesFreed: 0, message: '未发现引用，跳过' }, backup: null })
+        return ok({
+          outcome: { bytesFreed: 0, message: '未发现引用，跳过', skipped: true },
+          backup: null,
+        })
       }
       try {
         const backup = await ctx.backups.stageEdit(file as AbsolutePath, next)

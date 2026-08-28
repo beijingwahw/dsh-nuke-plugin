@@ -1,8 +1,11 @@
 // src/engine/dedup-analyzer.ts — IDedupAnalyzer 实现：内容寻址去重分析
-// 三级瀑布算法（rmlint/jdupes 同族的世界级方案，性能关键）：
+// 三级瀑布算法（rmlint/rmlints 同族的世界级方案，性能关键）：
 //   阶段一  size 分桶 —— 同尺寸才可能同内容；尺寸唯一的文件零哈希成本淘汰
-//   阶段二  头尾采样指纹（各 4KB）—— 采样不同即淘汰，不做全量读
-//           头+尾双采比单头采更鲁棒：前缀相同的文件（JS bundle/JSON 元数据）尾部常不同
+//   阶段二  头+中+尾三段采样指纹（各 4KB）—— 采样不同即淘汰，不做全量读。
+//           三段覆盖三类现实"同质段"盲区：头（magic number/shebang/JSON 前缀
+//           相同的 bundle）、尾（padding/trailer/签名后缀相同）、中（头尾都对
+//           但中部不同 —— 打包器时间戳/构建号差异的典型形态）。双段采样对
+//           第三类无能为力，只能漏到阶段三全量哈希兜底（正确但贵）。
 //   阶段三  仅对采样碰撞组计算全量 SHA-256 —— 零误报的最终裁决
 // 并行哈希：有界并发池（默认 8 路），SSD 上接近线性加速。
 // 安全属性：跳过符号链接（防哈希到逃逸目标）；流式读取（大文件不占内存）；
@@ -95,33 +98,34 @@ export function createDedupAnalyzer(options: DedupAnalyzerOptions): IDedupAnalyz
 
   const SAMPLE_BYTES = 4096
 
-  /** 头尾采样指纹：一次 open + 两次定位 read（≤8KB IO），绝不读全量。
-   *  小于 2×SAMPLE 的文件退化为头采（尾部与头部重叠无意义）。 */
+  /** 头+中+尾三段采样指纹：一次 open + 至多三次定位 read（≤12KB IO），
+   *  绝不读全量。退化规则：size ≤ S 仅头；S < size ≤ 2S 头+尾（中段与
+   *  头/尾重叠无增益）；size > 2S 头+中+尾（2S~3S 区间中段与头尾部分
+   *  重叠 —— 重复字节无害，指纹只需确定性不需采样不重叠）。
+   *  中段起点 = (size-S)/2 向下取整（中点对齐，两侧对称）。
+   *  fh.read 的 position 精确定位由 FileHandle API 保证；采样窗口全部
+   *  落在 [0, size) 内，不存在短读歧义。 */
   async function sampleFingerprint(p: string, size: number): Promise<string> {
-    return await new Promise((resolve, reject) => {
-      fs.open(p, 'r', (err, fd) => {
-        if (err) { reject(err); return }
-        const h = crypto.createHash('sha256')
-        const head = Buffer.alloc(Math.min(SAMPLE_BYTES, size))
-        fs.read(fd, head, 0, head.length, 0, e1 => {
-          if (e1) { try { fs.closeSync(fd) } catch {}; reject(e1); return }
-          if (size <= SAMPLE_BYTES) {
-            try { fs.closeSync(fd) } catch {}
-            h.update(head)
-            resolve(`s:${h.digest('hex')}`)
-            return
-          }
-          const tail = Buffer.alloc(SAMPLE_BYTES)
-          const tailStart = size - SAMPLE_BYTES
-          fs.read(fd, tail, 0, tail.length, tailStart, e2 => {
-            try { fs.closeSync(fd) } catch {}
-            if (e2) { reject(e2); return }
-            h.update(head); h.update(tail)
-            resolve(`s:${h.digest('hex')}`)
-          })
-        })
-      })
-    })
+    const fh = await fs.promises.open(p, 'r')
+    try {
+      const h = crypto.createHash('sha256')
+      const readAt = async (len: number, position: number): Promise<void> => {
+        const buf = Buffer.alloc(len)
+        await fh.read(buf, 0, len, position)
+        h.update(buf)
+      }
+      const headLen = Math.min(SAMPLE_BYTES, size)
+      await readAt(headLen, 0)
+      if (size > SAMPLE_BYTES) {
+        await readAt(SAMPLE_BYTES, size - SAMPLE_BYTES)
+      }
+      if (size > 2 * SAMPLE_BYTES) {
+        await readAt(SAMPLE_BYTES, Math.floor((size - SAMPLE_BYTES) / 2))
+      }
+      return `s:${h.digest('hex')}`
+    } finally {
+      await fh.close()
+    }
   }
 
   return {

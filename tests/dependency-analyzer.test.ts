@@ -133,4 +133,46 @@ describe('DependencyAnalyzer', () => {
     expect([...g.value.nodes.keys()]).toContain('profile:dev')
     expect([...g.value.nodes.keys()]).not.toContain('profile:default')
   })
+
+  it('指纹缓存：二次构建零读盘全命中，文件变更后精确失效重读', async () => {
+    const analyzer = createDependencyAnalyzer({ dshHome: home })
+
+    // 首次构建：全部读盘解析。home patch 会被 default/dev 两个 profile 各访问
+    // 一次 —— 构建内第二次访问即命中（缓存对构建内重复同样生效）
+    const g1 = await analyzer.buildGraph()
+    expect(g1.ok).toBe(true)
+    const s1 = analyzer.cacheStats()
+    expect(s1.filesRead).toBeGreaterThan(0)
+    const totalAccesses = s1.filesRead + s1.cacheHits
+    expect(totalAccesses).toBeGreaterThan(s1.filesRead)   // 构建内确有重复访问
+
+    // 二次构建：磁盘未变 → 零读盘、全命中；图结构逐位一致
+    const g2 = await analyzer.buildGraph()
+    expect(g2.ok).toBe(true)
+    const s2 = analyzer.cacheStats()
+    expect(s2.filesRead).toBe(0)
+    expect(s2.cacheHits).toBe(totalAccesses)              // 访问总数不变，全部命中
+    if (!g1.ok || !g2.ok) return
+    expect([...g2.value.nodes.keys()].sort()).toEqual([...g1.value.nodes.keys()].sort())
+    expect(g2.value.edges.length).toBe(g1.value.edges.length)
+
+    // 变更 default 的 package.json（新增依赖）→ 仅该文件指纹失效重读
+    const pkgPath = path.join(home, 'profiles', 'default', 'package.json')
+    const original = fs.readFileSync(pkgPath, 'utf-8')
+    try {
+      fs.writeFileSync(pkgPath, JSON.stringify({
+        dependencies: { foo: '^1.0.0', bar: '^1.0.0', 'new-pkg': '^1.0.0' },
+        dsh: { profile: { bundles: ['foo', 'bar'] } },
+      }, null, 2))
+      const g3 = await analyzer.buildGraph()
+      expect(g3.ok).toBe(true)
+      const s3 = analyzer.cacheStats()
+      expect(s3.filesRead).toBe(1)                        // 只有变更的那一个
+      expect(s3.cacheHits).toBe(totalAccesses - 1)        // 其余访问全部命中
+      if (!g3.ok) return
+      expect([...g3.value.nodes.keys()]).toContain('new-pkg')
+    } finally {
+      fs.writeFileSync(pkgPath, original)
+    }
+  })
 })

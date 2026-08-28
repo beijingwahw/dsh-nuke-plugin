@@ -167,3 +167,50 @@ describe('贝叶斯可靠性模型', () => {
     expect(r.successProbability).toBeGreaterThan(0.5)
   })
 })
+
+describe('可靠性统计升级（Wilson 区间 + 时间加权分位数）', () => {
+  it('Wilson 小样本：区间天然有界（正态近似会越出 [0,1] 的场景），且包含点估计', async () => {
+    const audit = auditAt('wilson')
+    await audit.append({
+      timestamp: '2026-08-25T00:00:00Z', actor: 't',
+      action: 'op:tiny-action', outcome: 'success', detail: {},
+    })
+    // κ=1：后验有效样本量仅 2，p̂≈0.833 —— 正态近似上界 ≈ 0.833+1.96×0.26 > 1（越界）
+    const model = await createReliabilityModel({ audit, shrinkage: 1 })
+    const r = model.reliabilityOf('tiny-action')
+    expect(r.ci95[0]).toBeGreaterThan(0)
+    expect(r.ci95[1]).toBeLessThan(1)   // Wilson 收缩幅度，天然有界
+    expect(r.ci95[0]).toBeLessThan(r.successProbability)
+    expect(r.ci95[1]).toBeGreaterThan(r.successProbability)
+  })
+
+  it('时间加权分位数：老样本指数衰减、近因样本主导；全 1 权重退化回未加权公式', async () => {
+    const audit = auditAt('weighted')
+    // 近期 2 条 ratio 0.4 / 0.6 + 精确 30 天前 1 条 ratio 1.5
+    await audit.append({
+      timestamp: '2026-07-28T00:01:00Z', actor: 't', action: 'op:drifty',
+      outcome: 'success', detail: { estimated: 100, actual: 150 },
+    })
+    await audit.append({
+      timestamp: '2026-08-27T00:00:00Z', actor: 't', action: 'op:drifty',
+      outcome: 'success', detail: { estimated: 100, actual: 40 },
+    })
+    await audit.append({
+      timestamp: '2026-08-27T00:01:00Z', actor: 't', action: 'op:drifty',
+      outcome: 'success', detail: { estimated: 100, actual: 60 },
+    })
+
+    // 半衰期 10 天：老样本权重 = 0.5^(30/10) = 0.125
+    //   W = 2.125，t = 0.5×1.125 = 0.5625 → p50 = 0.4 + 0.2×0.5625 = 0.5125
+    const weighted = await createReliabilityModel({ audit, calibrationHalfLifeMs: 10 * 24 * 3600 * 1000 })
+    const cal = weighted.reliabilityOf('drifty').calibration
+    expect(cal).not.toBeNull()
+    expect(cal!.samples).toBe(3)
+    expect(cal!.p50).toBeCloseTo(0.5125, 4)
+
+    // 对照：半衰期无穷（Infinity）→ 权重恒为 1 → 与未加权公式逐位等价（p50 = 0.6）
+    const unweighted = await createReliabilityModel({ audit, calibrationHalfLifeMs: Infinity })
+    const cal2 = unweighted.reliabilityOf('drifty').calibration
+    expect(cal2!.p50).toBeCloseTo(0.6, 4)
+  })
+})

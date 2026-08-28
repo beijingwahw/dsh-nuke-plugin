@@ -59,6 +59,29 @@ export interface IInputValidator {
   validateCommandArgv(argv: readonly string[], allowBin: readonly string[]):
     Result<readonly string[], readonly Violation[]>
 
+  /**
+   * V5 增量：批量校验 —— 一次请求内多个字段全部校验完毕，汇总返回全部
+   * 错误（而非首错即停），供上层一次性展示；全部通过时返回 ok。
+   * 仅校验请求中提供的字段，缺省字段跳过。
+   */
+  validateAll(request: ValidationRequest): Result<void, readonly Violation[]>
+
   /** 展示层转义：剥离 ANSI/控制字符，防终端转义注入（恶意文件名操纵终端） */
   sanitizeForDisplay(input: string): string
+}
+
+/** V5 增量：validateAll 的批量校验请求（全部字段可选，缺省跳过该项校验） */
+export interface ValidationRequest {
+  readonly pluginName?: string
+  readonly profileName?: string
+  /** pathOptions 缺省时按 { mustBeAbsolute: false, strictWindows: false } 处理 */
+  readonly path?: string
+  readonly pathOptions?: {
+    readonly mustBeAbsolute: boolean
+    readonly strictWindows: boolean
+  }
+  readonly regex?: string
+  readonly commandArgv?: readonly string[]
+  /** commandArgv 提供时必须同时提供 allowBin */
+  readonly allowBin?: readonly string[]
 }

@@ -85,3 +85,90 @@ describe('空间台账', () => {
     }
   })
 })
+
+describe('台账聚合升级（单遍历多维聚合 + 解析缓存）', () => {
+  it('一次遍历多维聚合：多日×多profile×多动作混合，总额与三维索引全部正确', async () => {
+    const l = ledger()
+    // 2 天 × 2 profile × (1 freed + 1 pending) = 8 条混合样本
+    const days = ['2026-02-01', '2026-02-02']
+    for (const [di, day] of days.entries()) {
+      for (const [pi, profile] of ['web', 'api'].entries()) {
+        await l.record(entry({
+          at: `${day}T10:00:00Z`, profile: profile as any, kind: 'freed',
+          action: 'remove-storages', bytes: 100 + di * 10 + pi,
+        }))
+        await l.record(entry({
+          at: `${day}T11:00:00Z`, profile: profile as any, kind: 'pending',
+          action: 'remove-node-modules', bytes: 1000 + di * 100 + pi * 10,
+        }))
+      }
+    }
+    const r = await l.query()
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.entryCount).toBe(8)
+    expect(r.value.totalFreed).toBe(422)       // 100+101+110+111
+    expect(r.value.totalPending).toBe(4220)    // 1000+1010+1100+1110
+    // byAction bytes 降序
+    expect(r.value.byAction).toEqual([
+      { key: 'remove-node-modules', bytes: 4220, count: 4 },
+      { key: 'remove-storages', bytes: 422, count: 4 },
+    ])
+    // byProfile bytes 降序：api 2332 (101+111+1010+1110) > web 2310 (100+110+1000+1100)
+    expect(r.value.byProfile).toEqual([
+      { key: 'api', bytes: 2332, count: 4 },
+      { key: 'web', bytes: 2310, count: 4 },
+    ])
+    // byDay key 升序且跨 kind 合并
+    expect(r.value.byDay).toEqual([
+      { key: '2026-02-01', bytes: 2211, count: 4 },   // 201 freed + 2010 pending
+      { key: '2026-02-02', bytes: 2431, count: 4 },   // 221 freed + 2210 pending
+    ])
+  })
+
+  it('多维过滤组合：kind × profile × since 同时收敛到各维聚合', async () => {
+    const l = ledger()
+    await l.record(entry({ at: '2026-03-01T00:00:00Z', profile: 'web' as any, bytes: 10 }))
+    await l.record(entry({ at: '2026-03-02T00:00:00Z', profile: 'web' as any, bytes: 20 }))
+    await l.record(entry({ at: '2026-03-02T00:00:00Z', profile: 'api' as any, bytes: 40 }))
+    await l.record(entry({ at: '2026-03-02T00:00:00Z', profile: 'web' as any, kind: 'pending', bytes: 80 }))
+    const r = await l.query({ kind: 'freed', profile: 'web' as any, since: '2026-03-02' })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.entryCount).toBe(1)
+    expect(r.value.totalFreed).toBe(20)
+    expect(r.value.totalPending).toBe(0)
+    expect(r.value.byDay).toEqual([{ key: '2026-03-02', bytes: 20, count: 1 }])
+    expect(r.value.byProfile).toEqual([{ key: 'web', bytes: 20, count: 1 }])
+  })
+
+  it('解析缓存对外部写入诚实：绕过 record 直写后同实例立即可见；半行照旧丢弃', async () => {
+    const dir = path.join(tmp, `l-${seq++}`)
+    const l = createLedger({ historyDir: dir })
+    await l.record(entry({ at: '2026-04-01T00:00:00Z', bytes: 1 }))
+    await l.record(entry({ at: '2026-04-02T00:00:00Z', bytes: 2 }))
+    const first = await l.query()
+    expect(first.ok && first.value.entryCount).toBe(2)   // 此后解析缓存建立
+
+    // 外部直写完整合法行 → stat 指纹变化 → 缓存失效重读
+    fs.appendFileSync(path.join(dir, 'ledger.jsonl'), JSON.stringify(entry({ at: '2026-04-03T00:00:00Z', bytes: 4 })) + '\n')
+    const second = await l.query()
+    expect(second.ok && second.value.entryCount).toBe(3)
+    expect(second.ok && second.value.totalFreed).toBe(7)
+    expect(l.entries().length).toBe(3)
+
+    // 外部追加半行 → 指纹变化触发重读，半行容错语义不变
+    fs.appendFileSync(path.join(dir, 'ledger.jsonl'), '{"at":"broken')
+    const third = await l.query()
+    expect(third.ok && third.value.entryCount).toBe(3)
+  })
+
+  it('缓存命中：同实例重复 query 输出幂等', async () => {
+    const l = ledger()
+    await l.record(entry({ bytes: 5 }))
+    await l.record(entry({ kind: 'pending', bytes: 7 }))
+    const a = await l.query()
+    const b = await l.query()
+    expect(a).toEqual(b)
+  })
+})

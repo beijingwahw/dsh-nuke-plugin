@@ -174,3 +174,75 @@ describe('withLock RAII', () => {
     expect(r.ok && r.value).toBe(42)
   })
 })
+
+describe('锁升级（指数退避等待 + 自动心跳续期）', () => {
+  const sleep = (ms: number): Promise<void> => new Promise(r => setTimeout(r, ms))
+
+  /** 真实时钟 manager（心跳/退避依赖真实 setTimeout，不能冻结 now stub） */
+  function realManager() {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    return {
+      lockRoot,
+      m: createLockManager({ lockRoot, probe: { isAlive: () => false } }),
+    }
+  }
+
+  it('等待重试（指数退避+抖动）：超时返回 E_LOCK_HELD 并报告当前持有者', async () => {
+    const { m } = realManager()
+    await okv(await m.acquire(req(ownerA, 'exclusive')))
+    const r = await m.acquire({ ...req(ownerB, 'exclusive'), waitTimeoutMs: 120 })
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.code).toBe('E_LOCK_HELD')
+    expect(r.error.message).toContain('clean')
+    expect(r.error.message).toContain('111')
+  })
+
+  it('等待重试：锁释放后等待者在截止线内成功获取', async () => {
+    const { m } = realManager()
+    const h1 = await okv(await m.acquire(req(ownerA, 'exclusive')))
+    // 80ms 后释放；ownerB 等待窗口 2s，退避期间应等到
+    void (async () => { await sleep(80); await h1.release() })()
+    const r = await m.acquire({ ...req(ownerB, 'exclusive'), waitTimeoutMs: 2_000 })
+    expect(r.ok).toBe(true)
+    if (r.ok) await r.value.release()
+  })
+
+  it('autoRenewMs 心跳续期：TTL 到期前自动 refresh，长持有不失效', async () => {
+    const { m } = realManager()
+    const r = await m.acquire({
+      scope: { kind: 'global' }, mode: 'exclusive', owner: ownerA,
+      waitTimeoutMs: 0, ttlMs: 150, autoRenewMs: 40,
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    await sleep(400)   // 远超 TTL 150ms：无心跳必然过期
+    expect(m.holders({ kind: 'global' }).length).toBe(1)   // 心跳保活
+    await r.value.release()
+    await sleep(80)    // 过一个心跳周期：释放后定时器清除，锁不复活
+    expect(m.holders({ kind: 'global' }).length).toBe(0)
+  })
+
+  it('对照：无自动续期的锁在 TTL 后自然失效', async () => {
+    const { m } = realManager()
+    await okv(await m.acquire(req(ownerA, 'exclusive', 150)))
+    await sleep(400)
+    expect(m.holders({ kind: 'global' }).length).toBe(0)
+  })
+
+  it('锁被外部清除后心跳停跳止血（不复活已消失的锁）', async () => {
+    const { m, lockRoot } = realManager()
+    const r = await m.acquire({
+      scope: { kind: 'global' }, mode: 'exclusive', owner: ownerA,
+      waitTimeoutMs: 0, ttlMs: 10_000, autoRenewMs: 30,
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    const lockFile = path.join(lockRoot, 'locks', 'global.lock')
+    fs.unlinkSync(lockFile)   // 模拟被安全破锁（锁文件消失）
+    await sleep(100)          // 期间心跳数次全部 E_LOCK_STALE → 停跳
+    expect(fs.existsSync(lockFile)).toBe(false)   // 心跳绝不重建锁文件
+    expect(m.holders({ kind: 'global' }).length).toBe(0)
+    await r.value.release()
+  })
+})

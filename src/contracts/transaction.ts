@@ -88,17 +88,69 @@ export interface BackupArea {
 }
 
 // ─── 原子操作（命令模式） ───────────────────────────────────
+
+// ── V4 增量（仅新增，向后兼容）：操作风险等级 / 结构化命令捕获 / 影响面明细 ──
+
+/** 操作风险等级（动作元数据维度；与 blast-radius 的 RiskLevel 相互独立：
+ *  前者描述"这类动作固有风险"，后者描述"这次删除波及谁"）。 */
+export type OperationRiskLevel = 'low' | 'medium' | 'high'
+
+/** 外部命令执行的结构化捕获（exec 类操作专用）。
+ *  preview 阶段为探针命令（--version）的结果；execute 阶段为真实命令的结果。
+ *  stdout/stderr 已截断至有界长度，保证 WAL/审计链不因命令噪声膨胀。 */
+export interface CommandExecutionDetail {
+  readonly cmd: string
+  readonly args: readonly string[]
+  readonly exitCode: number | null          // null = 进程未正常退出（spawn 失败/被信号终止）
+  readonly stdout: string
+  readonly stderr: string
+  readonly durationMs: number
+  /** 含首次执行在内的总尝试次数（瞬态重试后 > 1） */
+  readonly attempts: number
+  /** 是否因超时被终止（fail-closed 信号：调用方必须按失败处理） */
+  readonly timedOut: boolean
+}
+
+/** 目录清理影响面明细（fs 类操作 preview 阶段计算，供 dry-run 报告展示） */
+export interface DirImpactEntry {
+  readonly path: AbsolutePath
+  readonly bytes: number
+}
+
+export interface DirImpactDetail {
+  readonly dir: AbsolutePath
+  readonly totalBytes: number
+  /** 目录内 top-N 大文件（N 由操作配置，默认 5） */
+  readonly topFiles: readonly DirImpactEntry[]
+  /** 目录内 top-N 大子目录（递归体积） */
+  readonly topDirs: readonly DirImpactEntry[]
+}
+
 export interface OperationPlan {
   readonly summary: string                  // 人类可读的操作描述
   readonly touchedPaths: readonly AbsolutePath[]
   readonly estimatedBytesReclaimable: number
   readonly requiresExclusiveLock: boolean
+  /** V4 增量（可选）：本操作为幂等跳过（目标缺失/引用不存在），不产生副作用 */
+  readonly skipped?: boolean
+  /** V4 增量（可选）：探针命令的结构化输出（exec 类操作 preview 阶段填充） */
+  readonly command?: CommandExecutionDetail
+  /** V4 增量（可选）：目录影响面明细（fs 类操作 preview 阶段填充） */
+  readonly impact?: DirImpactDetail
+  /** V5 增量（可选）：本操作涉及的文件数（touchedPaths 去重计数；目录类操作
+   *  可报告递归统计值）。preview 阶段填充，供上层策略守卫消费 ——
+   *  缺省/未统计时文件数上限规则（maxFilesPerTx）跳过判定。 */
+  readonly fileCount?: number
 }
 
 export interface CleanOperation {
   readonly id: string
   readonly action: CleanAction
   readonly target: PluginName
+  /** V4 增量（可选）：动作风险等级（操作集编译器按 ACTION_METADATA 表注入） */
+  readonly riskLevel?: OperationRiskLevel
+  /** V4 增量（可选）：人类可读的动作语义描述（同上表注入） */
+  readonly description?: string
 
   /** 零副作用预演：dry-run 与 commit 共享此投影 */
   preview(ctx: TxContext): Promise<OperationPlan>
@@ -113,6 +165,10 @@ export interface CleanOperation {
 export interface OperationOutcome {
   readonly bytesFreed: number
   readonly message: string
+  /** V4 增量（可选）：本步骤为幂等跳过（无副作用发生） */
+  readonly skipped?: boolean
+  /** V4 增量（可选）：外部命令执行的结构化捕获（随 step-done 进 WAL 与审计链） */
+  readonly command?: CommandExecutionDetail
 }
 
 export interface ExecutedStep {
@@ -192,9 +248,23 @@ export interface TxSession {
   readonly request: CleanRequest
 }
 
+/** V4 增量：dry-run 动作级明细（DryRunReport.actions 的元素形态）。
+ *  由操作集编译器的 makeOperationPlan 供给，向后兼容 —— 引擎不填时报告形态不变。 */
+export interface DryRunActionDetail {
+  readonly action: CleanAction
+  readonly target: PluginName
+  readonly riskLevel: OperationRiskLevel
+  readonly description: string
+  readonly estimatedBytes: number
+  /** V4.1 增量（可选）：本动作幂等跳过（目标缺失/引用不存在），执行时无副作用 */
+  readonly skipped?: boolean
+}
+
 export interface DryRunReport {
   readonly txId: TxId
   readonly plans: readonly { readonly operation: OperationPlan; readonly summary: string }[]
   readonly estimatedBytesReclaimable: number
   readonly warnings: readonly PlanWarning[]
+  /** V4 增量（可选）：动作清单明细（action/riskLevel/description/estimatedBytes） */
+  readonly actions?: readonly DryRunActionDetail[]
 }

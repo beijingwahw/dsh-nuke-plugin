@@ -36,7 +36,7 @@ import { createGuardian } from './engine/guardian'
 import { createLedger } from './infra/ledger'
 import { createReliabilityModel } from './infra/reliability'
 import { createOracle } from './engine/oracle'
-import { createDrill } from './engine/drill'
+import { createDrill, isDrillMatrixReport } from './engine/drill'
 import { makeOperationFactory, STRATEGY_ACTIONS } from './operations'
 import type { CleanStrategy, PluginName, ProfileName, TxId } from './contracts/base'
 import { errorToMessage, fmtBytes } from './contracts/base'
@@ -411,7 +411,7 @@ export function apply(ctx: Context) {
   // ── nuke_oracle（先知引擎：后果推演） ─────────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_oracle',
-    description: '先知推演：dry-run 说"我打算做什么"，先知说"做了会怎样"——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长。基于历史执行数据（贝叶斯学习），零副作用不拿锁。建议清理前先问先知',
+    description: '先知推演：dry-run 说"我打算做什么"，先知说"做了会怎样"——事务成功率、期望回收（校准分布修正 + 蒙特卡洛 P10/P50/P90 分布）、最脆弱步骤（含修复收益）、爆炸半径、磁盘倒计时延长。基于历史执行数据（贝叶斯学习），零副作用不拿锁。建议清理前先问先知',
     parameters: {
       plugin_names: { type: 'array', items: { type: 'string' }, description: '要推演的插件名列表' },
       plugin_name: { type: 'string', description: '单个插件名（plugin_names 简写）' },
@@ -441,8 +441,15 @@ export function apply(ctx: Context) {
         `   期望回收: ${fmtBytes(o.expectedReclaimBytes)}（已折算失败回滚；若成功: ${fmtBytes(o.reclaimP10IfSuccess)} ~ ${fmtBytes(o.reclaimP90IfSuccess)}）`,
         `   预估总量: ${fmtBytes(o.totalEstimatedBytes)}  |  失败期望回滚深度: ${o.expectedRollbackDepth.toFixed(1)} 步`,
       ]
+      if (o.monteCarlo.trials > 0) {
+        const mc = o.monteCarlo
+        // 蒙特卡洛互证口径：P10/P90 是含失败回滚（=0）的无条件分布，
+        // 与解析式期望/成功率并列交叉验证（种子固定 → 逐位可复现）
+        lines.push(`   🎲 蒙特卡洛 ${mc.trials} 次抽样（种子 ${mc.seed}）: 无条件回收 P10 ${fmtBytes(mc.p10)} / P50 ${fmtBytes(mc.p50)} / P90 ${fmtBytes(mc.p90)}，抽样成功率 ${pct(mc.successRate)}`)
+      }
       if (o.weakestStep) {
         lines.push(`   ⚠️ 最脆弱: 第 ${o.weakestStep.index} 步 ${o.weakestStep.action}（成功率 ${pct(o.weakestStep.successProbability)}，失败作废 ${fmtBytes(o.weakestStep.exposureBytes)}）`)
+        lines.push(`      🔧 修复该步可令整体成功率升至 ${pct(o.weakestStep.repairedSuccessProbability)}（+${(o.weakestStep.repairUplift * 100).toFixed(1)} 个百分点）`)
       }
       if (o.brokenDependents !== null) {
         lines.push(o.brokenDependents.length > 0
@@ -468,17 +475,33 @@ export function apply(ctx: Context) {
   // ── nuke_drill（混沌演习：崩溃安全自检） ──────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_drill',
-    description: '混沌演习：在沙箱中执行真实事务并在第 N 步后模拟进程崩溃（不回滚、锁悬挂），再走真实崩溃恢复路径，逐项验证数据字节级还原/审计链完整/WAL 终结，签发崩溃安全证书。不触碰真实环境，随时可跑',
+    description: '混沌演习：在沙箱中执行真实事务并在第 N 步后模拟进程崩溃（不回滚、锁悬挂），再走真实崩溃恢复路径，逐项验证数据字节级还原/审计链完整/WAL 终结，签发崩溃安全证书。matrix=true 一次跑完 plan 后/第 1 步后/第 2 步后三个注入点（各自独立沙箱，签发证书矩阵）。不触碰真实环境，随时可跑',
     parameters: {
       crash_after_step: { type: 'number', description: '第几步成功后"断电"（1-2，默认 1）' },
+      matrix: { type: 'boolean', description: '矩阵模式：一次覆盖 plan 后/第 1 步后/第 2 步后三个注入点（各自独立沙箱验证，任一点失败则整体证书作废），默认 false 单点演习' },
     },
-    execute: async ({ crash_after_step = 1 }) => {
-      const r = await rt.drill.run({ afterStep: crash_after_step })
+    execute: async ({ crash_after_step = 1, matrix = false }) => {
+      // matrix=true 走证书矩阵（事务生命周期三段崩溃谱系独立验证）；
+      // 否则单点演习（旧语义不变，crashedAtStep 如实标注注入点）
+      const r = matrix
+        ? await rt.drill.runMatrix()
+        : await rt.drill.run({ afterStep: crash_after_step })
       if (!r.ok) return { content: `❌ [${r.error.code}] ${r.error.message}` }
       const d = r.value
       const lines = [
         `${d.passed ? '🎖️ 崩溃安全证书已签发' : '⚠️ 演习未通过'}  演习 ${d.runId}`,
-        `   注入点: 第 ${d.crashedAtStep} 步成功落盘后模拟进程死亡  |  恢复备份 ${d.restoredFiles} 项  |  耗时 ${d.durationMs}ms`,
+        isDrillMatrixReport(d)
+          ? `   注入点矩阵: ${d.pointsVerified} 个断电位（plan 后 / 第 1 步后 / 第 2 步后）各自独立沙箱验证  |  恢复备份 ${d.restoredFiles} 项  |  总耗时 ${d.durationMs}ms`
+          : `   注入点: 第 ${d.crashedAtStep} 步成功落盘后模拟进程死亡  |  恢复备份 ${d.restoredFiles} 项  |  耗时 ${d.durationMs}ms`,
+      ]
+      if (isDrillMatrixReport(d)) {
+        lines.push('', '─ 证书矩阵（任一点失败则整体作废）─')
+        for (const c of d.matrix) {
+          const label = c.point === 'plan' ? 'plan 后（零步骤执行）' : `第 ${c.point} 步成功后`
+          lines.push(`  ${c.passed ? '🎖️' : '❌'} ${label}: ${c.checks.filter(k => k.passed).length}/${c.checks.length} 项通过，恢复 ${c.restoredFiles} 项，${c.durationMs}ms（现场 ${c.runId}）`)
+        }
+      }
+      lines.push(
         '',
         '─ 逐项验证 ─',
         ...d.checks.map(c => `  ${c.passed ? '✅' : '❌'} ${c.name}: ${c.detail}`),
@@ -486,7 +509,7 @@ export function apply(ctx: Context) {
         d.passed
           ? '本次演习证明：崩溃后 recover() 能完整还原环境，审计链无断裂，后续事务不受阻塞。建议定期演习（尤其升级后）。'
           : '存在失败项：崩溃恢复能力存疑，请勿在生产依赖自动恢复，优先人工核查。演习现场保留在 .nuke/drill/ 供取证。',
-      ]
+      )
       return { content: lines.join('\n') }
     },
   }))
@@ -599,7 +622,19 @@ export function apply(ctx: Context) {
           if (dr.ok) {
             out.push('', '─ 预演明细 ─')
             for (const p of dr.value.plans) out.push(`  • ${p.summary}`)
-            out.push('', `预计回收 ${fmtBytes(dr.value.estimatedBytesReclaimable)}。确认后去掉 dry_run 执行。`)
+            // V4.1：动作级明细（风险等级 + 幂等跳过标记），元数据存在时输出
+            if (dr.value.actions && dr.value.actions.length > 0) {
+              const riskIcon: Record<string, string> = { low: '🟢', medium: '🟡', high: '🔴' }
+              const skippedCount = dr.value.actions.filter(a => a.skipped).length
+              out.push('', '─ 动作清单（风险分级）─')
+              for (const a of dr.value.actions) {
+                const skip = a.skipped ? ' [跳过：目标不存在]' : ''
+                out.push(`  ${riskIcon[a.riskLevel] ?? '⚪'} ${a.description} → ${a.target}${skip}  ${fmtBytes(a.estimatedBytes)}`)
+              }
+              if (skippedCount > 0) out.push(`  （${skippedCount} 个动作将幂等跳过，无副作用）`)
+            }
+            const filesTotal = dr.value.plans.reduce((s, p) => s + (p.operation.fileCount ?? 0), 0)
+            out.push('', `预计回收 ${fmtBytes(dr.value.estimatedBytesReclaimable)}${filesTotal > 0 ? `（涉及 ${filesTotal} 个文件）` : ''}。确认后去掉 dry_run 执行。`)
           } else {
             // 预演失败不能静默：用户必须能看到失败原因，否则输出形同成功
             out.push('', `❌ 预演失败 [${dr.error.code}]: ${dr.error.message}`)
@@ -607,6 +642,34 @@ export function apply(ctx: Context) {
           await rt.engine.rollback(session.txId)   // 释放锁
           return { content: out.join('\n') }
         }
+
+        // V5：commit 前预飞复查 —— 零副作用 preview 拿到真实涉及文件数，
+        // 对 maxFilesPerTx 做第二道策略闸门（首查在 plan 后，彼时文件数未知）。
+        // 预演结果同时预热 estimates（commit 复用，不产生双倍遍历成本）。
+        const preflight = await rt.engine.dryRun(plan)
+        if (preflight.ok) {
+          const fileCount = preflight.value.plans.reduce(
+            (s, p) => s + (p.operation.fileCount ?? 0), 0)
+          const recheck = rt.policy.check({
+            plugins: cp.plugins, estimatedBytes: plan.estimatedBytesReclaimable, fileCount,
+          })
+          if (!recheck.ok) {
+            await rt.engine.rollback(session.txId)
+            return { content: `❌ 预飞策略复查失败（事务已回滚释放）: ${recheck.error.message}` }
+          }
+          if (recheck.value.length > 0) {
+            await rt.engine.rollback(session.txId)
+            return {
+              content: [
+                `🛡️ 预飞策略拦截（事务已回滚释放）:`,
+                ...recheck.value.map(v => `  ⛔ [${v.rule}] ${v.message}${v.suggestion ? `\n     💡 ${v.suggestion}` : ''}`),
+                `策略文件: ${path.join(rt.nukeRoot, 'policy.json')}（nuke_policy 可查看）`,
+              ].join('\n'),
+            }
+          }
+        }
+        // 预飞失败（目录被并发改动等）不阻断 commit：execute 阶段自有
+        // validate 闸门与 Saga 回滚兜底，此处只负责 maxFilesPerTx 数据供给。
 
         const commit = await rt.engine.commit(plan)
         if (!commit.ok) {
@@ -932,7 +995,7 @@ export function apply(ctx: Context) {
   // ── nuke_trend ───────────────────────────────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_trend',
-    description: '历史趋势分析：可回收空间变化率（字节/天）、30 天线性外推、3σ 异常检测（插件失控写盘早期信号）',
+    description: '历史趋势分析：时间加权 Theil-Sen 稳健回归 → 变化率（字节/天，含 95% 置信区间）、30 天外推与预测区间、3σ 异常检测、CUSUM 增长率变点（插件失控写盘早期信号）',
     parameters: {
       profile: { type: 'string', description: '限定 profile（省略 = 全部）' },
     },
@@ -949,12 +1012,25 @@ export function apply(ctx: Context) {
       if (t.snapshotCount === 0) {
         return { content: '暂无历史快照 —— 运行 nuke_scan / nuke_clean / nuke_doctor 后自动积累。' }
       }
+      const rate = (v: number) => `${v >= 0 ? '+' : '-'}${fmtBytes(Math.abs(v))}`
       const lines = [
         `📈 趋势分析（${t.snapshotCount} 个快照，${t.firstAt} → ${t.lastAt}）`,
         `   变化率: ${t.bytesPerDay >= 0 ? '+' : ''}${fmtBytes(Math.abs(t.bytesPerDay))}/天${t.bytesPerDay > 0 ? '（残留净增长）' : t.bytesPerDay < 0 ? '（净回收，趋势向好）' : ''}`,
       ]
+      if (t.bytesPerDayLow !== null && t.bytesPerDayHigh !== null) {
+        lines.push(`   增长率 95% 置信区间: ${rate(t.bytesPerDayLow)} ~ ${rate(t.bytesPerDayHigh)}/天`)
+      }
       if (t.projected30dBytes !== null) {
         lines.push(`   30 天外推: ${fmtBytes(t.projected30dBytes)} 可回收`)
+      }
+      if (t.projected30dBytesLow !== null && t.projected30dBytesHigh !== null) {
+        lines.push(`   30 天预测区间（95%）: ${fmtBytes(t.projected30dBytesLow)} ~ ${fmtBytes(t.projected30dBytesHigh)}`)
+      }
+      if (t.changepoints.length > 0) {
+        lines.push('', `🔀 增长率变点（CUSUM 检出 ${t.changepoints.length} 处）:`)
+        for (const cp of t.changepoints) {
+          lines.push(`   ${cp.at} ${cp.direction === 'up' ? '📈 加速' : '📉 放缓'}: ${rate(cp.bytesPerDayBefore)}/天 → ${rate(cp.bytesPerDayAfter)}/天`)
+        }
       }
       if (t.anomaly.detected) {
         lines.push('', `🚨 异常: ${t.anomaly.detail}`)
@@ -990,7 +1066,7 @@ export function apply(ctx: Context) {
   // ── nuke_guardian ────────────────────────────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_guardian',
-    description: '守卫者巡检：一键主动运维 —— 磁盘写满倒计时/趋势异常/健康阻断/可回收积压/崩溃残留事务，输出带行动建议的分级告警',
+    description: '守卫者巡检：一键主动运维 —— 磁盘写满倒计时/趋势异常/健康阻断/可回收积压/崩溃残留事务，输出带行动建议的分级告警；同键告警默认 6h 抑制窗口去重（防告警风暴，重复 ≠ 消失，恶化升级为新键立即上报）',
     parameters: {
       profile: { type: 'string', description: '默认 "web"' },
     },
@@ -1009,13 +1085,22 @@ export function apply(ctx: Context) {
       if (g.partialFailures.length > 0) {
         lines.push(`   ⚠️ 部分采集降级: ${g.partialFailures.join('; ')}`)
       }
-      if (g.alerts.length === 0) {
+      if (g.alerts.length === 0 && g.suppressedAlertKeys.length === 0) {
         lines.push('', '✅ 一切正常，无需行动。')
       } else {
-        lines.push('', `发现 ${g.alerts.length} 条告警:`)
-        for (const a of g.alerts) {
-          lines.push(`  ${sevIcon[a.severity]} [${a.kind}] ${a.message}`)
-          lines.push(`     → 建议调用 ${a.suggestedTool}`)
+        if (g.alerts.length > 0) {
+          lines.push('', `发现 ${g.alerts.length} 条告警:`)
+          for (const a of g.alerts) {
+            lines.push(`  ${sevIcon[a.severity]} [${a.kind}] ${a.message}`)
+            lines.push(`     → 建议调用 ${a.suggestedTool}`)
+          }
+        } else {
+          // 全部告警处于抑制窗口内被去重：重复 ≠ 消失，不能谎报"一切正常"
+          lines.push('', '🔕 本轮告警全部处于抑制窗口内未重发（问题仍在，窗口结束后复发将重新上报）:')
+        }
+        if (g.suppressedAlertKeys.length > 0) {
+          lines.push('', `🔇 抑制窗口内去重 ${g.suppressedAlertKeys.length} 条同键重复告警（同键窗口内不重发）:`)
+          for (const k of g.suppressedAlertKeys) lines.push(`     • ${k}`)
         }
       }
       return { content: lines.join('\n') }
@@ -1025,7 +1110,7 @@ export function apply(ctx: Context) {
   // ── nuke_forecast ────────────────────────────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_forecast',
-    description: '磁盘写满预测：趋势回归 × 实时余量 → 写满倒计时（daysUntilFull）、30 天走势与分级建议',
+    description: '磁盘写满预测：趋势回归 × 实时余量 → 写满倒计时（daysUntilFull，含 95% 置信区间，分级按悲观界保守判定）、30 天走势与分级建议（附判定依据）',
     parameters: {},
     execute: async () => {
       const r = await rt.forecaster.forecast()
@@ -1046,6 +1131,16 @@ export function apply(ctx: Context) {
       if (f.daysUntilFull !== null && f.projectedFullAt !== null) {
         lines.push(`   ⏳ 写满倒计时: ${f.daysUntilFull.toFixed(1)} 天（预计 ${f.projectedFullAt}）`)
       }
+      if (f.daysUntilFullLow !== null) {
+        // CI 端点由斜率置信区间倒数反演：悲观界（增长最快 → 最早写满）
+        // 驱动 severity 分级；乐观侧不可界（区间含"永不写满"）时如实标注
+        const lo = `${f.daysUntilFullLow.toFixed(1)} 天${f.projectedFullAtLow !== null ? `（≈${f.projectedFullAtLow}）` : ''}`
+        const hi = f.daysUntilFullHigh !== null
+          ? `${f.daysUntilFullHigh.toFixed(1)} 天${f.projectedFullAtHigh !== null ? `（≈${f.projectedFullAtHigh}）` : ''}`
+          : '不可界（区间含"永不写满"）'
+        lines.push(`   📊 写满倒计时 95% 置信区间: ${lo}（悲观）~ ${hi}（乐观）`)
+      }
+      lines.push(`   分级依据: ${f.severityBasis}`)
       lines.push('', `💡 ${f.recommendation}`)
       return { content: lines.join('\n') }
     },

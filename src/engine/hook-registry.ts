@@ -16,11 +16,37 @@ export interface HookRegistryOptions {
   readonly allowBins?: readonly string[]
 }
 
+/** V5：注册输入形态 —— priority/timeoutMs/id 均可选（契约 HookDefinition 的宽松超集）。
+ *  priority 缺省 0；同优先级严格保持注册顺序（后注册者后执行）。 */
+export type HookRegistrationInput = Omit<HookDefinition, 'priority' | 'id'> & {
+  readonly id?: string
+  /** 同 timing 内的执行优先级，小者先；缺省 0 */
+  readonly priority?: number
+  /** 钩子执行超时（毫秒）：超时视为该钩子失败（走错误隔离路径，不中断整批）。
+   *  仅对 inline 钩子生效；command 钩子使用 handler.timeoutMs 的 execFile 内建超时。 */
+  readonly timeoutMs?: number
+}
+
+/** 注册表内部形态：附加注册序号（同优先级稳定次键）与归一化后的超时 */
+interface RegisteredHook extends HookRegistrationInput {
+  readonly id: string
+  readonly priority: number
+  /** 注册序号：永不复用，同优先级时按它稳定排序 */
+  readonly seq: number
+}
+
+/** V5：注册表实例 —— register 接受宽松的 HookRegistrationInput（priority/timeoutMs/id
+ *  均可选），同时完整保留 IHookRegistry 契约。参数比契约更宽松 → 旧消费方传
+ *  HookDefinition 依然合法（只增不改）。 */
+export interface HookRegistryInstance extends IHookRegistry {
+  register(def: HookRegistrationInput): Unsubscribe
+}
+
 const DEFAULT_ALLOW_BINS = ['node', 'python', 'python3', 'dsh', 'pnpm', 'npm', 'git']
 
-export function createHookRegistry(options: HookRegistryOptions): IHookRegistry {
+export function createHookRegistry(options: HookRegistryOptions): HookRegistryInstance {
   const allowBins = options.allowBins ?? DEFAULT_ALLOW_BINS
-  const defs: HookDefinition[] = []
+  const defs: RegisteredHook[] = []
   let seq = 0
   /** 磁盘钩子的注销句柄：loadFromDisk 幂等的关键 —— 重载前先注销上一轮，
    *  否则多次调用（如配置热重载）会叠加注册同一批钩子导致重复执行。 */
@@ -56,9 +82,37 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
     })
   }
 
-  function register(def: HookDefinition): Unsubscribe {
-    const id = def.id ?? `hook-${seq++}`
-    const withId = { ...def, id }
+  /** V5：inline 钩子带可选超时执行 —— 超时以 reject 形态抛出，
+   *  由 emit 的错误隔离路径统一收编（failed 计数 + 消息收集 + fail-fast 延迟统一上报）。
+   *  Promise.race 对每个输入都注册了 settlement handler，迟到的 rejection 不会成为
+   *  unhandledRejection。 */
+  function runInlineWithTimeout(def: RegisteredHook, ctx: HookContext): Promise<unknown> {
+    const handler = def.handler
+    if (handler.type !== 'inline') {
+      return Promise.reject(new Error(`内部错误: 钩子 ${def.id} 的 handler 不是 inline`))
+    }
+    const timeoutMs = def.timeoutMs
+    if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      return handler.run(ctx)
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`钩子 ${def.id} 执行超时(${timeoutMs}ms)`)), timeoutMs)
+    })
+    return Promise.race([Promise.resolve(handler.run(ctx)), timeout]).finally(() => {
+      if (timer !== undefined) clearTimeout(timer)
+    })
+  }
+
+  function register(def: HookRegistrationInput): Unsubscribe {
+    const registrationSeq = seq++
+    const withId: RegisteredHook = {
+      ...def,
+      id: def.id ?? `hook-${registrationSeq}`,
+      // V5：priority 归一化 —— 缺省 0，非数字防御为 0（磁盘数据不可信纪律的运行时延伸）
+      priority: typeof def.priority === 'number' && Number.isFinite(def.priority) ? def.priority : 0,
+      seq: registrationSeq,
+    }
     defs.push(withId)
     return () => {
       const i = defs.indexOf(withId)
@@ -70,25 +124,38 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
     register,
 
     async emit(timing: HookTiming, ctx: HookContext): Promise<Result<HookEmitResult, NukeError>> {
+      // V5 稳定排序：priority 为主键（小者先），注册序号为次键（同优先级保持注册序）
       const matching = defs
         .filter(d => d.timing === timing)
         .filter(d => d.actions === '*' || d.actions.includes(ctx.action))
-        .sort((a, b) => a.priority - b.priority)
+        .sort((a, b) => a.priority - b.priority || a.seq - b.seq)
 
       let executed = 0, failed = 0
       let verdict: HookVerdict = { kind: 'proceed' }
       let errorDirective: ErrorDirective | null = null
+      // V5 错误隔离：fail-fast 不再立即中断整批 —— 先执行完全部钩子，
+      // 收集到的首个 fail-fast 错误在循环结束后统一上报（对调用方语义不变）。
+      let failFastError: NukeError | null = null
       const messages: string[] = []
 
       for (const def of matching) {
         executed++
         if (def.handler.type === 'inline') {
           try {
-            const r = await def.handler.run(ctx)
+            const r = await runInlineWithTimeout(def, ctx)
             if (timing === 'pre' && r && typeof r === 'object' && 'kind' in r) {
               const v = r as HookVerdict
-              if (v.kind === 'veto' && verdict.kind !== 'veto') verdict = v
-              if (v.kind === 'proceed-with-warning') messages.push(`⚠️ ${v.message}`)
+              if (v.kind === 'veto') {
+                if (verdict.kind !== 'veto') verdict = v
+                break   // veto 立即短路：后续钩子不再执行
+              }
+              if (v.kind === 'proceed-with-warning') {
+                messages.push(`⚠️ ${v.message}`)
+                // 聚合升级：veto > proceed-with-warning > proceed。
+                // 已是 veto 时不动（veto 最强）；proceed 时升级为警告裁决，
+                // 调用方能从 verdict 直接读到"带警告放行"而非翻检 messages。
+                if (verdict.kind === 'proceed') verdict = v
+              }
             }
             if (timing === 'error' && typeof r === 'string') {
               errorDirective = errorDirective ?? (r as ErrorDirective)
@@ -96,8 +163,8 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
           } catch (e) {
             failed++
             messages.push(`❌ 钩子 ${def.id} 异常: ${errorToMessage(e)}`)
-            if (def.onFailure === 'fail-fast') {
-              return err({ code: 'E_HOOK_VETO', message: `钩子 ${def.id} fail-fast: ${errorToMessage(e)}` })
+            if (def.onFailure === 'fail-fast' && failFastError === null) {
+              failFastError = { code: 'E_HOOK_VETO', message: `钩子 ${def.id} fail-fast: ${errorToMessage(e)}` }
             }
           }
         } else {
@@ -107,8 +174,8 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
           if (argv0 === '' || /[\\/]/.test(argv0)) {
             failed++
             messages.push(`❌ 钩子 ${def.id} argv[0] 必须为裸命令名（禁止路径）: "${argv0}"`)
-            if (def.onFailure === 'fail-fast') {
-              return err({ code: 'E_HOOK_VETO', message: `钩子 ${def.id} argv[0] 含路径，拒绝执行` })
+            if (def.onFailure === 'fail-fast' && failFastError === null) {
+              failFastError = { code: 'E_HOOK_VETO', message: `钩子 ${def.id} argv[0] 含路径，拒绝执行` }
             }
             continue
           }
@@ -116,8 +183,8 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
           if (!allowBins.includes(bin)) {
             failed++
             messages.push(`❌ 钩子 ${def.id} 命令不在白名单: ${bin}`)
-            if (def.onFailure === 'fail-fast') {
-              return err({ code: 'E_HOOK_VETO', message: `钩子命令白名单外: ${bin}` })
+            if (def.onFailure === 'fail-fast' && failFastError === null) {
+              failFastError = { code: 'E_HOOK_VETO', message: `钩子命令白名单外: ${bin}` }
             }
             continue
           }
@@ -127,14 +194,17 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
             failed++
             messages.push(`❌ [${def.id}] ${r.message}`)
             if (timing === 'pre' && def.handler.nonzeroExitIsVeto) {
-              verdict = { kind: 'veto', reason: r.message }
+              if (verdict.kind !== 'veto') verdict = { kind: 'veto', reason: r.message }
+              break   // veto 立即短路：后续钩子不再执行
             }
-            if (def.onFailure === 'fail-fast') {
-              return err({ code: 'E_HOOK_VETO', message: `钩子 ${def.id} fail-fast` })
+            if (def.onFailure === 'fail-fast' && failFastError === null) {
+              failFastError = { code: 'E_HOOK_VETO', message: `钩子 ${def.id} fail-fast` }
             }
           }
         }
       }
+      // 统一报告：存在 fail-fast 失败 → 整个 emit 失败（与旧语义一致，只是不再提前中断）
+      if (failFastError !== null) return err(failFastError)
       return ok({ executed, failed, verdict, errorDirective, messages })
     },
 
@@ -153,7 +223,7 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
           for (const d of parsed) {
             // 磁盘数据不可信：逐项结构校验后才允许注册
             if (typeof d !== 'object' || d === null) continue
-            const def = d as Partial<HookDefinition>
+            const def = d as Partial<HookDefinition> & { timeoutMs?: unknown }
             if (typeof def.timing !== 'string' || typeof def.onFailure !== 'string') continue
             if (def.handler?.type === 'command') {
               const argv = def.handler.argv
@@ -164,6 +234,8 @@ export function createHookRegistry(options: HookRegistryOptions): IHookRegistry 
             } else if (def.handler?.type !== 'inline') {
               continue   // inline 函数无法从 JSON 反序列化，跳过
             }
+            // V5：注册级超时（若存在）必须是正有限数，否则整条丢弃（磁盘数据不可信）
+            if (def.timeoutMs !== undefined && (typeof def.timeoutMs !== 'number' || !Number.isFinite(def.timeoutMs) || def.timeoutMs <= 0)) continue
             diskUnsubscribers.push(register({ ...d, timing } as HookDefinition))
           }
         } catch (e) {

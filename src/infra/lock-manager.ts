@@ -7,6 +7,7 @@
 //  4. 读-改-写互斥：shared 的 acquire/release/breakStale 全部经由固定名
 //     guard 目录（mkdir 原子 EEXIST，不跟随符号链接）串行化 —— 旧实现的
 //     随机后缀 guard 每个进程创建不同文件名，O_EXCL 永不冲突，形同虚设。
+//  5. 等待重试 = 指数退避 + 等值抖动（防惊群）；acquire 可选自动心跳续期
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
@@ -33,6 +34,39 @@ export interface LockManagerOptions {
   readonly now?: () => number
 }
 
+/** acquire 请求的可选自动续期字段（叠加在 LockRequest 之上，向后兼容：
+ *  不携带该字段的既有调用行为完全不变） */
+export interface LockAutoRenewOptions {
+  /** 后台心跳周期（ms）：> 0 时句柄持有期间定时调用 refresh 防 TTL 到期
+   *  被他人安全破锁；release 时自动清除定时器。建议取 ttlMs 的 1/3 左右
+   *  （单次心跳失败仍有缓冲窗口）。定时器 unref —— 不阻止进程退出。 */
+  readonly autoRenewMs?: number
+}
+
+/** 携带自动续期扩展的获取请求 */
+export type LockRenewRequest = LockRequest & LockAutoRenewOptions
+
+/** createLockManager 的运行时能力集：ILockManager 契约的超集（只增不改）。
+ *  任何 LockRequest 都是合法的 LockRenewRequest（扩展字段全可选），
+ *  既有按 ILockManager 编写的调用方零改动。 */
+export interface LockManagerRuntime extends ILockManager {
+  acquire(request: LockRenewRequest): Promise<Result<LockHandle, NukeError>>
+  tryAcquire(request: LockRenewRequest): Promise<LockHandle | null>
+  withLock<T>(
+    request: LockRenewRequest,
+    fn: (handle: LockHandle) => Promise<Result<T, NukeError>>,
+  ): Promise<Result<T, NukeError>>
+}
+
+// ─── 等待重试：指数退避 + 等值抖动（equal jitter） ─────────────
+// 旧实现的固定 50ms 自旋有惊群问题：多个等待者在同一相位醒来重试，锁释放
+// 瞬间的冲突概率随等待者数叠加。指数退避拉开重试间隔，等值抖动
+// delay ∈ [backoff/2, backoff] 打散相位且期望值不塌向 0（优于全抖动）。
+// 退避上限与旧实现的固定间隔一致（50ms）—— 短等待场景不被拖慢。
+const RETRY_BASE_MS = 5
+const RETRY_FACTOR = 2
+const RETRY_CAP_MS = 50
+
 function scopeKey(scope: LockScope): string {
   switch (scope.kind) {
     case 'global': return 'global'
@@ -46,7 +80,7 @@ function sameOwner(a: LockOwner, b: LockOwner): boolean {
   return a.pid === b.pid && a.bootToken === b.bootToken
 }
 
-export function createLockManager(options: LockManagerOptions): ILockManager {
+export function createLockManager(options: LockManagerOptions): LockManagerRuntime {
   const lockDir = path.join(options.lockRoot, LOCK_DIR_NAME)
   const now = options.now ?? (() => Date.now())
   const probe: ProcessProbe = options.probe ?? {
@@ -94,7 +128,7 @@ export function createLockManager(options: LockManagerOptions): ILockManager {
   }
 
   /** 单次获取尝试（不含等待循环） */
-  async function tryOnce(request: LockRequest): Promise<LockHandle | null> {
+  async function tryOnce(request: LockRenewRequest): Promise<LockHandle | null> {
     const p = lockPath(request.scope)
     const me = { owner: request.owner, acquiredAt: new Date(now()).toISOString(), expiresAt: now() + request.ttlMs }
 
@@ -124,68 +158,101 @@ export function createLockManager(options: LockManagerOptions): ILockManager {
 
     const lockId = crypto.randomBytes(8).toString('hex') as LockId
     let released = false
+
+    // refresh/release 的核心实现：提取为闭包，供句柄方法与自动续期共用
+    const doRefresh = async (): Promise<Result<void, NukeError>> => {
+      if (released) return err({ code: 'E_LOCK_STATE', message: '锁已释放' })
+      // refresh 也是读-改-写，与 acquire/release 共享同一 guard 互斥
+      const done = await withGuard(p, now, () => {
+        const cur = readLock(p)
+        if (!cur) return false
+        const slot = cur.owners.find(o => sameOwner(o.owner, request.owner))
+        if (!slot) return false
+        const content: LockFileContent = {
+          ...cur,
+          owners: cur.owners.map(o => sameOwner(o.owner, request.owner)
+            ? { ...o, expiresAt: now() + request.ttlMs } : o),
+        }
+        const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
+        fs.writeFileSync(tmp, JSON.stringify(content, null, 2))
+        fs.renameSync(tmp, p)
+        return true
+      })
+      if (done === null) return err({ code: 'E_LOCK_STATE', message: '刷新锁失败：互斥 guard 在等待窗口内不可用' })
+      if (done === false) return err({ code: 'E_LOCK_STALE', message: '锁文件已消失或本持有者已不在锁中（可能被安全破锁）' })
+      return ok(undefined)
+    }
+
+    const doRelease = async (): Promise<Result<void, NukeError>> => {
+      if (released) return ok(undefined) // 幂等
+      released = true
+      try {
+        // exclusive：unlink 原子，无需互斥；shared：读-改-写必须进 guard，
+        // 否则两个并发 release 的 rename 互相覆盖，丢失对方的移除结果。
+        if (request.mode === 'shared') {
+          const done = await withGuard(p, now, () => {
+            const cur = readLock(p)
+            if (!cur) return true
+            const rest = cur.owners.filter(o => !sameOwner(o.owner, request.owner))
+            if (rest.length === 0) {
+              try { fs.unlinkSync(p) } catch {}
+            } else {
+              const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
+              fs.writeFileSync(tmp, JSON.stringify({ ...cur, owners: rest }, null, 2))
+              fs.renameSync(tmp, p)
+            }
+            return true
+          })
+          if (done !== true) {
+            return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用' })
+          }
+        } else {
+          try { fs.unlinkSync(p) } catch {}
+        }
+        return ok(undefined)
+      } catch (e) {
+        return err(ioError('释放锁失败', e))
+      }
+    }
+
+    // ─── 自动心跳续期：acquire 携带 autoRenewMs > 0 时启用 ──────
+    // 后台定时 refresh 防 TTL 到期被安全破锁；release 时清除（不清除 =
+    // 定时器泄漏 + 已释放锁被反复"复活"）。锁确认丢失（E_LOCK_STALE）
+    // 后停跳止血 —— 对已不存在的锁续期只是空转 IO。
+    // unref()：心跳不阻止进程正常退出（守护语义，非生命周期语义）。
+    const autoRenewMs = request.autoRenewMs
+    let renewTimer: NodeJS.Timeout | null = null
+    const stopAutoRenew = (): void => {
+      if (renewTimer !== null) {
+        clearInterval(renewTimer)
+        renewTimer = null
+      }
+    }
+    if (autoRenewMs !== undefined && autoRenewMs > 0) {
+      renewTimer = setInterval(() => {
+        void doRefresh().then(r => {
+          if (!r.ok && r.error.code === 'E_LOCK_STALE') stopAutoRenew()
+        })
+      }, autoRenewMs)
+      renewTimer.unref()
+    }
+
     return {
       id: lockId,
       request,
       acquiredAt: me.acquiredAt,
-      async refresh() {
-        if (released) return err({ code: 'E_LOCK_STATE', message: '锁已释放' })
-        // refresh 也是读-改-写，与 acquire/release 共享同一 guard 互斥
-        const done = await withGuard(p, now, () => {
-          const cur = readLock(p)
-          if (!cur) return false
-          const slot = cur.owners.find(o => sameOwner(o.owner, request.owner))
-          if (!slot) return false
-          const content: LockFileContent = {
-            ...cur,
-            owners: cur.owners.map(o => sameOwner(o.owner, request.owner)
-              ? { ...o, expiresAt: now() + request.ttlMs } : o),
-          }
-          const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
-          fs.writeFileSync(tmp, JSON.stringify(content, null, 2))
-          fs.renameSync(tmp, p)
-          return true
-        })
-        if (done === null) return err({ code: 'E_LOCK_STATE', message: '刷新锁失败：互斥 guard 在等待窗口内不可用' })
-        if (done === false) return err({ code: 'E_LOCK_STALE', message: '锁文件已消失或本持有者已不在锁中（可能被安全破锁）' })
-        return ok(undefined)
-      },
+      refresh: doRefresh,
       async release() {
-        if (released) return ok(undefined) // 幂等
-        released = true
-        try {
-          // exclusive：unlink 原子，无需互斥；shared：读-改-写必须进 guard，
-          // 否则两个并发 release 的 rename 互相覆盖，丢失对方的移除结果。
-          if (request.mode === 'shared') {
-            const done = await withGuard(p, now, () => {
-              const cur = readLock(p)
-              if (!cur) return true
-              const rest = cur.owners.filter(o => !sameOwner(o.owner, request.owner))
-              if (rest.length === 0) {
-                try { fs.unlinkSync(p) } catch {}
-              } else {
-                const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
-                fs.writeFileSync(tmp, JSON.stringify({ ...cur, owners: rest }, null, 2))
-                fs.renameSync(tmp, p)
-              }
-              return true
-            })
-            if (done !== true) {
-              return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用' })
-            }
-          } else {
-            try { fs.unlinkSync(p) } catch {}
-          }
-          return ok(undefined)
-        } catch (e) {
-          return err(ioError('释放锁失败', e))
-        }
+        // 先停心跳再释放：避免释放后残留一轮续期与 unlink 竞争
+        stopAutoRenew()
+        return await doRelease()
       },
     }
   }
 
-  async function acquire(request: LockRequest): Promise<Result<LockHandle, NukeError>> {
+  async function acquire(request: LockRenewRequest): Promise<Result<LockHandle, NukeError>> {
     const deadline = now() + request.waitTimeoutMs
+    let attempt = 0
     for (;;) {
       const handle = await tryOnce(request)
       if (handle) return ok(handle)
@@ -198,7 +265,11 @@ export function createLockManager(options: LockManagerOptions): ILockManager {
           message: `获取锁超时（${request.waitTimeoutMs}ms）：scope=${scopeKey(request.scope)} mode=${request.mode}，当前持有: ${holders}`,
         })
       }
-      await sleep(Math.min(50, Math.max(1, deadline - now())))
+      // 指数退避 + 等值抖动（见常量块注释）；绝不睡过截止线
+      const backoff = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * RETRY_FACTOR ** attempt)
+      const jittered = backoff / 2 + Math.random() * (backoff / 2)
+      await sleep(Math.min(Math.max(1, jittered), Math.max(1, deadline - now())))
+      attempt++
     }
   }
 
@@ -206,7 +277,7 @@ export function createLockManager(options: LockManagerOptions): ILockManager {
     acquire,
     async tryAcquire(request) { return await tryOnce(request) },
 
-    async withLock<T>(request: LockRequest, fn: (handle: LockHandle) => Promise<Result<T, NukeError>>): Promise<Result<T, NukeError>> {
+    async withLock<T>(request: LockRenewRequest, fn: (handle: LockHandle) => Promise<Result<T, NukeError>>): Promise<Result<T, NukeError>> {
       const got = await acquire(request)
       if (!got.ok) return got
       try {

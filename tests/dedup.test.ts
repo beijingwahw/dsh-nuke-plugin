@@ -124,11 +124,12 @@ describe('DedupAnalyzer 三级瀑布（突破升级守护）', () => {
     expect(st.bytesSavedBySampling).toBe(3 * (8192 + 10))
   })
 
-  it('头尾相同中段不同（采样盲区）→ 采样碰撞后全量裁决为非重复', async () => {
+  it('头尾相同中段不同 → 中段采样直接淘汰（旧盲区已消除，零全量哈希）', async () => {
     const base = mkDir()
     const nm = path.join(base, 'nm')
     fs.mkdirSync(nm, { recursive: true })
-    // 头尾各 4KB 相同，中段不同：采样指纹相同 → 必须落全量哈希 → 判定不同内容
+    // 头尾各 4KB 相同，中段不同：旧头尾双段采样会碰撞（盲区），
+    // 三段采样的中段窗口正落在差异区 → 阶段二即淘汰
     const head = Buffer.alloc(4096, 1)
     const tail = Buffer.alloc(4096, 2)
     const mid1 = Buffer.alloc(8192, 0xAA)
@@ -139,8 +140,32 @@ describe('DedupAnalyzer 三级瀑布（突破升级守护）', () => {
     const r = await analyzer.analyze({ roots: [nm] as any, minSizeBytes: 1 })
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    // 采样碰撞但全量不同 → 不是重复组（正确性关键：采样绝不产生最终判定）
+    // 无重复组（正确性不变），且中段采样省掉了全量哈希
     expect(r.value.groups.length).toBe(0)
+    expect(r.value.stages!.sampleEliminated).toBe(2)
+    expect(r.value.stages!.fullHashed).toBe(0)
+  })
+
+  it('三段采样窗口外的差异 → 采样碰撞后全量裁决为非重复（零误报兜底）', async () => {
+    const base = mkDir()
+    const nm = path.join(base, 'nm')
+    fs.mkdirSync(nm, { recursive: true })
+    // 16KB 文件，三段采样窗口 = 头 [0,4K) / 中 [6144,10240) / 尾 [12K,16K)。
+    // 差异放在 [4K,6K) —— 三段指纹完全相同，但内容不同：
+    // 必须落入全量哈希 → 判定非重复（采样只是过滤器，绝不产生最终判定）
+    const size = 16384
+    const mk = (diffByte: number): Buffer => {
+      const b = Buffer.alloc(size, 0x01)
+      b.fill(diffByte, 4096, 4097)   // 采样窗口外的单字节差异
+      return b
+    }
+    fs.writeFileSync(path.join(nm, 'f1'), mk(0xCC))
+    fs.writeFileSync(path.join(nm, 'f2'), mk(0xDD))
+    const analyzer = createDedupAnalyzer({ dshHome: base })
+    const r = await analyzer.analyze({ roots: [nm] as any, minSizeBytes: 1 })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.groups.length).toBe(0)   // 全量裁决：内容确实不同
     expect(r.value.stages!.fullHashed).toBe(2)
   })
 

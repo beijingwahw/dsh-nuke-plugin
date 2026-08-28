@@ -3,6 +3,18 @@
 // 取消：每处理一个根目录检查一次 AbortSignal；触发即停止并补发 done。
 // 增量模式：注入 IScanCache 后，checkpoint 结果按 mtime+size 指纹复用 ——
 // 二次扫描跳过 contains 全文读取与 dirSize 递归（最贵的两类 IO）。
+//
+// 本轮升级（infra walk 迁移 + 进度事件限频）：
+//   1. 目录体积全部迁移到 dirSizeAsync（统一遍历原语 walk 的流式实现）：
+//      数值语义与旧 dirSize 逐位一致（symlink 计 0 / 读不到按 0 / 深度 64），
+//      但体积计算中途可被 AbortSignal 立即中止 —— 旧同步递归一旦进入就
+//      无法打断，取消后仍要跑完整棵树。
+//   2. progress 事件限频：全局模式（N 插件 × 6 检查点）下逐路径 progress
+//      是事件洪泛，会淹没 UI/IPC 通道。默认 100ms 窗口内合并 —— 窗口内
+//      只发最后一个计数（scannedPaths 字段语义不变，事件变少而已）；
+//      首事件必发；另有数量保底（每 1000 路径强制一发）防时钟停滞时
+//      进度永久静默。progressIntervalMs=0 关闭限频（旧逐路径行为）。
+//      found/root-summary/done 低频高价值，不受限频影响。
 import * as fs from 'fs'
 import * as path from 'path'
 import type { AbsolutePath, PluginName, ProfileName } from '../contracts/base'
@@ -10,7 +22,7 @@ import type {
   IResidualScanner, ScanEvent, ScanRequest,
 } from '../contracts/scan'
 import type { ResidualEvidence, ResidualKind } from '../contracts/scoring'
-import { dirSize, tempOrphanEntries } from '../infra/fs-utils'
+import { dirSizeAsync, tempOrphanEntries } from '../infra/fs-utils'
 import type { IScanCache } from '../infra/scan-cache'
 
 export interface ResidualScannerOptions {
@@ -21,9 +33,16 @@ export interface ResidualScannerOptions {
   /** 增量扫描缓存（强烈建议注入）：命中则零 IO 复用，未注入则每次全量计算 */
   readonly scanCache?: IScanCache
   readonly now?: () => Date
+  /** progress 事件限频窗口（ms）：窗口内的事件合并为最后一个计数，默认 100；
+   *  0 = 关闭限频（逐路径事件，旧行为）。首事件必发；时钟停滞时每
+   *  PROGRESS_HARD_GAP 个路径强制发一次（进度永不永久静默） */
+  readonly progressIntervalMs?: number
 }
 
 const TEMP_MARKER_RE = /dsh|deepseek|cordis/i
+
+/** 数量保底：即使时钟完全停滞，积压这么多路径也强制发一次 progress */
+const PROGRESS_HARD_GAP = 1000
 
 export function createResidualScanner(options: ResidualScannerOptions): IResidualScanner {
   const now = options.now ?? (() => new Date())
@@ -103,6 +122,26 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
     let totalFound = 0
     let bytesReclaimable = 0
     const cancelled = () => request.signal?.aborted ?? false
+    const intervalMs = options.progressIntervalMs ?? 100
+
+    // 限频状态：上次发射时刻（-∞ 保证首事件必发）与发射时的路径计数。
+    // 窗口内的事件被合并 —— scannedPaths 字段始终携带最新真实计数
+    const lastEmit = { atMs: Number.NEGATIVE_INFINITY, count: 0 }
+    const progressDue = (): boolean => {
+      if (intervalMs <= 0) return true
+      return now().getTime() - lastEmit.atMs >= intervalMs
+        || scannedPaths - lastEmit.count >= PROGRESS_HARD_GAP
+    }
+    const markEmitted = () => {
+      lastEmit.atMs = now().getTime()
+      lastEmit.count = scannedPaths
+    }
+
+    // dirSizeAsync 选项：signal 存在才透传（exactOptionalPropertyTypes）。
+    // 体积计算中途 abort → walk 立即停止，不再跑完整棵树
+    const walkOpts = request.signal !== undefined
+      ? { signal: request.signal }
+      : {}
 
     const profiles = request.profile ? [request.profile] : listProfiles()
 
@@ -122,7 +161,10 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
         for (const cp of checkPoints(plugin, profile)) {
           if (cancelled()) break
           scannedPaths++
-          yield { type: 'progress', scannedPaths, currentRoot: path.dirname(cp.location) }
+          if (progressDue()) {
+            markEmitted()
+            yield { type: 'progress', scannedPaths, currentRoot: path.dirname(cp.location) }
+          }
 
           // 单次 stat 同时完成：存在性 + 体积 + atime + 缓存指纹校验
           let stat: fs.Stats | null = null
@@ -155,7 +197,7 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
           } else if (cached?.dirBytes !== undefined) {
             size = cached.dirBytes
           } else {
-            size = dirSize(cp.location)
+            size = await dirSizeAsync(cp.location, walkOpts)
             cache?.set(cp.location, {
               mtimeMs: stat.mtimeMs, size: stat.size, dirBytes: size,
             })
@@ -178,7 +220,7 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
       const pd = path.join(options.dshHome, 'profiles', profile)
       yield {
         type: 'root-summary', root: pd,
-        bytesScannable: dirSize(pd),
+        bytesScannable: await dirSizeAsync(pd, walkOpts),
       }
     }
 
@@ -201,7 +243,7 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
           }),
         }
       }
-      yield { type: 'root-summary', root: options.tempRoot, bytesScannable: dirSize(options.tempRoot) }
+      yield { type: 'root-summary', root: options.tempRoot, bytesScannable: await dirSizeAsync(options.tempRoot, walkOpts) }
     }
 
     // 扫描收尾：增量缓存落盘（原子写；无变更零 IO）

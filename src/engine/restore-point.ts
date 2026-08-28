@@ -7,7 +7,7 @@
 import * as fs from 'fs'
 import * as path from 'path'
 import * as crypto from 'crypto'
-import type { AbsolutePath } from '../contracts/base'
+import type { AbsolutePath, NukeError, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import { copyAtomic, writeJsonAtomic } from '../infra/fs-utils'
 import type { IRestorePointManager, RestorePointFile, RestorePointMeta } from '../contracts/restore-point.contract'
@@ -17,6 +17,14 @@ export interface RestorePointOptions {
   /** 还原点根目录，通常 <dshHome>/.nuke/restore-points */
   readonly nukeRoot: string
   readonly now?: () => Date
+  /** V5：保留策略上限 —— 还原点数超出时自动淘汰最旧者（缺省不限制）。
+   *  无效配置（非整数 / < 1）视为未设置（与 prune 的 keep≥1 安全网同纪律）。
+   *  淘汰生效的前提是能拿到事务信息（见 unfinishedTxPaths）。 */
+  readonly maxPoints?: number
+  /** V5：未终结事务的路径占用查询 —— 返回被任何未终结事务 manifest 引用的
+   *  绝对路径（originalPath ∪ backupPath）。返回 null / 未注入 / 抛异常 =
+   *  拿不到事务信息 → 保守跳过本轮全部淘汰（宁可多留不可误删）。 */
+  readonly unfinishedTxPaths?: () => readonly string[] | null
 }
 
 /** home 级关键配置（不含 profile 子目录） */
@@ -55,6 +63,60 @@ export function createRestorePointManager(options: RestorePointOptions): IRestor
       }
       return m
     } catch { return null }
+  }
+
+  /** 内容指纹（sha256 前 16 hex，与事务备份的 FileFingerprint 同风格） */
+  function digestOf(text: string): string {
+    return crypto.createHash('sha256').update(text, 'utf-8').digest('hex').slice(0, 16)
+  }
+
+  /** 全部还原点（createdAt 降序）；list() 方法与 evictOverflow 共用 */
+  function listAll(): RestorePointMeta[] {
+    try {
+      return fs
+        .readdirSync(rootDir, { withFileTypes: true })
+        .filter(e => e.isDirectory())
+        .map(e => readMeta(e.name))
+        .filter((m): m is RestorePointMeta => m !== null)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    } catch { return [] }
+  }
+
+  /** V5：保留策略淘汰 —— 超出 maxPoints 时从最旧端逐个淘汰。
+   *  安全闸（按序）：
+   *    1. maxPoints 无效（非整数 / <1）→ 不生效；
+   *    2. 拿不到事务信息（未注入 / 查询抛异常 / 返回 null）→ 本轮全部跳过
+   *       （宁可多留不可误删）；
+   *    3. 候选还原点目录与任一未终结事务占用路径存在包含关系（任一方向）
+   *       → 视为在用，跳过该候选，继续尝试更旧的；
+   *    4. id 未过白名单（meta 被篡改）→ 跳过。
+   *  返回实际淘汰数。 */
+  function evictOverflow(): number {
+    const maxPoints = options.maxPoints
+    if (typeof maxPoints !== 'number' || !Number.isInteger(maxPoints) || maxPoints < 1) return 0
+    let occupiedPaths: readonly string[] | null = null
+    if (typeof options.unfinishedTxPaths === 'function') {
+      try { occupiedPaths = options.unfinishedTxPaths() } catch { occupiedPaths = null }
+    }
+    if (occupiedPaths === null) return 0   // 拿不到事务信息：保守跳过全部淘汰
+    const occupied = [...occupiedPaths].map(p => path.resolve(p))
+    const all = listAll()   // createdAt 降序（最新在前）
+    const excess = all.length - maxPoints
+    if (excess <= 0) return 0
+    let evicted = 0
+    // 从最旧端（数组末尾）开始淘汰，跳过在用者
+    for (let i = all.length - 1; i >= 0 && evicted < excess; i--) {
+      const cand = all[i]!
+      const dir = path.resolve(rootDir, cand.id)
+      const inUse = occupied.some(p =>
+        p === dir || p.startsWith(dir + path.sep) || dir.startsWith(p + path.sep))
+      if (inUse) continue
+      const target = metaPath(cand.id)
+      if (!target) continue
+      try { fs.rmSync(path.dirname(target), { recursive: true, force: true }) } catch { continue }
+      evicted++
+    }
+    return evicted
   }
 
   return {
@@ -99,7 +161,27 @@ export function createRestorePointManager(options: RestorePointOptions): IRestor
           id, createdAt: now().toISOString(), actor: input.actor,
           reason: input.reason, profile: input.profile, files,
         }
-        writeJsonAtomic(path.join(dir, 'meta.json'), meta)
+        // V5 读回校验（fail-closed）：写入序列化内容 → 立即读回 → hash 比对。
+        // 不一致说明磁盘/文件系统在落盘路径上出了问题（坏扇区、注入、序列化
+        // 歧义）——这个还原点不可信，宁可当作创建失败也不交付伪快照。
+        const metaFile = path.join(dir, 'meta.json')
+        const expectedText = JSON.stringify(meta, null, 2)
+        writeJsonAtomic(metaFile, meta)
+        const abortPoint = (cause: string): Result<never, NukeError> => {
+          try { fs.rmSync(dir, { recursive: true, force: true }) } catch { /* 清理尽力而为 */ }
+          return err(ioError(cause, new Error('读回内容与写入内容指纹不一致')))
+        }
+        let readBack: string
+        try {
+          readBack = fs.readFileSync(metaFile, 'utf-8')
+        } catch (e) {
+          return err(ioError('还原点读回校验失败（manifest 不可读）', e))
+        }
+        if (digestOf(readBack) !== digestOf(expectedText)) {
+          return abortPoint('还原点读回校验失败（manifest 内容不一致）')
+        }
+        // V5 保留策略：超上限自动淘汰最旧（内部自带全部安全闸）
+        evictOverflow()
         return ok(meta)
       } catch (e) {
         return err(ioError('创建还原点失败', e))
@@ -107,14 +189,7 @@ export function createRestorePointManager(options: RestorePointOptions): IRestor
     },
 
     list() {
-      try {
-        return fs
-          .readdirSync(rootDir, { withFileTypes: true })
-          .filter(e => e.isDirectory())
-          .map(e => readMeta(e.name))
-          .filter((m): m is RestorePointMeta => m !== null)
-          .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
-      } catch { return [] }
+      return listAll()
     },
 
     async restore(id) {

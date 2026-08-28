@@ -110,3 +110,169 @@ describe('pre-hook 纵深防御', () => {
     expect(allowed).toBeUndefined()
   })
 })
+
+// ─── V5：冻结窗规则（修复 V4 整合缺口：hitFreezeWindow 此前零调用） ──
+
+describe('V5 冻结窗（FREEZE_WINDOW）', () => {
+  it('命中冻结窗 → FREEZE_WINDOW；窗口外放行', () => {
+    writePolicy({ freezeWindows: [{ startHour: 1, endHour: 5 }] })
+    const hit = guard(3).check({ plugins: ['a' as any], estimatedBytes: null })
+    const miss = guard(12).check({ plugins: ['a' as any], estimatedBytes: null })
+    expect(hit.ok && hit.value.some(v => v.rule === 'FREEZE_WINDOW')).toBe(true)
+    expect(miss.ok && miss.value.length).toBe(0)
+  })
+
+  it('跨零点冻结窗（22-6）：夜/晨命中，白天放行', () => {
+    writePolicy({ freezeWindows: [{ startHour: 22, endHour: 6 }] })
+    const night = guard(23).check({ plugins: ['a' as any], estimatedBytes: null })
+    const dawn = guard(5).check({ plugins: ['a' as any], estimatedBytes: null })
+    const day = guard(12).check({ plugins: ['a' as any], estimatedBytes: null })
+    expect(night.ok && night.value.some(v => v.rule === 'FREEZE_WINDOW')).toBe(true)
+    expect(dawn.ok && dawn.value.some(v => v.rule === 'FREEZE_WINDOW')).toBe(true)
+    expect(day.ok && day.value.length).toBe(0)
+  })
+
+  it('多重窗口任一命中即拒绝，reason 透出到 message', () => {
+    writePolicy({
+      freezeWindows: [
+        { startHour: 2, endHour: 3, reason: '数据库备份窗口' },
+        { startHour: 10, endHour: 12 },
+      ],
+    })
+    const r = guard(11).check({ plugins: ['a' as any], estimatedBytes: null })
+    expect(r.ok && r.value.length).toBe(1)
+    if (r.ok && r.value[0]) {
+      expect(r.value[0].rule).toBe('FREEZE_WINDOW')
+      expect(r.value[0].message).toContain('10:00-12:00')
+    }
+    const r2 = guard(2).check({ plugins: ['a' as any], estimatedBytes: null })
+    expect(r2.ok && r2.value[0]?.message).toContain('数据库备份窗口')
+  })
+
+  it('freezeWindows 缺省/空列表 → 规则不启用（向后兼容）', () => {
+    writePolicy({ freezeWindows: [] })
+    const r = guard(0).check({ plugins: ['a' as any], estimatedBytes: null })
+    expect(r.ok && r.value.length).toBe(0)
+  })
+})
+
+// ─── V5：单事务文件数上限规则（修复 V4 整合缺口：fileCount 此前无人消费） ──
+
+describe('V5 单事务文件数上限（TOO_MANY_FILES）', () => {
+  it('fileCount 超上限 → TOO_MANY_FILES', () => {
+    writePolicy({ maxFilesPerTx: 100 })
+    const r = guard().check({ plugins: ['a' as any], estimatedBytes: null, fileCount: 101 })
+    expect(r.ok && r.value.some(v => v.rule === 'TOO_MANY_FILES')).toBe(true)
+  })
+
+  it('fileCount 等于上限 → 放行（边界含等号）', () => {
+    writePolicy({ maxFilesPerTx: 100 })
+    const r = guard().check({ plugins: ['a' as any], estimatedBytes: null, fileCount: 100 })
+    expect(r.ok && r.value.length).toBe(0)
+  })
+
+  it('fileCount 缺省/未统计（undefined/null）→ 跳过判定（向后兼容）', () => {
+    writePolicy({ maxFilesPerTx: 1 })
+    const r1 = guard().check({ plugins: ['a' as any], estimatedBytes: null })
+    const r2 = guard().check({ plugins: ['a' as any], estimatedBytes: null, fileCount: null })
+    expect(r1.ok && r1.value.length).toBe(0)
+    expect(r2.ok && r2.value.length).toBe(0)
+  })
+
+  it('策略未配置 maxFilesPerTx → 跳过判定', () => {
+    writePolicy({ protectedPlugins: [] })
+    const r = guard().check({ plugins: ['a' as any], estimatedBytes: null, fileCount: 999_999 })
+    expect(r.ok && r.value.length).toBe(0)
+  })
+})
+
+describe('V5 违规附带 suggestion', () => {
+  it('全部 7 种规则可同时触发，且每条 suggestion 均为含 policy.json 的可读建议', () => {
+    writePolicy({
+      protectedPlugins: ['@corp/critical'],
+      maxPluginsPerTx: 1,
+      maxFilesPerTx: 10,
+      maxReclaimBytesPerTx: 1024,
+      minFreeDiskBytes: 100 * 1024 ** 3,
+      blackout: { startHour: 0, endHour: 23 },
+      freezeWindows: [{ startHour: 0, endHour: 23 }],
+    })
+    const r = guard(12, 1 * 1024 ** 3).check({
+      plugins: ['@corp/critical' as any, 'b' as any],
+      estimatedBytes: 2048,
+      fileCount: 11,
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(new Set(r.value.map(v => v.rule))).toEqual(new Set([
+      'PROTECTED_PLUGIN', 'TOO_MANY_PLUGINS', 'TOO_MANY_FILES', 'RECLAIM_CAP',
+      'LOW_FREE_DISK', 'BLACKOUT_WINDOW', 'FREEZE_WINDOW',
+    ]))
+    for (const v of r.value) {
+      expect(typeof v.suggestion).toBe('string')
+      expect(v.suggestion!.length).toBeGreaterThan(4)
+      expect(v.suggestion).toContain('policy.json')
+    }
+  })
+})
+
+// ─── V5：策略文件加载校验（非法配置绝不静默生效） ──
+
+describe('V5 策略加载校验（loadValidated）', () => {
+  it('合法配置 → issues 为空，字段原样生效', () => {
+    writePolicy({ maxPluginsPerTx: 5, freezeWindows: [{ startHour: 1, endHour: 3 }], maxFilesPerTx: 10 })
+    const report = guard().loadValidated()
+    expect(report.issues.length).toBe(0)
+    expect(report.policy.maxPluginsPerTx).toBe(5)
+    expect(report.policy.maxFilesPerTx).toBe(10)
+    expect(report.policy.freezeWindows?.length).toBe(1)
+  })
+
+  it('负数/小数上限 → 忽略为 null 并给出 issue 定位', () => {
+    writePolicy({ maxPluginsPerTx: -1, maxFilesPerTx: 2.5 })
+    const report = guard().loadValidated()
+    expect(report.policy.maxPluginsPerTx).toBeNull()
+    expect(report.policy.maxFilesPerTx).toBeNull()
+    expect(report.issues.length).toBe(2)
+    expect(report.issues.some(i => i.field === 'maxPluginsPerTx')).toBe(true)
+    expect(report.issues.every(i => i.problem.length > 0)).toBe(true)
+  })
+
+  it('畸形冻结窗项（小时越界/非整数）→ 剔除并定位 freezeWindows[i]', () => {
+    writePolicy({
+      freezeWindows: [
+        { startHour: 1, endHour: 3 },
+        { startHour: 25, endHour: 6 },
+        { startHour: 2.5, endHour: 6 },
+      ],
+    })
+    const report = guard().loadValidated()
+    expect(report.policy.freezeWindows?.length).toBe(1)
+    expect(report.issues.length).toBe(2)
+    expect(report.issues.some(i => i.field === 'freezeWindows[1]')).toBe(true)
+    expect(report.issues.some(i => i.field === 'freezeWindows[2]')).toBe(true)
+  })
+
+  it('非数组 freezeWindows / 畸形 blackout → 整体忽略并给出 issue', () => {
+    writePolicy({ freezeWindows: 'nope', blackout: { startHour: -1, endHour: 6 } })
+    const report = guard().loadValidated()
+    expect(report.policy.freezeWindows).toBeUndefined()
+    expect(report.policy.blackout).toBeNull()
+    expect(report.issues.length).toBe(2)
+    expect(report.issues.some(i => i.field === 'freezeWindows')).toBe(true)
+    expect(report.issues.some(i => i.field === 'blackout')).toBe(true)
+  })
+
+  it('非法项被忽略后不影响 check() 判定（-1 若被静默接受将误伤一切请求）', () => {
+    writePolicy({ maxFilesPerTx: -1, maxPluginsPerTx: -3 })
+    const r = guard().check({ plugins: ['a' as any], estimatedBytes: null, fileCount: 100 })
+    expect(r.ok && r.value.length).toBe(0)
+  })
+
+  it('文件缺失 → 默认全放行且无 issue（fail-open 行为保持）', () => {
+    fs.rmSync(policyFile, { force: true })
+    const report = guard().loadValidated()
+    expect(report.issues.length).toBe(0)
+    expect(report.policy.protectedPlugins.length).toBe(0)
+  })
+})

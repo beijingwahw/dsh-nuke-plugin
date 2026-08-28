@@ -1,13 +1,15 @@
 // src/infra/validator.ts — IInputValidator 实现：全量防注入校验
 import type { AbsolutePath, PluginName, ProfileName } from '../contracts/base'
 import type {
-  IInputValidator, Violation, ViolationKind,
+  IInputValidator, ValidationRequest, Violation, ViolationKind,
 } from '../contracts/validation'
 import { err, errorToMessage, ok } from '../contracts/base'
 
 // npm 包名规范：[scope/]name，字符集 [a-z0-9-._~]，总长 ≤ 214
 const PLUGIN_NAME_RE = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/
-const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9-]{0,63}$/
+// profile 名与插件名同等白名单字符集 [a-z0-9-._~]（消除两套字符集规则的漂移面；
+// 仍保留 profile 自身约束：无 @scope 前缀、总长 1~64、保留目录名拒绝）
+const PROFILE_NAME_RE = /^[a-z0-9-][a-z0-9-._~]{0,63}$/
 const RESERVED_PROFILES = new Set(['profiles', 'storages', 'attachments', 'sessions', 'node_modules', 'global'])
 const NUL_RE = /\0/
 // 注入字符：命令替换/管道/分号/反引号 —— argv 数组模式本身无 shell，
@@ -35,7 +37,7 @@ export function createValidator(
 ): IInputValidator {
   const isWin = platform === 'windows'
 
-  return {
+  const validator: IInputValidator = {
     validatePluginName(input: string) {
       const violations: Violation[] = []
       if (!input || input.length === 0) return err([v('empty', '插件名为空', 'pluginName')])
@@ -54,7 +56,7 @@ export function createValidator(
       if (!input || input.length === 0) return err([v('empty', 'profile 名为空', 'profileName')])
       if (NUL_RE.test(input)) violations.push(v('nul-byte', '包含 NUL 字节', 'profileName'))
       if (!PROFILE_NAME_RE.test(input)) {
-        violations.push(v('charset', '仅允许 [a-z0-9-]，首字符须为字母或数字，长度 1~64', 'profileName'))
+        violations.push(v('charset', '仅允许 [a-z0-9-._~]（与插件名同等白名单字符集），首字符须为字母/数字/连字符，长度 1~64', 'profileName'))
       }
       if (RESERVED_PROFILES.has(input)) {
         violations.push(v('syntax', `"${input}" 是保留目录名`, 'profileName'))
@@ -138,6 +140,34 @@ export function createValidator(
       return violations.length ? err(violations) : ok(argv)
     },
 
+    validateAll(request: ValidationRequest) {
+      // 批量模式：逐字段校验并汇总全部错误（而非首错即停），供上层一次性展示；
+      // 缺省字段跳过该项校验
+      const violations: Violation[] = []
+      if (request.pluginName !== undefined) {
+        const r = validator.validatePluginName(request.pluginName)
+        if (!r.ok) violations.push(...r.error)
+      }
+      if (request.profileName !== undefined) {
+        const r = validator.validateProfileName(request.profileName)
+        if (!r.ok) violations.push(...r.error)
+      }
+      if (request.path !== undefined) {
+        const opts = request.pathOptions ?? { mustBeAbsolute: false, strictWindows: false }
+        const r = validator.validatePath(request.path, opts)
+        if (!r.ok) violations.push(...r.error)
+      }
+      if (request.regex !== undefined) {
+        const r = validator.validateRegex(request.regex)
+        if (!r.ok) violations.push(...r.error)
+      }
+      if (request.commandArgv !== undefined) {
+        const r = validator.validateCommandArgv(request.commandArgv, request.allowBin ?? [])
+        if (!r.ok) violations.push(...r.error)
+      }
+      return violations.length ? err(violations) : ok(undefined)
+    },
+
     sanitizeForDisplay(input: string): string {
       // 剥离 ANSI 转义序列与其余 C0 控制字符，防终端转义注入
       return input
@@ -147,4 +177,5 @@ export function createValidator(
         .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '')
     },
   }
+  return validator
 }

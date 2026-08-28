@@ -110,3 +110,60 @@ describe('sanitizeForDisplay', () => {
     expect(lin.sanitizeForDisplay('a\x00b\x07c')).toBe('abc')
   })
 })
+
+// ─── V5：profile 名字符集与插件名白名单对齐 ──
+
+describe('V5 profile 名字符集（与插件名同等白名单 [a-z0-9-._~]）', () => {
+  it.each(['web.profile_1', 'a~b', 'x-y.z'])('接受对齐字符集 profile %s', (name) => {
+    expect(lin.validateProfileName(name).ok).toBe(true)
+  })
+  it.each(['@scope/x', 'web profile', '.hidden', '_under', 'UPPER'])(
+    '仍拒绝非法 profile %s', (name) => {
+      expect(lin.validateProfileName(name).ok).toBe(false)
+    })
+})
+
+// ─── V5：批量校验（validateAll 汇总全部错误） ──
+
+describe('V5 validateAll 批量校验', () => {
+  it('多字段同时非法 → 一次性汇总全部字段错误', () => {
+    const r = lin.validateAll({
+      pluginName: 'BAD NAME',
+      profileName: 'profiles',
+      path: 'rel/../x',
+      regex: '(a+)+',
+      commandArgv: ['sh', '-c'],
+      allowBin: ['node'],
+    })
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      const fields = new Set(r.error.map(v => v.field))
+      expect(fields.has('pluginName')).toBe(true)
+      expect(fields.has('profileName')).toBe(true)
+      expect(fields.has('path')).toBe(true)
+      expect(fields.has('regex')).toBe(true)
+      expect(fields.has('command')).toBe(true)
+      expect(r.error.length).toBeGreaterThanOrEqual(5)
+    }
+  })
+
+  it('全部字段合法 → ok', () => {
+    const r = lin.validateAll({
+      pluginName: 'dsh-nuke-plugin',
+      profileName: 'web',
+      path: '/tmp/ok/file.txt',
+      pathOptions: { mustBeAbsolute: true, strictWindows: false },
+      regex: '^dsh-.*$',
+      commandArgv: ['node', '-v'],
+      allowBin: ['node'],
+    })
+    expect(r.ok).toBe(true)
+  })
+
+  it('缺省字段跳过（仅校验提供的字段）', () => {
+    expect(lin.validateAll({ pluginName: 'pkg' }).ok).toBe(true)
+    const r = lin.validateAll({ profileName: 'PROFILES' })
+    expect(r.ok).toBe(false)
+    if (!r.ok) expect(r.error.every(v => v.field === 'profileName')).toBe(true)
+  })
+})

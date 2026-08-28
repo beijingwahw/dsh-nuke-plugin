@@ -3,7 +3,7 @@
 > DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
-[![Tests](https://img.shields.io/badge/tests-222%2F222-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
+[![Tests](https://img.shields.io/badge/tests-444%2F444-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -169,6 +169,90 @@ dry-run 是确定性预演，先知是概率化推演。每次清理的每个步
             → 再执行 → 数据更准 → ...
 ```
 
+## V5 全模块升级总览
+
+V5 聚焦 V4 未覆盖的模块与一处真实整合缺口，全部向后兼容，零新增运行时依赖。
+
+### 关键修复：V4 整合缺口（真实缺陷）
+
+V4 在契约中定义了 `freezeWindows`/`maxFilesPerTx`，但守卫从未执行（`hitFreezeWindow` 零调用、`fileCount` 无人供给）。V5 补全完整链条：
+
+- **FREEZE_WINDOW**：`hitFreezeWindow` 纯函数（跨零点/多窗支持）接入 policy-guard 首查
+- **TOO_MANY_FILES**：`dirStats`（一次遍历产出字节+文件数）→ fs-ops/edit-ops preview 填充 `OperationPlan.fileCount` → commit 前预飞 dry-run 汇总 → 守卫第二道闸门
+- **commit 前预飞复查**：执行前零副作用预演拿真实文件数再过策略（预演结果同时预热 estimates，零额外成本）
+
+### infra 剩余模块
+
+| 模块 | 升级 |
+|---|---|
+| policy-guard | 冻结窗/文件数上限真正执行；策略文件加载校验（非法配置 fail-closed 忽略并定位到字段级 issue）；全部违规附带人类可读修复建议 |
+| path-resolver | NFC Unicode 归一（杜绝同形异码绕过白名单）；控制字符路径拒绝；darwin/win32 大小写不敏感白名单匹配 |
+| validator | `validateAll` 批量校验一次返回全部错误；profile 字符集与插件名对齐 |
+| logger | 结构化 JSONL 模式（机器可读）；`child(bindings)` 上下文子日志器 |
+| reporter | Markdown/JSON 报告汇总统计区（按动作分组回收量、成功率、总量） |
+
+### engine 剩余模块
+
+| 模块 | 升级 |
+|---|---|
+| transaction-engine | dry-run 预览有界并发（默认 4，输出顺序稳定）；commit 每步耗时进审计 detail |
+| hook-registry | 钩子优先级排序；单钩子错误隔离（veto 仍立即短路）；注册级超时 |
+| blast-radius | 直接/传递依赖方分层（1 跳 vs 2+ 跳）；按 profile 影响计数 |
+| orphan-detector | 多 profile 检测并行化（输出稳定排序） |
+| restore-point | `maxPoints` 保留策略（在用还原点宁可多留不误删）；创建后读回 hash 校验（fail-closed） |
+| health-inspector | 四组检查并行执行（组序稳定）；inode 压力检查（探测不到标记 skipped） |
+
+## V4 全模块升级总览
+
+V4 对五层架构的每个模块做了系统性升级，全部向后兼容（API 只增不改），零新增运行时依赖。
+
+### infra 基建层
+
+| 模块 | 升级 |
+|---|---|
+| 审计链 | `appendMany` 批量追加共享一次 fdatasync；`verifyIncremental` 从可信锚点增量校验（锚点失配/截断攻击均 fail-closed） |
+| WAL | 已终结事务归档至 `archive/`（replay 仍可读，扫描只扫活跃区）；尾部半行自动截断修复（中间行损坏拒绝修复）；父目录 fsync |
+| 锁 | 等待重试升级指数退避 + 等值抖动（防惊群）；`autoRenewMs` 后台心跳自动续期 |
+| 备份区 | `restoreAll` 依赖分层并行恢复（同层并发、层间串行）；恢复后 size/hash 指纹复验 |
+| fs-utils | 统一 `walk()` 流式遍历原语（AbortSignal/深度限制/不走 symlink）；`withTransientRetry` 瞬态错误退避重试（EMFILE/ENFILE/EBUSY） |
+| 扫描缓存 | 命中刷新 LRU 热度（热条目不因 TTL 被逐）；容量上限驱逐 |
+| 可靠性模型 | Wilson score 可信区间（小样本天然有界）；校准分位数指数时间加权（近期样本权重更高） |
+
+### engine 引擎层
+
+| 模块 | 升级 |
+|---|---|
+| 先知引擎 | 蒙特卡洛模拟（带种子可复现，2000 次抽样）输出回收 P10/P50/P90 分布；最脆弱步骤附带"修复收益"量化 |
+| 趋势追踪 | 时间加权 Theil-Sen（近期样本权重更高）；CUSUM 变点检测识别增长率突变；30 天预测区间 |
+| 磁盘预测 | 写满倒计时 95% 置信区间（不确定性传播），分级按区间悲观侧判定 |
+| 评分器 | 五因子权重可配置，输出各因子贡献度明细（解释性） |
+| 依赖图 | 文件指纹缓存（mtime+size），未变文件解析结果增量复用 |
+| 残留扫描 | 迁移至流式 walk（可中断）；进度事件限频防风暴 |
+| 去重 | 采样指纹升级头+中+尾三段（大文件中部参与指纹，降低碰撞误判） |
+| 混沌演习 | `matrix=true` 崩溃注入点矩阵（plan 后/第 1 步后/第 2 步后），每点独立验证签发证书 |
+| 守卫者 | 告警去重键 + 抑制窗口；"全部被抑制"不再谎报"一切正常" |
+
+### operations / contracts 层
+
+| 模块 | 升级 |
+|---|---|
+| exec-ops | 外部命令瞬态重试（指数退避）+ 超时硬上限 fail-closed；stdout/stderr/exitCode/durationMs 结构化捕获进审计 |
+| fs-ops | preview 附带目录 top-N 大文件/子目录影响面明细 |
+| edit-ops | 幂等化（引用不存在 → skipped 语义，不报错不产生空操作）；YAML 摘除字节级保持（注释/顺序/CRLF 原样透传） |
+| 策略编译 | 动作集元数据化（riskLevel + 描述，表驱动）；`makeOperationPlan` 零副作用计划预览 |
+| 契约增量 | `freezeWindows` 多重时间黑窗、`maxFilesPerTx` 文件数上限、`DryRunReport.actions` 动作级明细（含风险分级与跳过标记） |
+
+### 事务引擎与工具接线
+
+- dry-run 报告填充动作级明细：`nuke_clean --dry_run` 直接输出风险分级的动作清单（🟢/🟡/🔴）与幂等跳过标记
+- `nuke_oracle` 输出蒙特卡洛分位数；`nuke_trend` 输出变点与预测区间；`nuke_forecast` 输出置信区间；`nuke_drill` 支持 `matrix` 参数
+
+### 独立 CLI
+
+- **锁协议对齐 V4**（关键安全修复）：此前 CLI 的 `.nuke.lock`（V3）与插件 `.nuke/locks/`（V4）互不感知，并发清理可能交叉写；现在 CLI 与插件共享同一锁目录、文件格式与破锁纪律（O_EXCL + bootToken 归属 + 死亡且过期才破锁）
+- `--json` 机器可读输出（scan/deps/health/sweep，CI 友好）；`--version`；崩溃兜底（未捕获异常 fail-closed 退出并引导提 issue）
+- 遍历 symlink 防护 + 深度限制（防目录环/逃逸）；瞬态 IO 退避重试；修复 `strategies` 输出 undefined 的缺陷
+
 ## 事务生命周期
 
 ```
@@ -214,7 +298,7 @@ git clone https://github.com/beijingwahw/dsh-nuke-plugin
 cd dsh-nuke-plugin
 npm install
 npm run typecheck    # tsc --noEmit（零错误）
-npm test             # vitest（222 用例 / 28 文件）
+npm test             # vitest（444 用例 / 34 文件）
 npm run build        # tsdown 构建
 npm run dev          # 开发期热更新进程（见下）
 ```

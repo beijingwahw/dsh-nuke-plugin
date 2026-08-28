@@ -167,3 +167,86 @@ describe('先知引擎（nuke_oracle）', () => {
     expect(r.weakestStep).toBeNull()
   })
 })
+
+describe('先知引擎（蒙特卡洛模拟 / 修复提升幅度）', () => {
+  it('MC 分布：P10=0（失败回滚折算）、P90 有界、均值与解析期望互证、抽样成功率≈连乘', async () => {
+    // P=0.5 → 一半抽样回收 0；成功抽样回收 680±校准波动
+    const oracle = buildOracle(mockModel(a => (a === 'remove-node-modules' ? 0.5 : 1)))
+    const r = okv(await oracle.divine(request))
+    const mc = r.monteCarlo
+    expect(mc.trials).toBe(2000)
+    expect(mc.seed).toBeGreaterThan(0)
+    // 至少 10% 的抽样以失败告终 → P10 必为 0（无条件口径）
+    expect(mc.p10).toBe(0)
+    // 成功前提的回收上界 = 100 + 200×1.2 + 400 = 740 → P90 不越界
+    expect(mc.p90).toBeGreaterThan(600)
+    expect(mc.p90).toBeLessThanOrEqual(740 + 1e-9)
+    expect(mc.p50).toBeLessThanOrEqual(mc.p90)
+    // 均值互证：SE ≈ 340/√2000 ≈ 7.6 → ±30 为 4σ 安全带
+    expect(mc.mean).toBeGreaterThan(340 - 30)
+    expect(mc.mean).toBeLessThan(340 + 30)
+    // 抽样成功率与解析连乘互证（4σ ≈ ±0.022）
+    expect(mc.successRate).toBeGreaterThan(0.5 - 0.025)
+    expect(mc.successRate).toBeLessThan(0.5 + 0.025)
+  })
+
+  it('同种子 → 逐位可复现；不同种子 → 样本不同但统计一致', async () => {
+    const a = okv(await buildOracle(mockModel(() => 0.7)).divine(request))
+    const b = okv(await buildOracle(mockModel(() => 0.7)).divine(request))
+    expect(b.monteCarlo.p10).toBe(a.monteCarlo.p10)
+    expect(b.monteCarlo.p50).toBe(a.monteCarlo.p50)
+    expect(b.monteCarlo.p90).toBe(a.monteCarlo.p90)
+    expect(b.monteCarlo.mean).toBe(a.monteCarlo.mean)
+    const c = okv(await createOracle({
+      reliability: async () => mockModel(() => 0.7),
+      operationFactory: () => threeOps(),
+      resolver: stubResolver, logger, clock: { now: () => new Date() },
+      monteCarloSeed: 987654321,
+    }).divine(request))
+    // 种子不同 → 至少一个分位数不同（概率上几乎必然）；均值仍在统计带内
+    const changed = c.monteCarlo.p10 !== a.monteCarlo.p10
+      || c.monteCarlo.p50 !== a.monteCarlo.p50
+      || c.monteCarlo.p90 !== a.monteCarlo.p90
+    expect(changed).toBe(true)
+    expect(Math.abs(c.monteCarlo.mean - a.monteCarlo.mean)).toBeLessThan(60)
+  })
+
+  it('最脆弱步骤附带修复提升幅度：p=0.5 → 修复后整体成功率 1（+0.5）', async () => {
+    const oracle = buildOracle(mockModel(a => (a === 'remove-node-modules' ? 0.5 : 1)))
+    const r = okv(await oracle.divine(request))
+    const w = r.weakestStep!
+    expect(w.index).toBe(1)
+    expect(w.repairedSuccessProbability).toBeCloseTo(1)
+    expect(w.repairUplift).toBeCloseTo(0.5)
+    // 多数步骤可靠时（其余 p=1）：修复最脆弱一步即可拉满整体成功率
+    const all099 = buildOracle(mockModel(a => (a === 'remove-node-modules' ? 0.8 : 1)))
+    const r2 = okv(await all099.divine(request))
+    expect(r2.weakestStep!.repairUplift).toBeCloseTo(1 - 0.8)
+  })
+
+  it('monteCarloTrials=0 → 关闭模拟（分位数归零），解析口径不受影响', async () => {
+    const oracle = createOracle({
+      reliability: async () => mockModel(a => (a === 'remove-node-modules' ? 0.5 : 1)),
+      operationFactory: () => threeOps(),
+      resolver: stubResolver, logger, clock: { now: () => new Date() },
+      monteCarloTrials: 0,
+    })
+    const r = okv(await oracle.divine(request))
+    expect(r.monteCarlo.trials).toBe(0)
+    expect(r.monteCarlo.p90).toBe(0)
+    expect(r.expectedReclaimBytes).toBeCloseTo(340)   // 解析式不受模拟开关影响
+  })
+
+  it('空操作集 → MC 成功率 1、分位数 0', async () => {
+    const oracle = createOracle({
+      reliability: async () => mockModel(() => 0.9),
+      operationFactory: () => [],
+      resolver: stubResolver,
+      logger,
+      clock: { now: () => new Date() },
+    })
+    const r = okv(await oracle.divine(request))
+    expect(r.monteCarlo.successRate).toBe(1)
+    expect(r.monteCarlo.p50).toBe(0)
+  })
+})
