@@ -25,21 +25,31 @@ function auditAt(name: string) {
 }
 
 describe('贝叶斯可靠性模型', () => {
-  it('冷启动：零历史 → 全部动作收缩到 0.5 保守先验，诚实标注不确定', async () => {
+  it('冷启动：零历史 → 收缩到设计先验 0.95（非硬币 0.5），CI 仍诚实宽开', async () => {
     const model = await createReliabilityModel({ audit: auditAt('cold') })
     expect(model.sampleCount).toBe(0)
-    expect(model.globalSuccessProbability).toBeCloseTo(0.5)
+    expect(model.globalSuccessProbability).toBeCloseTo(0.95)
     const r = model.reliabilityOf('remove-node-modules')
-    expect(r.successProbability).toBeCloseTo(0.5)
+    expect(r.successProbability).toBeCloseTo(0.95)
     expect(r.selfWeight).toBe(0)
     expect(r.calibration).toBeNull()
-    expect(r.ci95[0]).toBeLessThan(0.5)
-    expect(r.ci95[1]).toBeGreaterThan(0.5)
+    // Wilson 不假装知道：点估计 0.95 的区间仍宽（零数据 → 不确定度大）
+    expect(r.ci95[0]).toBeLessThan(0.95)
+    expect(r.ci95[1]).toBeGreaterThan(0.95)
+  })
+
+  it('设计先验可配置：priorSuccessProbability 覆盖默认锚点', async () => {
+    const model = await createReliabilityModel({
+      audit: auditAt('prior-override'), priorSuccessProbability: 0.8,
+    })
+    expect(model.globalSuccessProbability).toBeCloseTo(0.8)
+    expect(model.reliabilityOf('remove-node-modules').successProbability).toBeCloseTo(0.8)
   })
 
   it('经验贝叶斯收缩：有数据动作自信、无数据动作向全局均值收缩', async () => {
     const audit = auditAt('shrink')
-    // remove-storages: 8 成 2 败（自身频率 0.8）；pooled μ = (8+1)/(10+2) = 0.75
+    // remove-storages: 8 成 2 败（自身频率 0.8）
+    // 全局 μ = (8 + 20×0.95)/(10+20) = 27/30 = 0.9（pooled 向设计先验收缩）
     for (let i = 0; i < 8; i++) {
       await audit.append({
         timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
@@ -56,21 +66,46 @@ describe('贝叶斯可靠性模型', () => {
     }
     const model = await createReliabilityModel({ audit })
     expect(model.sampleCount).toBe(10)
-    expect(model.globalSuccessProbability).toBeCloseTo(0.75)
+    expect(model.globalSuccessProbability).toBeCloseTo(0.9)
 
-    // 有数据：α=0.75×10+8=15.5, β=0.25×10+2=4.5 → 15.5/20 = 0.775（收缩向 0.75）
+    // 有数据：α=0.9×10+8=17, β=0.1×10+2=3 → 17/20 = 0.85（收缩向 0.9）
     const r = model.reliabilityOf('remove-storages')
     expect(r.successes).toBe(8)
     expect(r.failures).toBe(2)
-    expect(r.successProbability).toBeCloseTo(0.775)
+    expect(r.successProbability).toBeCloseTo(0.85)
     expect(r.selfWeight).toBeCloseTo(10 / 20)
-    expect(r.successProbability).toBeGreaterThan(0.75)   // 被拉向自身 0.8
-    expect(r.successProbability).toBeLessThan(0.8)       // 但仍受先验收缩
+    expect(r.successProbability).toBeGreaterThan(0.8)   // 被拉向自身 0.8
+    expect(r.successProbability).toBeLessThan(0.9)      // 但仍受全局 0.9 收缩
 
-    // 无数据动作：完全借力全局 → 0.75
+    // 无数据动作：完全借力全局 → 0.9
     const r2 = model.reliabilityOf('purge-temp')
-    expect(r2.successProbability).toBeCloseTo(0.75)
+    expect(r2.successProbability).toBeCloseTo(0.9)
     expect(r2.selfWeight).toBe(0)
+  })
+
+  it('设计先验随数据稀释：50 次观测后全局均值由数据主导，不被先验锚死', async () => {
+    const audit = auditAt('dilute')
+    // 40 成 10 败（真实 pooled 0.8）：μ = (40+19)/(50+20) = 59/70 ≈ 0.843
+    // —— 数据权重 50/70 ≈ 71%，先验只拉高 ~4 个百分点（自动让位）
+    for (let i = 0; i < 40; i++) {
+      await audit.append({
+        timestamp: `2026-08-20T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-attachments', outcome: 'success',
+        detail: {},
+      })
+    }
+    for (let i = 0; i < 10; i++) {
+      await audit.append({
+        timestamp: `2026-08-21T00:${String(Math.floor(i / 60)).padStart(2, '0')}:${String(i % 60).padStart(2, '0')}Z`,
+        actor: 't', action: 'op:remove-attachments', outcome: 'failure',
+        detail: {},
+      })
+    }
+    const model = await createReliabilityModel({ audit })
+    expect(model.sampleCount).toBe(50)
+    expect(model.globalSuccessProbability).toBeCloseTo(59 / 70, 4)
+    expect(model.globalSuccessProbability).toBeGreaterThan(0.8)   // 仍向先验微收
+    expect(model.globalSuccessProbability).toBeLessThan(0.95)    // 但数据主导，未锚死先验
   })
 
   it('校准分布：ratio 样本插值分位数；样本不足诚实返回 null', async () => {
@@ -164,7 +199,9 @@ describe('贝叶斯可靠性模型', () => {
     const r = model.reliabilityOf('remove-storages')
     expect(r.successes).toBe(1)
     expect(r.calibration).toBeNull()   // 默认 minCalibrationSamples=3，单样本诚实为 null
-    expect(r.successProbability).toBeGreaterThan(0.5)
+    // μ=(1+19)/21=20/21；α=μ·10+1=221/21，β=(1-μ)·10=10/21 → 221/231 ≈ 0.957
+    //（飞轮方向：一次成功把该动作从纯先验 0.95 微微拉向自身 1.0）
+    expect(r.successProbability).toBeCloseTo(221 / 231, 4)
   })
 })
 

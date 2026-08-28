@@ -5,7 +5,10 @@
 //
 //   1. 成功率分布 —— Beta 后验 + 经验贝叶斯收缩（James-Stein 精神）：
 //      观测少的动作向全局均值收缩（借力 pooled 数据），观测多的
-//      动作自信。冷启动（零历史）给出保守的 0.5 先验而非盲目乐观。
+//      动作自信。冷启动（零历史）收缩向设计先验（默认 0.95 ——
+//      validate 前置 + 备份 + 回滚的事务引擎，失败属例外），而非
+//      误导性的硬币 0.5：后者在先知的 Saga 连乘 ∏p 下指数塌缩，
+//      把"零信息"渲染成"高故障"。
 //
 //   2. 校准分布 —— preview 预估 vs execute 实际的回收比
 //      actual/estimated 的分位数（p10/p50/p90）。预演说 100MB
@@ -47,6 +50,6 @@ export interface IReliabilityModel {
   reliabilityOf(action: string): ActionReliability
   /** 步骤级观测总样本数（跨动作） */
   readonly sampleCount: number
-  /** 全局成功率均值（pooled，冷启动时为 0.5） */
+  /** 全局成功率均值（pooled，向设计先验收缩；零历史时即设计先验 0.95） */
   readonly globalSuccessProbability: number
 }

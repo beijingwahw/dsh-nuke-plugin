@@ -23,6 +23,9 @@ export interface OracleStep {
   readonly estimatedBytes: number
   /** 该步骤成功率（贝叶斯后验，收缩后） */
   readonly successProbability: number
+  /** 自数据权重 0-1（来自可靠性模型）：0 = 该动作零历史，成功率纯为先验收缩
+   *  （冷启动标注 —— 与置信度共同表达"这个数从哪来"） */
+  readonly selfWeight?: number
   /** 该步失败将作废的预估回收量（自身 + 后续步骤） */
   readonly exposureBytes: number
   readonly calibration: CalibrationSummary | null

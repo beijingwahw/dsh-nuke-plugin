@@ -3,12 +3,24 @@
 // 审计 hash chain 的完整性同时就是可靠性数据的信任根。
 //
 // 统计方法（经验贝叶斯分层收缩）：
-//   全局层  μ = (S+1)/(S+F+2)         —— pooled 成功率（Laplace 平滑）
+//   全局层  μ = (S + K·μ₀)/(S+F+K)   —— pooled 成功率向设计先验 μ₀ 收缩
 //   动作层  α = μκ + s_a,  β = (1-μ)κ + f_a
 //   p̂_a   = α/(α+β)                  —— 向全局均值收缩的后验均值
 //   CI95   = Wilson score interval    —— 以 (p̂_a, α+β) 为输入的 Wilson 区间
 //   selfWeight = (s_a+f_a)/(s_a+f_a+κ) —— 收缩系数（可解释）
-// κ 是先验强度：动作观测数 << κ 时几乎完全借力全局，>> κ 时自信。
+// κ 是动作层先验强度：动作观测数 << κ 时几乎完全借力全局，>> κ 时自信。
+//
+// 设计先验（V5.1.1 冷启动修复）：
+//   旧全局层用 Laplace +1/+2 → 零历史时 μ=0.5（硬币先验）。硬币先验对
+//   "无信息"是中立的，但对本域是错的：事务引擎 validate 前置（失败在
+//   commit 前被拦截）、编辑前快照备份、目录改名进回收区、Saga 回滚 ——
+//   步骤失败是设计上的例外而非常态。更致命的是先知按 Saga 连乘
+//   P = ∏p_i：0.5⁴=6%、0.5¹⁴=0.006%，把"零信息"误渲染为"高故障"，
+//   用户看到的是吓人的低成功率而非诚实的"尚无数据"。
+//   修复：全局层向设计先验 μ₀=0.95 收缩（强度 K=20 —— 约 20 次全局
+//   观测后历史数据权重过半，先验随数据自动稀释）；零历史时 μ=μ₀，
+//   0.95⁴=81%、0.95¹⁴=49%，与"设计上会成功"的直觉一致，且置信度
+//   仍诚实标注 low、CI 仍宽（Wilson 不假装知道）。
 //
 // CI 升级说明（正态近似 → Wilson）：
 //   Beta 正态近似在小区间（n 小 / p̂ 近 0 或 1）会给出越界 [0,1] 的区间，
@@ -33,6 +45,14 @@ export interface ReliabilityModelOptions {
   readonly audit: IAuditLog
   /** 经验贝叶斯先验强度 κ（默认 10：约 10 次观测后自身数据过半） */
   readonly shrinkage?: number
+  /**
+   * 设计先验成功率 μ₀（默认 0.95）：零历史时全局层的收缩锚点。
+   * 取值依据：validate 前置 + 快照备份 + 回收区改名 + Saga 回滚的事务
+   * 引擎，步骤失败是设计上的例外。可配置（如观察到真实环境更脆弱可调低）。
+   */
+  readonly priorSuccessProbability?: number
+  /** 设计先验强度 K（默认 20：约 20 次全局观测后历史数据权重过半） */
+  readonly priorStrength?: number
   /** 校准分布所需最少样本数（默认 3，不足则诚实返回 null） */
   readonly minCalibrationSamples?: number
   /** 校准样本权重半衰期（ms，默认 30 天）：权重 = 0.5^(年龄/半衰期)。
@@ -119,6 +139,8 @@ export async function createReliabilityModel(
   options: ReliabilityModelOptions,
 ): Promise<IReliabilityModel> {
   const kappa = options.shrinkage ?? 10
+  const mu0 = options.priorSuccessProbability ?? 0.95
+  const priorK = options.priorStrength ?? 20
   const minCal = options.minCalibrationSamples ?? 3
   const halfLifeMs = options.calibrationHalfLifeMs ?? 30 * 24 * 3600 * 1000
 
@@ -148,7 +170,9 @@ export async function createReliabilityModel(
     stats.set(action, s)
   }
 
-  const mu = (pooledS + 1) / (pooledS + pooledF + 2)   // 冷启动 = 0.5
+  // 全局层：pooled 成功率向设计先验 μ₀ 收缩（强度 K）。
+  // 零历史 → μ = μ₀（0.95）；数据累积 → 先验权重 1/(n+K) 自动稀释。
+  const mu = (pooledS + priorK * mu0) / (pooledS + pooledF + priorK)
   const sampleCount = pooledS + pooledF
 
   /** 校准样本 → 时间加权样本集（按值升序，权重随年龄指数衰减） */

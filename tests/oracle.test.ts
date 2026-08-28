@@ -1,7 +1,12 @@
 // tests/oracle.test.ts — 先知引擎（概率融合 / 置信区间 / 最脆弱步骤 / 磁盘延长）
 import { describe, expect, it } from 'vitest'
+import * as fs from 'fs'
+import * as os from 'os'
+import * as path from 'path'
 import { createOracle } from '../src/engine/oracle'
 import { createLogger } from '../src/infra/logger'
+import { createAuditLog } from '../src/infra/audit-log'
+import { createReliabilityModel } from '../src/infra/reliability'
 import type { IReliabilityModel, ActionReliability } from '../src/contracts/reliability.contract'
 import type { CleanOperation, CleanRequest } from '../src/contracts/transaction'
 import type { IPathResolver } from '../src/contracts/paths'
@@ -248,5 +253,56 @@ describe('先知引擎（蒙特卡洛模拟 / 修复提升幅度）', () => {
     const r = okv(await oracle.divine(request))
     expect(r.monteCarlo.successRate).toBe(1)
     expect(r.monteCarlo.p50).toBe(0)
+  })
+})
+
+describe('先知引擎（V5.1.1 冷启动修复：零历史不再硬币塌缩）', () => {
+  it('零历史：3 步事务成功率 = 设计先验连乘 0.95³ ≈ 85.7%（旧硬币先验为 0.5³=12.5%）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-cold-'))
+    try {
+      // 真实可靠性模型 + 空审计链 = 用户报告的确切场景（刚装好、从未清理过）
+      const model = await createReliabilityModel({
+        audit: createAuditLog({ filePath: path.join(dir, 'chain.jsonl') }),
+      })
+      expect(model.sampleCount).toBe(0)
+      const oracle = buildOracle(model)
+      const r = okv(await oracle.divine(request))
+      expect(r.confidence).toBe('low')                    // 置信度诚实：数据就是没有
+      expect(r.transactionSuccessProbability).toBeCloseTo(0.95 ** 3, 5)
+      expect(r.transactionSuccessProbability).toBeGreaterThan(0.85)
+      // 每步纯先验：selfWeight=0 透传到步骤（渲染层据此标 🧭）
+      for (const s of r.steps) expect(s.selfWeight).toBe(0)
+      // 叙事必须说明数字来自设计先验，而非历史故障证据
+      expect(r.narrative).toContain('设计先验')
+      expect(r.narrative).toContain('3 步无自身历史')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('有历史动作混合未见过动作：已见步骤 selfWeight>0，未见步骤仍纯先验', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-mixed-'))
+    try {
+      const audit = createAuditLog({ filePath: path.join(dir, 'chain.jsonl') })
+      // 只给 clean-home-patch 累积历史（5 成）—— 其余动作仍零样本
+      for (let i = 0; i < 5; i++) {
+        await audit.append({
+          timestamp: `2026-08-20T00:00:${String(i).padStart(2, '0')}Z`,
+          actor: 't', action: 'op:clean-home-patch', outcome: 'success', detail: {},
+        })
+      }
+      const model = await createReliabilityModel({ audit })
+      const oracle = buildOracle(model)
+      const r = okv(await oracle.divine(request))
+      const seen = r.steps.find(s => s.action === 'clean-home-patch')!
+      const unseen = r.steps.find(s => s.action === 'remove-storages')!
+      expect(seen.selfWeight).toBeCloseTo(5 / 15)          // κ=10：5 观测 → 1/3 自身权重
+      expect(unseen.selfWeight).toBe(0)
+      // 5 个全局样本 → medium 置信（阈值 5），叙事不再打冷启动补丁
+      expect(r.confidence).toBe('medium')
+      expect(r.narrative).not.toContain('设计先验')
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

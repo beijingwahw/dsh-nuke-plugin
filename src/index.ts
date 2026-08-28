@@ -451,7 +451,7 @@ export function apply(ctx: Context) {
       const lines = [
         `🔮 先知推演 @ ${new Date().toISOString()}`,
         `   插件: ${cp.plugins.join(', ')}  |  profile: ${cprof.profile}  |  策略: ${strategy}`,
-        `   事务成功率: ${pct(o.transactionSuccessProbability)}  ${confIcon[o.confidence]} 置信 ${o.confidence}（${o.evidence.stepSamples} 个历史步骤样本）`,
+        `   事务成功率: ${pct(o.transactionSuccessProbability)}  ${confIcon[o.confidence]} 置信 ${o.confidence}（${o.evidence.stepSamples} 个历史步骤样本${o.confidence === 'low' ? `；零/少样本时收缩向设计先验 ${pct(o.evidence.globalSuccessProbability)}` : ''}）`,
         `   期望回收: ${fmtBytes(o.expectedReclaimBytes)}（已折算失败回滚；若成功: ${fmtBytes(o.reclaimP10IfSuccess)} ~ ${fmtBytes(o.reclaimP90IfSuccess)}）`,
         `   预估总量: ${fmtBytes(o.totalEstimatedBytes)}  |  失败期望回滚深度: ${o.expectedRollbackDepth.toFixed(1)} 步`,
       ]
@@ -478,7 +478,9 @@ export function apply(ctx: Context) {
         const cal = s.calibration
           ? `  校准 ${(s.calibration.p50 * 100).toFixed(0)}%（${s.calibration.samples} 样本）`
           : '  校准 n/a'
-        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${cal}`)
+        // 🧭 = 该动作零历史，成功率纯为先验收缩（冷启动透明度）
+        const prior = (s.selfWeight ?? 0) === 0 ? ' 🧭' : ''
+        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${cal}${prior}`)
       }
       lines.push('', `💡 ${o.narrative}`)
       lines.push('', '决策链建议: nuke_oracle（后果推演）→ nuke_clean dry_run（计划预演）→ nuke_clean（执行）')

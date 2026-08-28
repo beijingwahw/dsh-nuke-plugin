@@ -216,6 +216,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
             summary: pv.summary,
             estimatedBytes: pv.estimated,
             successProbability: r.successProbability,
+            selfWeight: r.selfWeight,
             exposureBytes: suffix[i]!,
             calibration: r.calibration,
           })
@@ -299,6 +300,9 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         // 置信度：样本量驱动（统计的诚实——数据不够就说不够）
         const confidence: OracleConfidence =
           rel.sampleCount >= 30 ? 'high' : rel.sampleCount >= 5 ? 'medium' : 'low'
+        // 纯先验步骤数（该动作零历史，成功率完全来自先验收缩）——
+        // 冷启动叙事的透明度：明确告诉用户"这个数从哪来"
+        const priorOnlySteps = steps.filter(s => (s.selfWeight ?? 0) === 0).length
 
         const report: OracleReportDetail = {
           request,
@@ -314,7 +318,8 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           diskExtensionDays,
           confidence,
           monteCarlo: mc,
-          narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc),
+          narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc,
+            priorOnlySteps, rel.globalSuccessProbability),
           evidence: {
             stepSamples: rel.sampleCount,
             globalSuccessProbability: rel.globalSuccessProbability,
@@ -334,6 +339,8 @@ function narrate(
   broken: readonly PluginName[] | null,
   confidence: OracleConfidence,
   mc: MonteCarloSummary,
+  priorOnlySteps = 0,
+  globalPrior = 0.95,
 ): string {
   const pct = (p: number) => `${(p * 100).toFixed(1)}%`
   const parts: string[] = []
@@ -351,7 +358,9 @@ function narrate(
     parts.push('各环节可靠，可放心进入 dry-run → commit')
   }
   if (confidence === 'low') {
-    parts.push('历史样本不足，预测以保守先验为主 —— 执行越多，先知越准')
+    // 冷启动透明度：低成功率若源自"零历史"，必须说明数字来自设计先验
+    //（引擎含预检/备份/回滚，失败属例外）而非历史故障证据
+    parts.push(`历史样本不足（${priorOnlySteps} 步无自身历史，成功率收缩向设计先验 ${pct(globalPrior)}）—— 执行越多，先知越准`)
   }
   return parts.join('；') + '。'
 }
