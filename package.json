@@ -6,9 +6,17 @@
   "main": "./lib/index.mjs",
   "types": "./lib/index.d.mts",
   "exports": {
-    "import": "./lib/index.mjs",
-    "types": "./lib/index.d.mts"
+    ".": {
+      "types": "./lib/index.d.mts",
+      "import": "./lib/index.mjs",
+      "default": "./lib/index.mjs"
+    }
   },
+  "files": [
+    "lib",
+    "cli",
+    "cordis.patch.yml"
+  ],
   "engines": {
     "node": ">=24.11"
   },

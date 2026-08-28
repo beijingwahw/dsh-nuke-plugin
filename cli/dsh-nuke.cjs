@@ -38,9 +38,67 @@ function assertSafe(value, label) {
 
 function formatBytes(bytes) {
   if (bytes === 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  // 钳制上界：≥1TB 时 i=4，防止 units[4] 越界返回 "… undefined"
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  命令解析（与插件版 src/infra/bin-resolver.ts 同源）
+//  真实故障：dsh 经 nvm 安装，交互 shell 由 rc 文件注入 PATH 而本进程
+//  （GUI/守护态拉起）不加载 rc → spawnSync('dsh') ENOENT。此时若静默
+//  跳过 standard-remove，bundles 声明残留 → 健康检查永久报"孤立"。
+//  解法：ENOENT 时扫描常见全局 bin 候选目录（nvm/volta/asdf/npm 前缀），
+//  命中则用绝对路径执行（不依赖 PATH）。
+// ═══════════════════════════════════════════════════════════
+
+const binCache = new Map();
+
+function resolveBin(cmd) {
+  if (binCache.has(cmd)) return binCache.get(cmd);
+  const found = resolveOnPath(cmd) || rescueFromCommonDirs(cmd);
+  binCache.set(cmd, found);
+  return found;
+}
+
+function resolveOnPath(cmd) {
+  const pathVar = process.env.PATH || process.env.Path || '';
+  for (const dir of pathVar.split(path.delimiter)) {
+    if (!dir) continue;
+    const full = path.join(dir, cmd);
+    try { if (fs.existsSync(full)) return full; } catch { /* 不可读即跳过 */ }
+  }
+  return null;
+}
+
+function rescueFromCommonDirs(cmd) {
+  const home = os.homedir();
+  const dirs = ['/usr/local/bin', '/opt/homebrew/bin', path.join(home, '.local', 'bin'),
+    path.join(home, '.volta', 'bin'), path.join(home, '.asdf', 'shims')];
+  if (process.env.npm_config_prefix) dirs.push(path.join(process.env.npm_config_prefix, 'bin'));
+  // nvm 版本目录（~/.nvm/versions/node/<ver>/bin）—— 逐版本枚举，fail-soft
+  const nvmVersions = path.join(home, '.nvm', 'versions', 'node');
+  try {
+    for (const v of fs.readdirSync(nvmVersions)) dirs.push(path.join(nvmVersions, v, 'bin'));
+  } catch { /* nvm 未安装 → 跳过 */ }
+  for (const dir of dirs) {
+    const full = path.join(dir, cmd);
+    try { if (fs.existsSync(full)) return full; } catch { /* 不可读即跳过 */ }
+  }
+  return null;
+}
+
+/** 执行救援命中的命令：nvm 全局 CLI 是 node 脚本（shebang `#!/usr/bin/env node`），
+ *  PATH 缺口场景下 child 进程同样找不到 node → 退出码 127。
+ *  对策：把当前 node 所在目录注入 child 的 PATH（幂等：已在 PATH 则不重复）。 */
+function spawnBin(bin, args, opts = {}) {
+  const nodeDir = path.dirname(process.execPath);
+  const pathVar = process.env.PATH || '';
+  const env = pathVar.split(path.delimiter).includes(nodeDir)
+    ? process.env
+    : { ...process.env, PATH: `${nodeDir}${path.delimiter}${pathVar}` };
+  return spawnSync(bin, args, { ...opts, env });
 }
 
 // 遍历纪律（与插件版 fs-utils 对齐）：不走 symlink（防逃逸与环）、限制深度（防病态深目录拖死）
@@ -485,6 +543,7 @@ function removeYamlBlock(content, pluginId) {
 
 function executeClean(profile, pluginName, actions, tx) {
   const cleaned = [];
+  const warnings = [];
   let totalFreed = 0;
   const profileDir = path.join(DSH_HOME, 'profiles', profile);
 
@@ -504,8 +563,18 @@ function executeClean(profile, pluginName, actions, tx) {
   };
 
   runAction('standard-remove', () => {
-    const r = spawnSync('dsh', ['plugin', '--profile', profile, 'remove', pluginName], { timeout: 30000, encoding: 'utf-8' });
-    return r.status === 0 ? '标准卸载完成' : null;
+    // PATH 救援（与插件版 V5.2 语义对齐）：宿主 PATH 缺口时 dsh 可能只在
+    // nvm 版本目录里 —— 静默跳过会导致 bundles 声明残留（孤立假警报）
+    const bin = resolveBin('dsh');
+    if (!bin) {
+      warnings.push('无法定位 dsh CLI（PATH 缺口？nvm 安装？），已跳过标准卸载 —— bundles 声明可能残留，建议在交互 shell 重跑或手动 dsh plugin remove');
+      return null;
+    }
+    const r = spawnBin(bin, ['plugin', '--profile', profile, 'remove', pluginName], { timeout: 30000, encoding: 'utf-8' });
+    if (r.status === 0) return '标准卸载完成';
+    // 区分"执行了但失败"与 ENOENT：执行了但非 0 → 带原因的跳过（可诊断）
+    warnings.push(`dsh plugin remove 退出码 ${r.status}：${(r.stderr || r.stdout || '').trim().slice(0, 120) || '无输出'}`);
+    return null;
   });
 
   runAction('clean-workspace-yaml', () => {
@@ -569,12 +638,18 @@ function executeClean(profile, pluginName, actions, tx) {
   }
 
   runAction('pnpm-store-prune', () => {
-    const r = spawnSync('pnpm', ['store', 'prune'], { encoding: 'utf-8', timeout: 60000 });
+    const bin = resolveBin('pnpm');
+    if (!bin) {
+      warnings.push('无法定位 pnpm（PATH 缺口？），已跳过 pnpm store prune');
+      return null;
+    }
+    const r = spawnBin(bin, ['store', 'prune'], { encoding: 'utf-8', timeout: 60000 });
     if (r.status === 0) { log('CLEAN', 'pnpm store pruned'); return '已执行 pnpm store prune'; }
+    warnings.push(`pnpm store prune 退出码 ${r.status}：${(r.stderr || r.stdout || '').trim().slice(0, 120) || '无输出'}`);
     return null;
   });
 
-  return { cleaned, totalFreed };
+  return { cleaned, warnings, totalFreed };
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -610,17 +685,21 @@ function runHealthChecks(profile) {
     }
   }
 
-  const dshCheck = spawnSync('dsh', ['--version'], { encoding: 'utf-8', timeout: 5000 });
-  // V5.1：status 非 null = 二进制确实执行了（--version 旗标行为差异不算不可用）；
-  // status null（spawn ENOENT）才是真正找不到 —— 与插件版 probeCli 三段式语义对齐
+  // PATH 救援后的 dsh 探测（与插件版 bin-resolver 语义对齐）：救援命中
+  // 时用绝对路径探测 —— 与 standard-remove 的执行口径一致，避免"健康
+  // 检查说不可用、清理却真能跑"（或反之）的语义漂移
+  const dshBin = resolveBin('dsh');
+  const dshCheck = dshBin
+    ? spawnBin(dshBin, ['--version'], { encoding: 'utf-8', timeout: 5000 })
+    : { status: null };
   results.push({
     check: 'dsh CLI',
     passed: dshCheck.status !== null,
     message: dshCheck.status === 0
-      ? dshCheck.stdout.trim()
+      ? `${dshCheck.stdout.trim()}${dshBin && !process.env.PATH?.split(path.delimiter).includes(path.dirname(dshBin)) ? '（PATH 救援命中）' : ''}`
       : dshCheck.status !== null
         ? `可用（--version 退出码 ${dshCheck.status}）`
-        : '不可用（不在 PATH；CLI 在交互 shell 运行，请确认 dsh 已全局安装）',
+        : '不可用（PATH 与常见安装目录均未找到；若经 nvm 安装请在交互 shell 运行或设 DSH_BIN）',
   });
 
   return results;
@@ -754,9 +833,10 @@ function cmdClean(positional, flags) {
       let actions = [...strat.actions];
       if (flags.skipStandard) actions = actions.filter(a => a !== 'standard-remove');
 
-      const { cleaned, totalFreed } = executeClean(profile, name, actions, tx);
+      const { cleaned, warnings, totalFreed } = executeClean(profile, name, actions, tx);
       totalSpaceFreed += totalFreed;
       cleaned.forEach(item => report.push(c.green(`  ✅ ${item}`)));
+      warnings.forEach(w => { report.push(c.yellow(`  ⚠️ ${w}`)); allWarnings.push(w); });
       tx.steps.filter(s => s.backup).forEach(s => allBackups.push(s.backup));
 
       const finalRes = scanResiduals(profile, name);
@@ -1022,7 +1102,16 @@ function cmdSnapshot(positional) {
   const snapFile = path.join(snapDir, `${pluginName.replace(/\//g, '__')}.${txId}.json`);
   if (!fs.existsSync(snapFile)) { console.error(c.red('❌ 快照不存在')); process.exit(1); }
 
-  const snapshot = JSON.parse(fs.readFileSync(snapFile, 'utf-8'));
+  // 快照文件可能半写/损坏（崩溃窗口的产物）—— 可预期输入错误应优雅报错，
+  // 而非走 uncaughtException 崩溃兜底（CLI 是系统损坏时的兜底工具，自身必须稳）
+  let snapshot;
+  try {
+    snapshot = JSON.parse(fs.readFileSync(snapFile, 'utf-8'));
+  } catch (e) {
+    console.error(c.red(`❌ 快照文件损坏或非 JSON（${e.message}）: ${snapFile}`));
+    console.error(c.dim('   可能是崩溃窗口的半写产物；用 nuke reports 查事务日志，或删除该快照重做。'));
+    process.exit(1);
+  }
   const result = verifySnapshot(snapshot);
   if (result.valid) {
     console.log(c.green(`✅ 快照验证通过：所有 ${snapshot.fingerprints.length} 个文件指纹匹配。`));
