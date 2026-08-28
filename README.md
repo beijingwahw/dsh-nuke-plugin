@@ -1,9 +1,9 @@
 # dsh-nuke-plugin
 
-> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习 · 预测存证问责
+> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习 · 预测存证问责 · 自我校准
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
-[![Tests](https://img.shields.io/badge/tests-547%2F547-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
+[![Tests](https://img.shields.io/badge/tests-562%2F562-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -65,9 +65,9 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | `nuke_policy` | 查看守卫配置：保护名单 / 批量上限 / 回收上限 / 磁盘下限 / 时间黑窗 |
 | `nuke_trend` | 历史趋势：字节/天变化率、30 天外推、3σ̂ 异常检测（失控写盘早期信号） |
 | `nuke_forecast` | 磁盘写满预测：趋势 × 实时余量 → 倒计时与分级建议 |
-| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长、预计耗时（p50 与悲观 p90）；基于历史执行数据贝叶斯自学习，零副作用不拿锁 |
+| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长、预计耗时（p50 与悲观 p90）；基于历史执行数据贝叶斯自学习 + 从战绩自我校准（历史过自信则自动收敛），零副作用不拿锁 |
 | `nuke_failures` | **失败档案**：每类动作的历史失败模式诊断（EBUSY 锁定/超时/权限/校验拒绝…）、瞬态份额与处方；⚡瞬态引擎自动重试、🔒永久需人工介入 |
-| `nuke_scorecard` | **先知战绩对账单**：执行前已存证进 hash chain 的预测（成功率/耗时）vs 实际结局——Brier 技能分（对照无技能基线）、逐步命中明细、耗时偏差分布、重试疗效学习值；回答"先知的数字到底可不可信" |
+| `nuke_scorecard` | **先知战绩对账单**：执行前已存证进 hash chain 的预测（成功率/耗时）vs 实际结局——Brier 技能分（对照无技能基线）、逐步命中明细、耗时偏差分布、重试疗效学习值、系统性偏差诊断与自我校准位移；回答"先知的数字到底可不可信、偏在哪、纠了没有" |
 
 ### 执行 — 事务化清理
 
@@ -172,6 +172,44 @@ dry-run 是确定性预演，先知是概率化推演。每次清理的每个步
          → 决策（先修最弱步骤，或换 safe 策略）
             → 再执行 → 数据更准 → ...
 ```
+
+## V5.5 自我校准：对账不止打分，还驱动再学习
+
+V5.4 让预测可问责（存证 + Brier 对账），但问责本身不改善预测——先知报 95% 实际只有 60%，计分器只是把这件尴尬的事写下来。V5.5 闭环最后一段：**从已对账的 (预测, 结局) 对学习系统性偏差，动态修正未来预测**：
+
+```
+预测 → 存证（hash chain）→ 执行 → 对账（Brier/技能分）
+   ↑                                      ↓
+   └──── 校准位移 δ 修正未来预测 ←── 从残差学习 δ
+              （过自信 → δ<0 拉低；过保守 → δ>0 拉高；
+                残差消失 → δ→0，迭代收敛的终点）
+```
+
+### 学什么：Platt 截距式校准
+
+对账侧（`nuke_scorecard` 同源逻辑）从步骤级 (预测, 结局) 对学习：
+
+```
+meanPred = 存证均值          actualRate = 实际率（Laplace +1/+2 收缩）
+δ_raw = logit(actualRate) − logit(meanPred)     ← 系统性偏差的 logit 口径
+δ     = δ_raw · w,  w = n/(n+K)                 ← 证据权重收缩（K=8）
+```
+
+- **证据纪律**：已对账步骤 < 5 → 不修正（没有统计力就不动，诚实留白）
+- **钳制**：δ ∈ [−5, +5]；修正后 p ∈ [0.001, 0.999]
+- **耗时同理**：中位耗时比（实际/预测）向 1 收缩为修正因子，钳制 [0.25, 4]——预测系统性偏乐观 3× 就放大 3×（按证据权重打折）
+
+### 用在哪：写侧与读侧同源
+
+- **引擎存证（写侧）**：commit 前的预测存证直接落校准后口径，`detail` 记录 `calibrationDelta` / `calibrationEvidence`——存证与推演同一套修正，对账才有收敛意义
+- **先知推演（读侧）**：`nuke_oracle` 逐步与事务成功率给出校准后口径，叙事直白交代病史：`自我校准后成功率 74%（历史预测过自信：存证均值 90% vs 实际 55%，12 步证据 → logit 位移 −0.75）`
+- **故障纪律**：校准器抛错 → 恒等存证/恒等推演（学习失败绝不阻断真实清理）；未注入 → V5.4 语义完全兼容
+
+### 为什么这样设计
+
+- **logit 空间线性**——概率靠近 0/1 时偏差被天然放大（0.99→0.95 与 0.6→0.56 的"严重性"不可同日而语），logit 位移对此无偏
+- **证据收缩而非全信**——6 步证据只信 43%（w=6/14），50 步信 86%；小样本的极端战绩不会把预测甩飞
+- **存证口径 = 推演口径**——若存证用原始值、推演用校正值，对账永远学不到真残差，闭环退化成摆设
 
 ## V5.4 先知问责制：预测若不可证伪，就与巫术无异
 

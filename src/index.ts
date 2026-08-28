@@ -100,6 +100,9 @@ function buildRuntime() {
       // V5.4 预测存证：commit 执行前把逐步预测写进 hash chain ——
       // 预测先于结局、事后不可篡改，先知从此可被问责（nuke_scorecard）
       predictor: () => createReliabilityModel({ audit }),
+      // V5.5 自我校准：存证前应用战绩学到的偏差修正（收敛闭环写侧）
+      calibrator: async () =>
+        (await (await createPredictionScorer({ audit })).scorecard()).calibration,
     },
     operationFactory,
   )
@@ -459,11 +462,20 @@ export function apply(ctx: Context) {
       const retryLine = o.retryAdjustedSuccessProbability > o.transactionSuccessProbability + 0.0005
         ? `   ♻️ 重试感知成功率: ${pct(o.retryAdjustedSuccessProbability)}（引擎自动重试瞬态失败 EBUSY/超时后的有效口径）`
         : ''
+      // V5.5：自我校准口径 —— 存证战绩学到的系统性偏差已修正进本次预测
+      const cal = o.calibration
+      let calLine = ''
+      if (cal !== null && o.calibratedSuccessProbability !== null
+        && Math.abs(o.calibratedSuccessProbability - o.retryAdjustedSuccessProbability) > 0.0005) {
+        const bias = cal.actualRate < cal.meanPredicted ? '过自信' : '过保守'
+        calLine = `   ⚖️ 自我校准后: ${pct(o.calibratedSuccessProbability)}（历史预测系统性${bias}：存证均值 ${pct(cal.meanPredicted)} vs 实际 ${pct(cal.actualRate)}，${cal.evidence} 步证据 → logit 位移 ${cal.delta >= 0 ? '+' : ''}${cal.delta.toFixed(2)}）`
+      }
       const lines = [
         `🔮 先知推演 @ ${new Date().toISOString()}`,
         `   插件: ${cp.plugins.join(', ')}  |  profile: ${cprof.profile}  |  策略: ${strategy}`,
         `   事务成功率: ${pct(o.transactionSuccessProbability)}  ${confIcon[o.confidence]} 置信 ${o.confidence}（${o.evidence.stepSamples} 个历史步骤样本${o.confidence === 'low' ? `；零/少样本时收缩向设计先验 ${pct(o.evidence.globalSuccessProbability)}` : ''}）`,
         ...(retryLine ? [retryLine] : []),
+        ...(calLine ? [calLine] : []),
         `   期望回收: ${fmtBytes(o.expectedReclaimBytes)}（已折算失败回滚；若成功: ${fmtBytes(o.reclaimP10IfSuccess)} ~ ${fmtBytes(o.reclaimP90IfSuccess)}）`,
         `   预估总量: ${fmtBytes(o.totalEstimatedBytes)}  |  失败期望回滚深度: ${o.expectedRollbackDepth.toFixed(1)} 步`,
       ]
@@ -514,6 +526,11 @@ export function apply(ctx: Context) {
         const retryAdj = s.retryAdjustedProbability > s.successProbability + 0.0005
           ? `  → 重试感知 ${pct(s.retryAdjustedProbability)}`
           : ''
+        // V5.5：自我校准后成功率（有对账证据且修正有实际变化时显示）
+        const calAdj = s.calibratedProbability !== null
+          && Math.abs(s.calibratedProbability - s.retryAdjustedProbability) > 0.0005
+          ? `  → 校准 ${pct(s.calibratedProbability)}`
+          : ''
         // V5.3：主导失败模式（⚡=瞬态可自愈 / 🔒=永久需介入）
         const modes = s.failureModes.length > 0
           ? `  模式 ${s.failureModes.map(m =>
@@ -524,7 +541,7 @@ export function apply(ctx: Context) {
         const dur = s.predictedDurationMs !== null
           ? `  ~${fmtDuration(s.predictedDurationMs)}`
           : ''
-        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${retryAdj}${cal}${prior}${modes}${dur}`)
+        lines.push(`  [${s.index}] ${s.action}  ${fmtBytes(s.estimatedBytes)}  成功率 ${pct(s.successProbability)}${retryAdj}${calAdj}${cal}${prior}${modes}${dur}`)
       }
       // V5.2 决策智能：帕累托前沿 + 推荐计划（先知从"预测者"升级为"决策顾问"）
       // V5.3：候选成功率已取重试调整口径 —— 计划合成与引擎执行语义对齐
@@ -624,6 +641,15 @@ export function apply(ctx: Context) {
       if (sc.durationRatio !== null) {
         const dr = sc.durationRatio
         lines.push(`   ⏱️ 耗时偏差: 实际/预测 中位 ${dr.p50.toFixed(2)}× / P90 ${dr.p90.toFixed(2)}×（${dr.samples} 样本；>1 = 预测偏乐观）`)
+      }
+      // V5.5 自我校准：战绩不止打分，还驱动再学习 —— 未来预测已按此修正
+      const cs = sc.calibration
+      if (cs !== null) {
+        const bias = cs.actualRate < cs.meanPredicted ? '过自信' : '过保守'
+        const durPart = cs.durationFactor !== null
+          ? `；耗时因子 ${cs.durationFactor.toFixed(2)}×（${cs.durationSamples} 样本）`
+          : ''
+        lines.push(`   ⚖️ 自我校准: 历史预测系统性${bias}（存证均值 ${pct(cs.meanPredicted)} vs 实际 ${pct(cs.actualRate)}，${cs.evidence} 步证据）→ logit 位移 ${cs.delta >= 0 ? '+' : ''}${cs.delta.toFixed(2)}（证据权重 ${pct(cs.selfWeight)}）已修正进未来预测${durPart}`)
       }
       if (eff !== undefined) {
         const learned = eff.selfWeight > 0

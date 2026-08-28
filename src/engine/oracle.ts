@@ -15,7 +15,8 @@ import type { CleanOperation, CleanRequest, TxContext } from '../contracts/trans
 import type { CleanStrategy, PluginName, ProfileName, TxId } from '../contracts/base'
 import { err, fmtDuration, ioError, ok } from '../contracts/base'
 import type { IReliabilityModel } from '../contracts/reliability.contract'
-import type { PredictionScorecard } from '../contracts/prediction.contract'
+import type { CalibrationShift, PredictionScorecard } from '../contracts/prediction.contract'
+import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
 import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
 } from '../contracts/oracle.contract'
 import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
@@ -76,6 +77,9 @@ export interface OracleStepDetail extends OracleStep {
   readonly retryAdjustedProbability: number
   /** V5.4：该步预计耗时（ms，动作历史时间加权中位；零历史 = null） */
   readonly predictedDurationMs: number | null
+  /** V5.5：自我校准后的预测成功率（重试感知口径 × 历史偏差修正）；
+   *  无对账证据（校准缺席）= null —— 未修正与"修正后恰好不变"可区分 */
+  readonly calibratedProbability: number | null
 }
 
 /** 先知报告详情：契约字段语义不变，新增蒙特卡洛分布与修复建议 */
@@ -98,6 +102,10 @@ export interface OracleReportDetail extends OracleReport {
   /** V5.4：先知战绩（预测存证 vs 实际结局的对账）；未注入评分级或
    *  零可对账样本 = null —— 预测若不可证伪就与巫术无异，先知公开成绩单 */
   readonly trackRecord: PredictionScorecard | null
+  /** V5.5：自我校准位移（从战绩学习的系统性偏差修正）；证据不足 = null */
+  readonly calibration: CalibrationShift | null
+  /** V5.5：自我校准后的事务成功率 = ∏ 校准后逐步 p；校准缺席 = null */
+  readonly calibratedSuccessProbability: number | null
 }
 
 /** IOracle 的引擎层扩展：divine 返回详情报告（协变返回类型） */
@@ -245,6 +253,16 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
 
         // ── 可靠性融合 ──────────────────────────────────────────
         const rel = await deps.reliability()
+        // V5.4/V5.5 战绩与自我校准提前获取：校准位移要在逐步融合时应用
+        //（存证 → 对账 → 学习 δ → 修正未来预测 —— 收敛闭环的读侧）。
+        // 评分级失败/未注入 → trackRecord=null 且不校准：增强不阻断推演
+        let trackRecord: PredictionScorecard | null = null
+        if (deps.scorecard) {
+          try {
+            trackRecord = await deps.scorecard()
+          } catch { trackRecord = null }
+        }
+        const calibration = trackRecord?.calibration ?? null
         const steps: OracleStepDetail[] = []
         // 后缀和：exposure_i = Σ_{j≥i} b_j（第 i 步失败作废的总量）
         const suffix = new Array<number>(previews.length + 1).fill(0)
@@ -254,6 +272,10 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         for (const [i, pv] of previews.entries()) {
           // V5.2：操作级成功率 —— 大小分桶协变量调制（"删 2GB 的成功率"）
           const r = rel.reliabilityOf(pv.op.action, { sizeBytes: pv.estimated })
+          const pRetry = r.retryAdjustedProbability ?? r.successProbability
+          // V5.4：耗时预测（时间加权中位；零历史 = null 诚实留白）；
+          // V5.5：有耗时对账证据时按修正因子缩放（预测偏乐观 → 放大）
+          const durP50 = r.duration?.p50 ?? null
           steps.push({
             index: i,
             action: pv.op.action,
@@ -267,9 +289,14 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
             // V5.3 失败模式智能：这步为什么挂 + 引擎自愈后的有效成功率
             failureModes: r.failureModes ?? [],
             transientShare: r.transientShare ?? 0,
-            retryAdjustedProbability: r.retryAdjustedProbability ?? r.successProbability,
-            // V5.4：耗时预测（时间加权中位；零历史 = null 诚实留白）
-            predictedDurationMs: r.duration?.p50 ?? null,
+            retryAdjustedProbability: pRetry,
+            predictedDurationMs: durP50 !== null
+              ? applyDurationCorrection(durP50, calibration)
+              : null,
+            // V5.5：自我校准 —— 存证战绩学习到的系统性偏差修正
+            calibratedProbability: calibration !== null
+              ? applyCalibrationShift(pRetry, calibration)
+              : null,
           })
         }
 
@@ -385,6 +412,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         // ── V5.4 耗时预测：各步 p50 之和（任一步零历史 → null 诚实留白）─
         // 悲观上界 = 各步 p90 之和（"每步都跑在最慢 10% 分位"的串联）。
         // 墙钟口径与引擎计时一致（含重试退避等待）—— 用户等的就是这个数。
+        // V5.5：逐步耗时已按对账修正因子缩放，悲观上界同口径。
         const durationAll = previews.length > 0
           && steps.every(s => s.predictedDurationMs !== null)
         const predictedDurationMs = durationAll
@@ -393,18 +421,15 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         const pessimisticDurationMs = durationAll
           ? previews.reduce((acc, pv) => {
             const r = rel.reliabilityOf(pv.op.action, { sizeBytes: pv.estimated })
-            return acc + (r.duration?.p90 ?? 0)
+            const p90 = r.duration?.p90 ?? 0
+            return acc + applyDurationCorrection(p90, calibration)
           }, 0)
           : null
 
-        // ── V5.4 先知战绩：预测存证 vs 实际结局的对账（问责制） ──
-        // 评分级失败/未注入 → null：战绩是增强展示，绝不阻断推演
-        let trackRecord: PredictionScorecard | null = null
-        if (deps.scorecard) {
-          try {
-            trackRecord = await deps.scorecard()
-          } catch { trackRecord = null }
-        }
+        // ── V5.5 自我校准：校准后事务成功率（Saga 连乘，与存证口径一致）─
+        const calibratedSuccessProbability = calibration !== null
+          ? steps.reduce((acc, s) => acc * (s.calibratedProbability ?? s.retryAdjustedProbability), 1)
+          : null
 
         const report: OracleReportDetail = {
           request,
@@ -425,8 +450,11 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           predictedDurationMs,
           pessimisticDurationMs,
           trackRecord,
+          calibration,
+          calibratedSuccessProbability,
           narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc,
-            priorOnlySteps, rel.globalSuccessProbability, pRetryAdjusted, predictedDurationMs),
+            priorOnlySteps, rel.globalSuccessProbability, pRetryAdjusted, predictedDurationMs,
+            calibratedSuccessProbability, calibration),
           evidence: {
             stepSamples: rel.sampleCount,
             globalSuccessProbability: rel.globalSuccessProbability,
@@ -450,6 +478,8 @@ function narrate(
   globalPrior = 0.95,
   pRetryAdjusted?: number,
   predictedDurationMs?: number | null,
+  calibratedP?: number | null,
+  calibration?: CalibrationShift | null,
 ): string {
   const pct = (p: number) => `${(p * 100).toFixed(1)}%`
   const parts: string[] = []
@@ -457,6 +487,13 @@ function narrate(
   // V5.3：重试感知口径 —— 引擎将自愈瞬态失败，用户应看到"有效成功率"
   if (typeof pRetryAdjusted === 'number' && pRetryAdjusted > p + 0.0005) {
     parts.push(`引擎自动重试瞬态失败（EBUSY/超时等）后有效成功率 ${pct(pRetryAdjusted)}（+${((pRetryAdjusted - p) * 100).toFixed(1)} 个百分点）`)
+  }
+  // V5.5：自我校准口径 —— 存证战绩显示的历史偏差已被修正进本次预测
+  if (typeof calibratedP === 'number' && typeof pRetryAdjusted === 'number'
+    && calibration != null
+    && Math.abs(calibratedP - pRetryAdjusted) > 0.0005) {
+    const bias = calibration.actualRate < calibration.meanPredicted ? '过自信' : '过保守'
+    parts.push(`自我校准后成功率 ${pct(calibratedP)}（历史预测${bias}：存证均值 ${pct(calibration.meanPredicted)} vs 实际 ${pct(calibration.actualRate)}，${calibration.evidence} 步证据 → logit 位移 ${calibration.delta >= 0 ? '+' : ''}${calibration.delta.toFixed(2)}）`)
   }
   // V5.4：耗时预测 —— 来自动作历史的时间加权中位（有据可依的"要多久"）
   if (typeof predictedDurationMs === 'number' && predictedDurationMs > 0) {

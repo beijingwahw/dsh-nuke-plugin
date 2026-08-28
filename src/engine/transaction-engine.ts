@@ -17,6 +17,8 @@ import type {
 } from '../contracts/transaction'
 import type { IAuditLog } from '../contracts/logging'
 import { OP_AUDIT_PREFIX, PREDICT_AUDIT_ACTION } from '../contracts/logging'
+import type { CalibrationShift } from '../contracts/prediction.contract'
+import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
 import {
   classifyFailureMode, DEFAULT_RETRY_POLICY, MODE_TRANSIENCE,
 } from '../contracts/failure.contract'
@@ -48,6 +50,11 @@ export interface EngineDeps {
    *  事后不可篡改（链哈希），先知从此可被问责（nuke_scorecard 对账）。
    *  统计增强能力：构建/存证失败只记日志，绝不阻断真实清理。 */
   readonly predictor?: () => Promise<IReliabilityModel>
+  /** V5.5 自我校准：校准位移工厂（从存证战绩学习的历史偏差）。
+   *  注入后存证的 predictedP/predictedDurationMs 为校准后口径 ——
+   *  对账因此衡量"修正后的预测"，残差 → 0 则 δ → 0（迭代收敛）。
+   *  学习失败 → 不校准（恒等），绝不阻断真实清理。 */
+  readonly calibrator?: () => Promise<CalibrationShift | null>
 }
 
 /** V5：引擎行为选项（全部缺省安全，不传即沿用 V4 语义） */
@@ -468,10 +475,20 @@ export function createTransactionEngine(
         // 先知问责制的根基：预测时刻先于结局时刻（时间戳为证），事后
         // 任何篡改都会被 nuke_verify 检出。存证口径 = 重试感知成功率
         //（引擎将自动重试瞬态失败 —— 预测与执行语义对齐）。
+        // V5.5：注入校准器时存证校准后口径（先知与引擎同一套修正 ——
+        // 对账衡量修正后预测，残差→0 则 δ→0，迭代收敛）。
         // 统计增强纪律：模型构建/存证失败只记日志，绝不阻断真实清理。
         if (deps.predictor) {
           try {
             const model = await deps.predictor()
+            let shift: CalibrationShift | null = null
+            if (deps.calibrator) {
+              try {
+                shift = await deps.calibrator()
+              } catch {
+                shift = null   // 学习失败 → 不校准（恒等），不阻断
+              }
+            }
             const stepPredictions = []
             for (const [i, op] of plan.operations.entries()) {
               // 直连 commit（未经 plan/dryRun）时补一次 preview：
@@ -491,13 +508,17 @@ export function createTransactionEngine(
                 op.action,
                 est !== undefined && est >= 0 ? { sizeBytes: est } : undefined,
               )
+              const pRaw = r.retryAdjustedProbability ?? r.successProbability
+              const durRaw = r.duration?.p50 ?? null
               stepPredictions.push({
                 index: i,
                 operationId: op.id,
                 action: op.action,
                 estimatedBytes: est ?? null,
-                predictedP: r.retryAdjustedProbability ?? r.successProbability,
-                predictedDurationMs: r.duration?.p50 ?? null,
+                predictedP: applyCalibrationShift(pRaw, shift),
+                predictedDurationMs: durRaw !== null
+                  ? applyDurationCorrection(durRaw, shift)
+                  : null,
               })
             }
             const txP = stepPredictions.reduce((acc, s) => acc * s.predictedP, 1)
@@ -509,6 +530,10 @@ export function createTransactionEngine(
               detail: {
                 steps: stepPredictions,
                 txSuccessProbability: txP,
+                // V5.5：记录所应用的校准（存证可解释 —— 这个数字修正过多少）
+                ...(shift !== null
+                  ? { calibrationDelta: shift.delta, calibrationEvidence: shift.evidence }
+                  : {}),
                 // 演习事务（人为注入崩溃）标记后不计入战绩 —— 对账纪律
                 ...(deps.crashAfterStep !== undefined ? { drill: true } : {}),
               },
