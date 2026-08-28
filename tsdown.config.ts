@@ -12,11 +12,21 @@ export default defineConfig({
   entry: ['src/index.ts'],
   format: 'esm',
   outDir: 'lib',
-  noExternal: ['@deepseek-ai/dsh-tools', 'yaml'],
-  external: [
-    '@deepseek-ai/cordis',
-    '@deepseek-ai/dsh-scope',
-    '@deepseek-ai/dsh-llm',
-    '@deepseek-ai/dsh-session',
-  ],
+  // 显式化内联意图（替代 noExternal 隐式语义）：只有列出的依赖被打进产物，
+  // 其余一律外置 —— 防未来新增依赖被静默内联
+  deps: {
+    onlyBundle: [
+      '@deepseek-ai/dsh-tools',
+      '@deepseek-ai/cosmokit',   // dsh-tools 的传递依赖，连带内联
+      '@deepseek-ai/schemastery', // 同上
+      'yaml',
+    ],
+    // harness 运行时单例：永不内联（见顶部注释）
+    neverBundle: [
+      '@deepseek-ai/cordis',
+      '@deepseek-ai/dsh-scope',
+      '@deepseek-ai/dsh-llm',
+      '@deepseek-ai/dsh-session',
+    ],
+  },
 })

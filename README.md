@@ -523,7 +523,7 @@ npm run dev          # 开发期热更新进程（见下）
 `npm run dev` 的组成：仓库根 `cordis.yml` 依次挂 logger / timer / hmr / 宿主桩 / 本插件（直接加载 `src/index.ts`）；
 `dev/host-stubs.ts` 提供 dsh 宿主 `tools` 服务的最小桩（本插件 inject `['tools']`，缺桩会永远 PENDING）。
 
-> 注意：开发 HMR 需 Node ≥ 24.11（24.1.0 等早期 24.x 的 Node 内部接口与 cordis-plugin-loader 1.0.2 不兼容，表现为编辑文件不触发重载）。
+> 注意：开发基线为 Node ≥ 24.11（已在 `package.json` 的 `engines` 声明，npm 安装时自动校验）。早期 24.x（如 24.1.0）的 Node 内部接口与 cordis-plugin-loader 1.0.2 不兼容（表现为 HMR 编辑文件不触发重载），且不满足 tsdown 0.22 的引擎要求。
 
 ## FAQ
 

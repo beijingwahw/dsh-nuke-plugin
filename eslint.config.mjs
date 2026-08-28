@@ -2,6 +2,7 @@
 // typescript-eslint strict 型预设（类型感知规则）+ import 卫生 +
 // 零告警门禁（--max-warnings 0 见 package.json lint script）
 import js from '@eslint/js'
+import globals from 'globals'
 import importPlugin from 'eslint-plugin-import-x'
 import tseslint from 'typescript-eslint'
 
@@ -115,16 +116,11 @@ export default tseslint.config(
     },
   },
   {
-    // 独立 CLI（零依赖 CommonJS 脚本）：Node 全局内联声明（npm 树损坏
-    // 无法安装 globals 包，实测仅 console/process/Buffer 被标记）；
+    // 独立 CLI（零依赖 CommonJS 脚本）：Node 全局环境；
     // 空 catch 是有意的 fail-open（体积统计/遍历不因单文件失败中断）
     files: ['cli/**/*.cjs'],
     languageOptions: {
-      globals: {
-        console: 'readonly',
-        process: 'readonly',
-        Buffer: 'readonly',
-      },
+      globals: globals.node,
     },
     rules: {
       'no-empty': ['error', { allowEmptyCatch: true }],
