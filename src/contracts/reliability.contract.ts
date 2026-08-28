@@ -82,6 +82,12 @@ export interface ActionReliability {
   readonly ci95: readonly [number, number]
   /** 自数据权重 0-1：(s+f)/(s+f+κ)。1=完全用自身数据，0=完全用全局先验 */
   readonly selfWeight: number
+  /** V5.6：最终层 Beta 后验参数（与 successProbability 同源；
+   *  带 sizeBytes 查询时为桶层调制后的后验）。Thompson 采样 /
+   *  探索智能的输入 —— 后验宽度即"还需要多少数据"的诚实度量。
+   *  可选：旧实现/注入 mock 未提供时消费方应以 (successProbability,
+   *  successes+failures) 构造近似后验。 */
+  readonly posterior?: { readonly alpha: number; readonly beta: number }
   /** 校准分布；样本 < minCalibrationSamples 时为 null（诚实的不确定） */
   readonly calibration: CalibrationSummary | null
   /** V5.2：带 sizeBytes 查询时的桶级调制证据；未查询大小时为 undefined */

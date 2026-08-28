@@ -435,7 +435,7 @@ export function apply(ctx: Context) {
   // ── nuke_oracle（先知引擎：后果推演） ─────────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_oracle',
-    description: '先知推演：dry-run 说"我打算做什么"，先知说"做了会怎样"——事务成功率、期望回收（校准分布修正 + 蒙特卡洛 P10/P50/P90 分布）、最脆弱步骤（含修复收益）、爆炸半径、磁盘倒计时延长。基于历史执行数据（贝叶斯学习），零副作用不拿锁。建议清理前先问先知',
+    description: '先知推演：dry-run 说"我打算做什么"，先知说"做了会怎样"——事务成功率、期望回收（校准分布修正 + 蒙特卡洛 P10/P50/P90 分布 + 下行风险 CVaR₁₀）、最脆弱步骤（含修复收益）、爆炸半径、磁盘倒计时延长、Thompson 探索口径与信息价值排序（数据不足时建议先执行哪步以最快积累证据）。基于历史执行数据（贝叶斯学习 + 自我校准），零副作用不拿锁。建议清理前先问先知',
     parameters: {
       plugin_names: { type: 'array', items: { type: 'string' }, description: '要推演的插件名列表' },
       plugin_name: { type: 'string', description: '单个插件名（plugin_names 简写）' },
@@ -496,6 +496,18 @@ export function apply(ctx: Context) {
         // 蒙特卡洛互证口径：P10/P90 是含失败回滚（=0）的无条件分布，
         // 与解析式期望/成功率并列交叉验证（种子固定 → 逐位可复现）
         lines.push(`   🎲 蒙特卡洛 ${mc.trials} 次抽样（种子 ${mc.seed}）: 无条件回收 P10 ${fmtBytes(mc.p10)} / P50 ${fmtBytes(mc.p50)} / P90 ${fmtBytes(mc.p90)}，抽样成功率 ${pct(mc.successRate)}`)
+        // V5.6：下行风险 —— CVaR₁₀（最差 10% 情形的平均回收）
+        lines.push(`   📉 下行风险 CVaR₁₀: ${fmtBytes(mc.cvar10)}（最差 10% 情形的平均回收；Saga 全或无语义下尾部多为失败回滚 = 0）`)
+      }
+      // V5.6：Thompson 受控探索 —— 后验采样口径 + 信息价值排序
+      const ex = o.exploration
+      if (ex !== null && ex.steps.length > 0) {
+        const arrow = ex.sampledTxProbability >= ex.meanTxProbability ? '↑' : '↓'
+        lines.push(`   🧪 Thompson 探索口径: ${pct(ex.sampledTxProbability)}（均值 ${pct(ex.meanTxProbability)} ${arrow}，种子 ${ex.seed}）`)
+        const info = ex.mostInformative
+        if (info !== null) {
+          lines.push(`      📡 最值得先执行: 第 ${info.index} 步 ${info.action}（自身历史 ${info.evidence} 条，后验 σ ${(info.posteriorSd * 100).toFixed(1)}pp，不确定敞口 ≈ ${fmtBytes(info.uncertaintyBytes)}）`)
+        }
       }
       if (o.weakestStep) {
         lines.push(`   ⚠️ 最脆弱: 第 ${o.weakestStep.index} 步 ${o.weakestStep.action}（成功率 ${pct(o.weakestStep.successProbability)}，失败作废 ${fmtBytes(o.weakestStep.exposureBytes)}）`)

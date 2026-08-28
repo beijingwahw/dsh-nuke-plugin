@@ -17,6 +17,8 @@ import { err, fmtDuration, ioError, ok } from '../contracts/base'
 import type { IReliabilityModel } from '../contracts/reliability.contract'
 import type { CalibrationShift, PredictionScorecard } from '../contracts/prediction.contract'
 import { applyCalibrationShift, applyDurationCorrection } from '../contracts/prediction.contract'
+import type { ExplorationStepInput, ThompsonExploration } from '../contracts/exploration.contract'
+import { thompsonExplore } from '../contracts/exploration.contract'
 import type { IOracle, OracleConfidence, OracleReport, OracleStep, OracleWeakestStep,
 } from '../contracts/oracle.contract'
 import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
@@ -46,6 +48,10 @@ export interface MonteCarloSummary {
   readonly p50: number
   /** 回收分布 P90 */
   readonly p90: number
+  /** V5.6：CVaR₁₀ 下行风险 —— 最差 10% 抽样的条件均值。
+   *  Saga 全或无语义下成功率 > 10% 时该值为 0（最差尾部全是
+   *  失败回滚）：诚实回答"最坏情形能剩多少"。 */
+  readonly cvar10: number
   /** 蒙特卡洛均值（与解析期望 expectedReclaimBytes 互证） */
   readonly mean: number
   /** 抽样中事务全成的频率（与解析连乘 transactionSuccessProbability 互证） */
@@ -90,6 +96,10 @@ export interface OracleReportDetail extends OracleReport {
   readonly monteCarlo: MonteCarloSummary
   /** V5.2 决策智能：帕累托最优计划合成（优化失败不阻断推演 → null） */
   readonly optimizedPlan: OptimizedPlan | null
+  /** V5.6：Thompson 受控探索 —— 后验采样口径 + 信息价值排序。
+   *  纯利用的死锁（富者愈富）由探索打破：数据少的动作被乐观抽样
+   *  获得执行机会，执行即学习。零步骤 = null。 */
+  readonly exploration: ThompsonExploration | null
   /** V5.3：重试感知事务成功率 = ∏ retryAdjusted p_i。
    *  引擎将自动重试瞬态失败（有界次数）前提下的整体成功率 ——
    *  与 transactionSuccessProbability（裸连乘）并列，口径透明。 */
@@ -201,7 +211,10 @@ function monteCarlo(
   seed: number,
 ): MonteCarloSummary {
   if (trials <= 0 || steps.length === 0) {
-    return { trials: Math.max(0, trials), seed, p10: 0, p50: 0, p90: 0, mean: 0, successRate: steps.length === 0 ? 1 : 0 }
+    return {
+      trials: Math.max(0, trials), seed, p10: 0, p50: 0, p90: 0, cvar10: 0, mean: 0,
+      successRate: steps.length === 0 ? 1 : 0,
+    }
   }
   const rand = lcg(seed)
   const samples: number[] = new Array(trials)
@@ -218,12 +231,18 @@ function monteCarlo(
   }
   samples.sort((a, b) => a - b)
   const mean = samples.reduce((s, v) => s + v, 0) / trials
+  // CVaR₁₀：最差 10% 抽样的条件均值（样本升序取头部平均）。
+  // Saga 全或无 + 成功率 > 10% 时头部全是 0 → CVaR=0（最坏尾部
+  // 就是失败回滚，什么都没有 —— 这正是要诚实说出的下行）
+  const tail = Math.max(1, Math.floor(trials * 0.10))
+  const cvar10 = samples.slice(0, tail).reduce((s, v) => s + v, 0) / tail
   return {
     trials,
     seed,
     p10: sampleQuantile(samples, 0.10),
     p50: sampleQuantile(samples, 0.50),
     p90: sampleQuantile(samples, 0.90),
+    cvar10,
     mean,
     successRate: successes / trials,
   }
@@ -264,6 +283,8 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
         }
         const calibration = trackRecord?.calibration ?? null
         const steps: OracleStepDetail[] = []
+        // V5.6 探索智能输入：每步的最终层 Beta 后验 + 敞口 + 自身证据量
+        const exploreInputs: ExplorationStepInput[] = []
         // 后缀和：exposure_i = Σ_{j≥i} b_j（第 i 步失败作废的总量）
         const suffix = new Array<number>(previews.length + 1).fill(0)
         for (let i = previews.length - 1; i >= 0; i--) {
@@ -273,6 +294,21 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           // V5.2：操作级成功率 —— 大小分桶协变量调制（"删 2GB 的成功率"）
           const r = rel.reliabilityOf(pv.op.action, { sizeBytes: pv.estimated })
           const pRetry = r.retryAdjustedProbability ?? r.successProbability
+          // V5.6：后验缺省时以 (均值, 强度 10) 近似 —— 注入 mock 的
+          // 兼容路径，真实模型始终暴露与 mean 同源的 Beta 参数
+          const post = r.posterior ?? {
+            alpha: r.successProbability * 10,
+            beta: (1 - r.successProbability) * 10,
+          }
+          exploreInputs.push({
+            index: i,
+            action: pv.op.action,
+            mean: r.successProbability,
+            alpha: post.alpha,
+            beta: post.beta,
+            exposureBytes: suffix[i]!,
+            evidence: r.successes + r.failures,
+          })
           // V5.4：耗时预测（时间加权中位；零历史 = null 诚实留白）；
           // V5.5：有耗时对账证据时按修正因子缩放（预测偏乐观 → 放大）
           const durP50 = r.duration?.p50 ?? null
@@ -382,6 +418,20 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           mcSeed,
         )
 
+        // ── V5.6 探索智能：Thompson 后验采样 + 信息价值排序 ──────
+        // 均值口径是纯利用：新动作永远竞争不过有历史的动作（富者愈富
+        // 死锁）。后验采样让不确定的动作获得探索机会 —— 执行即学习，
+        // 探索/利用比例由后验宽度自动调节。种子与 MC 错位（独立流），
+        // 同输入逐位可复现。探索是建议不是行为：决策权仍在用户。
+        let exploration: ThompsonExploration | null = null
+        if (exploreInputs.length > 0) {
+          try {
+            exploration = thompsonExplore(exploreInputs, {
+              seed: (mcSeed ^ 0x7ea5ed) >>> 0,
+            })
+          } catch { exploration = null }
+        }
+
         // 置信度：样本量驱动（统计的诚实——数据不够就说不够）
         const confidence: OracleConfidence =
           rel.sampleCount >= 30 ? 'high' : rel.sampleCount >= 5 ? 'medium' : 'low'
@@ -446,6 +496,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           confidence,
           monteCarlo: mc,
           optimizedPlan,
+          exploration,
           retryAdjustedSuccessProbability: pRetryAdjusted,
           predictedDurationMs,
           pessimisticDurationMs,
@@ -454,7 +505,7 @@ export function createOracle(deps: OracleDeps): IOracleDetail {
           calibratedSuccessProbability,
           narrative: narrate(pSuccess, expectedReclaim, weakest, broken, confidence, mc,
             priorOnlySteps, rel.globalSuccessProbability, pRetryAdjusted, predictedDurationMs,
-            calibratedSuccessProbability, calibration),
+            calibratedSuccessProbability, calibration, exploration),
           evidence: {
             stepSamples: rel.sampleCount,
             globalSuccessProbability: rel.globalSuccessProbability,
@@ -480,6 +531,7 @@ function narrate(
   predictedDurationMs?: number | null,
   calibratedP?: number | null,
   calibration?: CalibrationShift | null,
+  exploration?: ThompsonExploration | null,
 ): string {
   const pct = (p: number) => `${(p * 100).toFixed(1)}%`
   const parts: string[] = []
@@ -502,6 +554,16 @@ function narrate(
   if (mc.trials > 0) {
     // 蒙特卡洛互证口径：P10/P90 是含失败回滚的分布分位（悲观-乐观带）
     parts.push(`蒙特卡洛 ${mc.trials} 次抽样：回收 P10 ${fmtBytes(mc.p10)} ~ P90 ${fmtBytes(mc.p90)}（抽样成功率 ${pct(mc.successRate)}）`)
+    // V5.6：下行风险 —— CVaR₁₀ 诚实回答"最差 10% 情形剩多少"
+    parts.push(`下行风险 CVaR₁₀ ${fmtBytes(mc.cvar10)}（最差 10% 情形的平均回收）`)
+  }
+  // V5.6：Thompson 探索口径 —— 打破纯利用的富者愈富死锁
+  if (exploration != null && exploration.steps.length > 0) {
+    const info = exploration.mostInformative
+    const infoPart = info !== null
+      ? `信息价值最高：第 ${info.index} 步 ${info.action}（自身历史 ${info.evidence} 条，不确定敞口 ≈ ${fmtBytes(info.uncertaintyBytes)}，优先执行可最快收窄先知盲区）`
+      : ''
+    parts.push(`Thompson 探索口径成功率 ${pct(exploration.sampledTxProbability)}（均值口径 ${pct(exploration.meanTxProbability)}${infoPart ? `；${infoPart}` : ''}）`)
   }
   if (weakest && (1 - weakest.successProbability) * weakest.exposureBytes > 0) {
     const diag = weakest.dominantFailureMode !== null

@@ -313,6 +313,9 @@ export async function createReliabilityModel(
     //（三层收缩：桶 → 动作 → 全局 → 设计先验；κ_b=5）
     // 注意：selfWeight 保持动作层口径（"该动作有多少自身历史"），
     // 桶层权重单独由 sizeBucket.selfWeight 表达 —— 两个语义不混用。
+    // V5.6：posterior 暴露最终层 Beta 参数（桶调制生效时为桶层后验）——
+    // Thompson 采样 / 探索智能的输入，与 mean 点估计严格同源。
+    let posterior: { readonly alpha: number; readonly beta: number }
     if (typeof sizeBytes === 'number' && sizeBytes >= 0) {
       const b = bucketOf(sizeBytes)
       if (b) {
@@ -322,6 +325,7 @@ export async function createReliabilityModel(
         const betaB = (1 - mean) * BUCKET_KAPPA + bs.failures
         mean = alphaB / (alphaB + betaB)
         ci = wilsonInterval(mean, alphaB + betaB)
+        posterior = { alpha: alphaB, beta: betaB }
         sizeBucket = {
           bucket: b.bucket,
           rangeBytes: [b.min, b.max],
@@ -330,9 +334,11 @@ export async function createReliabilityModel(
         }
       } else {
         ci = wilsonInterval(mean, alpha + beta)
+        posterior = { alpha, beta }
       }
     } else {
       ci = wilsonInterval(mean, alpha + beta)
+      posterior = { alpha, beta }
     }
 
     // Wilson score interval：点估计与区间同源于 Beta(α,β) 后验
@@ -390,6 +396,7 @@ export async function createReliabilityModel(
       successProbability: mean,
       ci95: [lo, hi],
       selfWeight,
+      posterior,
       calibration,
       ...(sizeBucket !== undefined ? { sizeBucket } : {}),
       failureModes,

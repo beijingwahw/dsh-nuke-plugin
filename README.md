@@ -1,9 +1,9 @@
 # dsh-nuke-plugin
 
-> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习 · 预测存证问责 · 自我校准
+> DeepSeek Harness 的工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 先知推演 · 混沌演习 · 贝叶斯自学习 · 预测存证问责 · 自我校准 · Thompson 探索
 
 [![Release](https://img.shields.io/github/v/release/beijingwahw/dsh-nuke-plugin?color=blue&label=release)](https://github.com/beijingwahw/dsh-nuke-plugin/releases)
-[![Tests](https://img.shields.io/badge/tests-562%2F562-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
+[![Tests](https://img.shields.io/badge/tests-579%2F579-brightgreen)](https://github.com/beijingwahw/dsh-nuke-plugin/actions)
 [![TypeScript](https://img.shields.io/badge/TypeScript-strict-blue)](./tsconfig.json)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
@@ -65,7 +65,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 | `nuke_policy` | 查看守卫配置：保护名单 / 批量上限 / 回收上限 / 磁盘下限 / 时间黑窗 |
 | `nuke_trend` | 历史趋势：字节/天变化率、30 天外推、3σ̂ 异常检测（失控写盘早期信号） |
 | `nuke_forecast` | 磁盘写满预测：趋势 × 实时余量 → 倒计时与分级建议 |
-| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长、预计耗时（p50 与悲观 p90）；基于历史执行数据贝叶斯自学习 + 从战绩自我校准（历史过自信则自动收敛），零副作用不拿锁 |
+| `nuke_oracle` | **先知推演**：概率化后果预测——事务成功率、期望回收（校准分布修正）、最脆弱步骤、爆炸半径、磁盘倒计时延长、预计耗时（p50 与悲观 p90）、下行风险 CVaR₁₀、Thompson 探索口径与信息价值排序（建议先执行哪步以最快积累证据）；基于历史执行数据贝叶斯自学习 + 从战绩自我校准，零副作用不拿锁 |
 | `nuke_failures` | **失败档案**：每类动作的历史失败模式诊断（EBUSY 锁定/超时/权限/校验拒绝…）、瞬态份额与处方；⚡瞬态引擎自动重试、🔒永久需人工介入 |
 | `nuke_scorecard` | **先知战绩对账单**：执行前已存证进 hash chain 的预测（成功率/耗时）vs 实际结局——Brier 技能分（对照无技能基线）、逐步命中明细、耗时偏差分布、重试疗效学习值、系统性偏差诊断与自我校准位移；回答"先知的数字到底可不可信、偏在哪、纠了没有" |
 
@@ -172,6 +172,29 @@ dry-run 是确定性预演，先知是概率化推演。每次清理的每个步
          → 决策（先修最弱步骤，或换 safe 策略）
             → 再执行 → 数据更准 → ...
 ```
+
+## V5.6 探索智能：从纯利用到知情探索，从期望值到下行风险
+
+V5.5 之前的学习系统有一个结构性死锁：**所有预测取后验均值，决策永远偏向历史证据充分的动作**——新动作/新尺寸桶收缩向先验，在均值口径下永远竞争不过"老将"，于是永远不被执行、永远没有数据、先验永远不被修正（多臂老虎机的"富者愈富"）。V5.6 用两个世界级机制补全决策智能的最后两块：
+
+### Thompson 受控探索（后验采样决策）
+
+```
+纯利用（旧）：决策 = argmax 后验均值      → 富者愈富，新动作饿死
+Thompson（新）：决策 = argmax 后验抽样 p̃  → 后验宽（数据少）的动作
+                                          偶尔被抽得很高 → 获得执行机会
+                                          → 产生数据 → 后验收窄
+                                          → 探索/利用比例由不确定性自动调节
+```
+
+- `sampleBeta`：Marsaglia-Tsang Gamma + Box-Muller 的种子化 Beta 采样（零依赖，逐位可复现）
+- 可靠性模型暴露最终层 Beta 后验参数（与均值点估计同源，桶调制后即桶层后验）
+- `nuke_oracle` 输出**探索口径**（采样成功率 vs 均值成功率并列）与**信息价值排序**：`不确定敞口 = 后验 σ × 失败敞口`——"这步的不确定度值多少字节"，数据最少、牵扯最大的步骤最先被建议执行
+- 探索是**建议不是行为**：执行决策权仍在用户/Agent，种子固定可复现
+
+### CVaR₁₀ 下行风险（最差 10% 情形能剩多少）
+
+蒙特卡洛分布不止报 P10/P90 悲观-乐观带，新增**条件风险值**：最差 10% 抽样的平均回收。Saga 全或无语义下成功率 > 90% 时尾部由失败回滚（=0）过渡到最小的成功抽样——诚实回答"最坏情形我能接受吗"，而不是只给让人舒服的期望值。
 
 ## V5.5 自我校准：对账不止打分，还驱动再学习
 
