@@ -92,7 +92,12 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
   const probe: ProcessProbe = options.probe ?? {
     isAlive(pid, hostname) {
       if (hostname !== os.hostname()) return false
-      try { process.kill(pid, 0); return true } catch { return false }
+      // POSIX 语义：kill(pid,0) 抛 ESRCH = 进程不存在；抛 EPERM = 进程
+      // 存在但无权限。EPERM 误判为死会让 reapStale 回收活持有者的锁，
+      // 导致两个清理者并发 —— 必须按存活处理（保守方向）。
+      try { process.kill(pid, 0); return true } catch (e) {
+        return (e as NodeJS.ErrnoException).code === 'EPERM'
+      }
     },
   }
 
@@ -115,7 +120,10 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       for (const o of c.owners as readonly unknown[]) {
         if (typeof o !== 'object' || o === null) return null
         const slot = o as { owner?: { pid?: unknown; bootToken?: unknown }; expiresAt?: unknown }
-        if (typeof slot.owner?.pid !== 'number' || typeof slot.owner.bootToken !== 'string') return null
+        const pid = slot.owner?.pid
+        // pid 必须正整数：非正值传入 kill(pid,0) 会演化为进程组/全体信号探测
+        if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return null
+        if (typeof slot.owner?.bootToken !== 'string') return null
         if (typeof slot.expiresAt !== 'number') return null
       }
       return parsed as LockFileContent
@@ -146,18 +154,24 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
   }
 
   /** V5.6.2 陈旧锁自动回收（获取路径内嵌，唯一被生产触发的破锁路径）：
-   *  锁文件全体 owner 过期且死亡 → 在 guard 互斥下删除，返回 true 表示
-   *  锁已消失（调用方立即重试创建）。guard 内二次核验防 TOCTOU：等待
-   *  guard 期间持有者可能已正常释放（readLock null → true）或新 shared
-   *  持有者已加入（重新判定，不可回收则返回 false）。guard 不可用返回
+   *  ① 锁文件全体 owner 过期且死亡 → guard 互斥下删除；
+   *  ② 文件存在但结构非法（写入中途崩溃的截断 JSON / 被篡改）→ 无法证明
+   *    任何持有者存在，视为不可信残留同样回收 —— 旧实现把它与"文件不
+   *    存在"混为一谈，reap 后重试创建必然失败，损坏文件永久阻塞获取。
+   *  guard 内二次核验防 TOCTOU：等待 guard 期间持有者可能已正常释放或
+   *  新持有者已加入（重新判定，不可回收则返回 false）。guard 不可用返回
    *  false —— 保守留给下轮重试，绝不强拆。 */
   async function reapStale(p: string): Promise<boolean> {
+    if (!fs.existsSync(p)) return true // 锁文件已消失：直接进入重试创建
     const pre = readLock(p)
-    if (pre === null) return true // 锁文件已消失：直接进入重试创建
-    if (!allSlotsStale(pre, now())) return false
+    if (pre !== null && !allSlotsStale(pre, now())) return false
     const done = await withGuard(p, now, () => {
       const cur = readLock(p)
-      if (cur === null) return true
+      if (cur === null) {
+        // 结构非法 = 不可信残留 → 删除回收（若已被并发删/重建，下面 exists 判定兜底）
+        try { fs.unlinkSync(p) } catch { /* 并发已回收 */ }
+        return !fs.existsSync(p)
+      }
       if (!allSlotsStale(cur, now())) return false
       try { fs.unlinkSync(p) } catch { /* 并发已回收 */ }
       return !fs.existsSync(p)

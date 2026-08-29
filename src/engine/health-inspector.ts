@@ -81,10 +81,13 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 export function createHealthInspector(options: HealthInspectorOptions): IHealthInspector {
   const now = options.now ?? (() => new Date())
   // V5.6.2：锁持有者存活探测（默认与 lock-manager ProcessProbe / CLI
-  // isProcessAlive 同语义：hostname 核验 + kill(pid,0) 信号 0 探测）
+  // isProcessAlive 同语义：hostname 核验 + kill(pid,0) 信号 0 探测；
+  // EPERM = 进程存在但无权限 → 按存活处理，防陈旧锁状态误报）
   const isAlive = options.isProcessAlive ?? ((pid: number, hostname: string) => {
     if (hostname && hostname !== os.hostname()) return false
-    try { process.kill(pid, 0); return true } catch { return false }
+    try { process.kill(pid, 0); return true } catch (e) {
+      return (e as NodeJS.ErrnoException).code === 'EPERM'
+    }
   })
   // spawnSync 失败时 stdout/stderr 可能为 null —— 归一化为 string（与 exec-ops 同纪律）
   const runCommand = options.runCommand ?? ((cmd, args, opts) => {
@@ -268,20 +271,22 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
       const states = ownersRaw.map(o => {
         const slot = asRecord(o)
         const owner = asRecord(slot?.owner)
-        if (owner === null || typeof owner.pid !== 'number') return '结构异常'
+        const pid = owner?.pid
+        // pid 正整数校验（磁盘数据不可信）：非正值传入 kill(pid,0) 会演化为进程组/全体信号探测
+        if (owner === null || typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return '结构异常'
         const hostname = typeof owner.hostname === 'string' ? owner.hostname : ''
         const purpose = typeof owner.purpose === 'string' ? owner.purpose : 'unknown'
         const expiresAt = typeof slot?.expiresAt === 'number' ? slot.expiresAt : 0
-        const alive = isAlive(owner.pid, hostname)
-        if (alive && expiresAt > t) return `${purpose}(pid ${owner.pid}): 活跃`
+        const alive = isAlive(pid, hostname)
+        if (alive && expiresAt > t) return `${purpose}(pid ${pid}): 活跃`
         if (!alive && expiresAt <= t) {
-          return `${purpose}(pid ${owner.pid}): 已过期且进程已死，下次获取自动回收`
+          return `${purpose}(pid ${pid}): 已过期且进程已死，下次获取自动回收`
         }
         if (!alive) {
           const remainSec = Math.max(0, Math.round((expiresAt - t) / 1000))
-          return `${purpose}(pid ${owner.pid}): 进程已死，TTL 剩余 ${remainSec}s 后自动回收`
+          return `${purpose}(pid ${pid}): 进程已死，TTL 剩余 ${remainSec}s 后自动回收`
         }
-        return `${purpose}(pid ${owner.pid}): 已过期但进程仍存活`
+        return `${purpose}(pid ${pid}): 已过期但进程仍存活`
       })
       return states.join('; ')
     } catch { return '无法读取' }

@@ -217,6 +217,34 @@ describe('陈旧锁自动回收（V5.6.2）', () => {
     if (r.ok) return
     expect(r.error.message).toContain('活跃')
   })
+
+  it('v5.6.2 锁文件 pid 非正整数（磁盘可被篡改）→ 视为无锁，不探测进程组', async () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const m = createLockManager({ lockRoot, now: () => nowStub.value })
+    const lockDir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(lockDir, { recursive: true })
+    for (const bad of [-1, 0, 3.5]) {
+      fs.writeFileSync(path.join(lockDir, 'global.lock'), JSON.stringify({
+        version: 1, scope: 'global', mode: 'exclusive',
+        owners: [{ owner: { pid: bad, hostname: 'h', bootToken: 'x', purpose: 'clean' },
+          acquiredAt: 't', expiresAt: nowStub.value + 60_000 }],
+      }))
+      const h = await m.acquire(req(ownerB, 'exclusive'))
+      expect(h.ok).toBe(true)
+      if (h.ok) await h.value.release()
+    }
+  })
+
+  it('v5.6.2 结构损坏的锁文件（截断 JSON）→ 自动回收不阻塞获取', async () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const m = createLockManager({ lockRoot, now: () => nowStub.value, probe: { isAlive: () => false } })
+    const p = path.join(lockRoot, 'locks', 'global.lock')
+    fs.mkdirSync(path.dirname(p), { recursive: true })
+    fs.writeFileSync(p, '{"version":1,"scope":"global","mode":"exclu')  // 模拟写入中途崩溃
+    const h = await m.acquire(req(ownerB, 'exclusive'))
+    expect(h.ok).toBe(true)
+    if (h.ok) await h.value.release()
+  })
 })
 
 describe('withLock RAII', () => {

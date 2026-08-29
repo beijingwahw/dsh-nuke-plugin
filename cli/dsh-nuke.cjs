@@ -212,10 +212,13 @@ const LEGACY_LOCK_FILE = path.join(DSH_HOME, '.nuke.lock'); // V3 遗留锁（�
 const LOCK_TTL_MS = 300000;
 const CLI_BOOT_TOKEN = `cli-${crypto.randomBytes(8).toString('hex')}`;
 
-/** 进程存活探测（与插件版 ProcessProbe 同语义：pid + hostname 双重核验） */
+/** 进程存活探测（与插件版 ProcessProbe 同语义：pid + hostname 双重核验）。
+ *  POSIX 语义：kill(pid,0) 抛 ESRCH = 不存在；抛 EPERM = 存在但无权限。
+ *  EPERM 误判为死会让 breakStaleV4Lock 回收活持有者的锁 → 并发清理，
+ *  必须按存活处理（保守方向，与插件版 v5.6.2 修复对齐）。 */
 function isProcessAlive(pid, hostname) {
   if (hostname && hostname !== os.hostname()) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
+  try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
 }
 
 /** 读取 V4 锁文件（结构非法视为无锁） */
@@ -229,13 +232,20 @@ function readV4Lock(p) {
   } catch { return null; }
 }
 
-/** 判断一个 V4 锁文件是否存在"活跃"持有者（未过期且进程存活） */
+/** 判断一个 V4 锁文件是否存在"活跃"持有者。
+ *  v5.6.2 纪律对齐：活跃 = (存活 OR 未过期)。旧实现 some(未过期 && 存活)
+ *  的补集是"每 owner 过期 OR 死亡"—— 存活但 TTL 已过（CLI 无心跳续期，
+ *  长清理必然出现）的持有者锁会被并发 CLI 强行破掉，产生两个并发清理
+ *  者恰是锁要防的事故。收紧后：进程已死须等 TTL 过期、TTL 过期须等进程
+ *  确认死亡，双条件同时满足才允许破锁（与插件版 reapStale 同纪律）。 */
 function hasActiveOwner(lock) {
   if (!lock) return false;
   const now = Date.now();
   return lock.owners.some(o => {
-    const alive = o.owner && typeof o.owner.pid === 'number' && isProcessAlive(o.owner.pid, o.owner.hostname);
-    return o.expiresAt > now && alive;
+    // pid 正整数校验（磁盘数据不可信）：非正值传入 kill(pid,0) 会演化为进程组/全体信号探测
+    const alive = o.owner && Number.isInteger(o.owner.pid) && o.owner.pid > 0
+      && isProcessAlive(o.owner.pid, o.owner.hostname);
+    return o.expiresAt > now || alive;
   });
 }
 

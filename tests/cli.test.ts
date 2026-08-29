@@ -130,6 +130,26 @@ describe('CLI V4 锁互斥（与插件版共享 .nuke/locks/ 协议）', () => {
     expect(fs.existsSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))).toBe(false)
   })
 
+  it('v5.6.2 持有者存活但 TTL 过期 → 不破锁拒绝执行（双条件纪律，防并发清理）', () => {
+    // 旧实现 hasActiveOwner=some(未过期&&存活)：存活+过期 → 判非活跃 → 破锁
+    // → 与仍在工作的持有者并发清理。修复后必须双条件（死&&过期）才破。
+    writeV4Lock('global.lock', process.pid, Date.now() - 60_000, 'slow-but-alive')
+    const r = runCli(['clean', 'foo-plugin', '--dry-run'])
+    expect(r.status).toBe(1)
+    expect(r.stderr).toContain('🔒')
+    // 不得破坏活持有者的锁文件
+    expect(fs.existsSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))).toBe(true)
+    fs.rmSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))
+  })
+
+  it('v5.6.2 持有者已死但 TTL 未过期 → 不破锁拒绝执行（等 TTL 到期）', () => {
+    writeV4Lock('global.lock', 999_999_999, Date.now() + 60_000, 'dead-not-expired')
+    const r = runCli(['clean', 'foo-plugin', '--dry-run'])
+    expect(r.status).toBe(1)
+    expect(fs.existsSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))).toBe(true)
+    fs.rmSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))
+  })
+
   it('V3 遗留锁未超时 → 拒绝（升级窗口期保护）；超时 → 清除后继续', () => {
     // 未超时：拒绝
     fs.writeFileSync(path.join(dshHome, '.nuke.lock'), JSON.stringify({
