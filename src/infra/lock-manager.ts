@@ -13,6 +13,7 @@
 //     的锁文件在 guard 互斥下就地删除。修复缺陷：持有者崩溃后锁文件永久
 //     残留，O_EXCL 永远失败，acquire 只能 E_LOCK_HELD —— 全部 nuke 操作
 //     被一个早已死亡的进程无限期阻塞（breakStale 从未被生产代码调用）。
+import { spawnSync } from 'child_process'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -21,7 +22,8 @@ import * as path from 'path'
 import type { LockId, Result } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type {
-  ILockManager, LockHandle, LockOwner, LockRequest, LockScope, ProcessProbe, StaleProof,
+  ILockManager, LockFileStatus, LockHandle, LockOwner, LockRequest, LockScope,
+  LockSlotStatus, ProcessProbe, StaleProof,
 } from '../contracts/lock'
 
 interface LockFileContent {
@@ -40,28 +42,97 @@ export interface LockManagerOptions {
   readonly now?: () => number
 }
 
-/** acquire 请求的可选自动续期字段（叠加在 LockRequest 之上，向后兼容：
- *  不携带该字段的既有调用行为完全不变） */
-export interface LockAutoRenewOptions {
-  /** 后台心跳周期（ms）：> 0 时句柄持有期间定时调用 refresh 防 TTL 到期
-   *  被他人安全破锁；release 时自动清除定时器。建议取 ttlMs 的 1/3 左右
-   *  （单次心跳失败仍有缓冲窗口）。定时器 unref —— 不阻止进程退出。 */
-  readonly autoRenewMs?: number
+/** @deprecated V5.7：autoRenewMs 已并入契约 LockRequest；保留别名向后兼容 */
+export type LockRenewRequest = LockRequest
+
+/** createLockManager 的运行时能力集 = ILockManager 契约（V5.7 起超集
+ *  能力全部上收进契约：autoRenewMs 心跳、inspect 诊断）。 */
+export type LockManagerRuntime = ILockManager
+
+// ─── V5.7 进程启动时间指纹：PID 复用甄别的物理依据 ─────────────
+// 场景：持有者崩溃 → PID 被无关新进程复用 → kill(pid,0) 恒真 →
+// 「已过期但进程仍存活」→ 陈旧锁永不回收 → 全部 nuke 操作无限期阻塞。
+// bootToken 是锁文件内容的一部分，只能防"内容伪造"，无法对抗操作系统
+// 层面的 PID 复用；启动时间是内核事实，不随锁文件内容变化。
+// 三平台策略：
+//   Linux   /proc/<pid>/stat 第 22 字段（自启动的时钟滴答）+ /proc/stat btime
+//   Windows libuv 无启动时间 API → cmd→powershell 查询（数百 ms，仅陈旧
+//           回收冷路径调用 + 短 TTL 记忆化，绝不进入获取热路径）
+//   macOS   无 /proc 且无免 native 方案 → null（退回保守纯存活判定）
+const WIN_PLATFORM = process.platform === 'win32'
+const CLK_TCK_FALLBACK = 100
+const FINGERPRINT_TTL_MS = 5_000
+/** 跨读取方式的时钟抖动容忍（btime 秒精度 × clk 粒度 + FILETIME 换算余量） */
+const START_TIME_TOLERANCE_MS = 2_000
+
+let cachedClkTck: number | null = null
+let cachedBtimeMs: number | null = null
+const startFingerprintCache = new Map<number, { at: number; value: number | null }>()
+
+function linuxStartTimeOf(pid: number): number | null {
+  try {
+    if (cachedClkTck === null) {
+      const r = spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf-8', timeout: 2_000 })
+      const n = Number(r.stdout.trim())
+      cachedClkTck = Number.isInteger(n) && n > 0 ? n : CLK_TCK_FALLBACK
+    }
+    if (cachedBtimeMs === null) {
+      const m = /(?:^|\n)btime:\s*(\d+)/.exec(fs.readFileSync('/proc/stat', 'utf-8'))
+      if (!m) return null
+      cachedBtimeMs = Number(m[1]) * 1000
+    }
+    // comm 字段可含空格与括号：从最后一个 ')' 之后切分，避免字段错位
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8')
+    const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/)
+    // 切分后 index 0 = 第 3 字段（state）→ 第 22 字段在 index 19
+    const ticks = Number(fields[19])
+    if (!Number.isFinite(ticks) || ticks < 0) return null
+    return Math.round(cachedBtimeMs + (ticks * 1000) / cachedClkTck)
+  } catch { return null }
 }
 
-/** 携带自动续期扩展的获取请求 */
-export type LockRenewRequest = LockRequest & LockAutoRenewOptions
+function winStartTimeOf(pid: number): number | null {
+  try {
+    const r = spawnSync(
+      process.env.comspec ?? 'cmd.exe',
+      ['/d', '/c', 'powershell', '-NoProfile', '-Command',
+        `(Get-Process -Id ${pid}).StartTime.ToFileTimeUtc()`],
+      { encoding: 'utf-8', timeout: 5_000 },
+    )
+    const ft = Number(r.stdout.trim())
+    if (!Number.isFinite(ft) || ft <= 0) return null
+    // FILETIME（1601 起 100ns 单位）→ Unix epoch 毫秒
+    return Math.round(ft / 10_000 - 11_644_473_600_000)
+  } catch { return null }
+}
 
-/** createLockManager 的运行时能力集：ILockManager 契约的超集（只增不改）。
- *  任何 LockRequest 都是合法的 LockRenewRequest（扩展字段全可选），
- *  既有按 ILockManager 编写的调用方零改动。 */
-export interface LockManagerRuntime extends ILockManager {
-  acquire(request: LockRenewRequest): Promise<Result<LockHandle>>
-  tryAcquire(request: LockRenewRequest): Promise<LockHandle | null>
-  withLock<T>(
-    request: LockRenewRequest,
-    fn: (handle: LockHandle) => Promise<Result<T>>,
-  ): Promise<Result<T>>
+/** 平台默认指纹（带短 TTL 记忆化含负缓存：防重试循环反复 spawn） */
+function defaultStartTimeOf(pid: number): number | null {
+  const t = Date.now()
+  const hit = startFingerprintCache.get(pid)
+  if (hit && t - hit.at < FINGERPRINT_TTL_MS) return hit.value
+  const value = process.platform === 'linux'
+    ? linuxStartTimeOf(pid)
+    : WIN_PLATFORM ? winStartTimeOf(pid) : null
+  startFingerprintCache.set(pid, { at: t, value })
+  return value
+}
+
+/** 缺省存活探测（可注入替换）。V5.7 修复：EPERM(POSIX) 与 EACCES(Windows
+ *  libuv) 都表示「进程存在但无权限」—— 旧实现只认 EPERM，Windows 上活
+ *  持有者（提权/跨会话/系统进程）被误判为已死 → 陈旧回收活锁 →
+ *  两个清理者并发交叉写。保守方向统一：两种码均按存活处理。 */
+export function defaultProcessProbe(): ProcessProbe {
+  return {
+    isAlive(pid, hostname) {
+      if (hostname !== os.hostname()) return false
+      try { process.kill(pid, 0); return true } catch (e) {
+        const code = (e as NodeJS.ErrnoException).code
+        return code === 'EPERM' || code === 'EACCES'
+      }
+    },
+    startTimeOf: defaultStartTimeOf,
+  }
 }
 
 // ─── 等待重试：指数退避 + 等值抖动（equal jitter） ─────────────
@@ -89,19 +160,31 @@ function sameOwner(a: LockOwner, b: LockOwner): boolean {
 export function createLockManager(options: LockManagerOptions): LockManagerRuntime {
   const lockDir = path.join(options.lockRoot, LOCK_DIR_NAME)
   const now = options.now ?? (() => Date.now())
-  const probe: ProcessProbe = options.probe ?? {
-    isAlive(pid, hostname) {
-      if (hostname !== os.hostname()) return false
-      // POSIX 语义：kill(pid,0) 抛 ESRCH = 进程不存在；抛 EPERM = 进程
-      // 存在但无权限。EPERM 误判为死会让 reapStale 回收活持有者的锁，
-      // 导致两个清理者并发 —— 必须按存活处理（保守方向）。
-      try { process.kill(pid, 0); return true } catch (e) {
-        return (e as NodeJS.ErrnoException).code === 'EPERM'
-      }
-    },
-  }
+  const probe: ProcessProbe = options.probe ?? defaultProcessProbe()
 
   fs.mkdirSync(lockDir, { recursive: true })
+
+  /** V5.7 PID 复用甄别：锁记录的启动时间与当前该 PID 的真实启动时间
+   *  不一致 → 原持有者必死（PID 已被无关新进程复用）。
+   *  null = 无记录指纹或本平台不可用（无法甄别，保守）。 */
+  function pidReuseOf(owner: LockOwner): boolean | null {
+    if (owner.startTime === undefined || !probe.startTimeOf) return null
+    const cur = probe.startTimeOf(owner.pid)
+    if (cur === null) return null
+    return Math.abs(cur - owner.startTime) > START_TIME_TOLERANCE_MS
+  }
+
+  /** 持有者存活判定（存活探测 + 复用甄别的合成结论）：陈旧回收、破锁、
+   *  超时报错、诊断全部走这一个口径，杜绝"回收判活、报错判死"的分裂。 */
+  function holderAlive(owner: LockOwner): boolean {
+    if (!probe.isAlive(owner.pid, owner.hostname)) return false
+    return pidReuseOf(owner) !== true
+  }
+
+  /** guard 强拆核验：pid 维度的存活查询（guard owner 文件只记 pid，
+   *  hostname 取本机 —— guard 是本地文件系统互斥量） */
+  const guardHolderAlive = (pid: number): boolean =>
+    holderAlive({ pid, hostname: os.hostname(), bootToken: '', purpose: 'guard' })
 
   function lockPath(scope: LockScope): string {
     return path.join(lockDir, `${scopeKey(scope).replace(/[/@]/g, '_')}.lock`)
@@ -119,11 +202,18 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       // Array.isArray 会把 readonly 数组收窄成 any[]，此处显式按 unknown 逐字段校验（磁盘数据不可信）
       for (const o of c.owners as readonly unknown[]) {
         if (typeof o !== 'object' || o === null) return null
-        const slot = o as { owner?: { pid?: unknown; bootToken?: unknown }; expiresAt?: unknown }
+        const slot = o as {
+          owner?: { pid?: unknown; bootToken?: unknown; startTime?: unknown }
+          expiresAt?: unknown
+        }
         const pid = slot.owner?.pid
         // pid 必须正整数：非正值传入 kill(pid,0) 会演化为进程组/全体信号探测
         if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 0) return null
         if (typeof slot.owner?.bootToken !== 'string') return null
+        // V5.7 启动时间指纹（可选字段）：类型不符视为结构非法（磁盘数据不可信）
+        //（上一行已隐式证明 owner 非空）
+        const startAt = slot.owner.startTime
+        if (startAt !== undefined && typeof startAt !== 'number') return null
         if (typeof slot.expiresAt !== 'number') return null
       }
       return parsed as LockFileContent
@@ -150,7 +240,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
    *  非陈旧（结构异常保守处理）。 */
   function allSlotsStale(cur: LockFileContent, t: number): boolean {
     return cur.owners.length > 0 && cur.owners.every(o =>
-      o.expiresAt <= t && !probe.isAlive(o.owner.pid, o.owner.hostname))
+      o.expiresAt <= t && !holderAlive(o.owner))
   }
 
   /** V5.6.2 陈旧锁自动回收（获取路径内嵌，唯一被生产触发的破锁路径）：
@@ -175,14 +265,20 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       if (!allSlotsStale(cur, now())) return false
       try { fs.unlinkSync(p) } catch { /* 并发已回收 */ }
       return !fs.existsSync(p)
-    })
+    }, guardHolderAlive)
     return done === true
   }
 
   /** 单次获取尝试（不含等待循环） */
-  async function tryOnce(request: LockRenewRequest): Promise<LockHandle | null> {
+  async function tryOnce(request: LockRequest): Promise<LockHandle | null> {
     const p = lockPath(request.scope)
-    const me = { owner: request.owner, acquiredAt: new Date(now()).toISOString(), expiresAt: now() + request.ttlMs }
+    // V5.7 启动时间指纹补全：本进程的启动时刻写入锁文件，供后续陈旧回收
+    // 时甄别 PID 复用。平台不可用（null）→ 不写入，退回保守存活判定。
+    const myStart = probe.startTimeOf?.(process.pid) ?? null
+    const owner: LockOwner = myStart !== null
+      ? { ...request.owner, startTime: myStart }
+      : request.owner
+    const me = { owner, acquiredAt: new Date(now()).toISOString(), expiresAt: now() + request.ttlMs }
 
     if (request.mode === 'shared') {
       // shared：在 guard 互斥下完成"读-改-写"。关键点：重读后若发现
@@ -204,7 +300,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
         fs.writeFileSync(tmp, JSON.stringify(content, null, 2))
         fs.renameSync(tmp, p)
         return true
-      })
+      }, guardHolderAlive)
       if (acquired !== true) return null
     } else {
       // exclusive：O_EXCL 创建，已存在（任何模式）即失败
@@ -241,15 +337,17 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
         fs.writeFileSync(tmp, JSON.stringify(content, null, 2))
         fs.renameSync(tmp, p)
         return true
-      })
+      }, guardHolderAlive)
       if (done === null) return err({ code: 'E_LOCK_STATE', message: '刷新锁失败：互斥 guard 在等待窗口内不可用' })
       if (!done) return err({ code: 'E_LOCK_STALE', message: '锁文件已消失或本持有者已不在锁中（可能被安全破锁）' })
       return ok(undefined)
     }
 
     const doRelease = async (): Promise<Result<void>> => {
-      if (released) return ok(undefined) // 幂等
-      released = true
+      if (released) return ok(undefined) // 幂等：此前一次成功释放后
+      // 先停心跳再释放：避免释放后残留一轮续期与 unlink 竞争
+      //（移入 doRelease：失败重试路径同样不允许心跳复活已删的锁）
+      stopAutoRenew()
       try {
         // exclusive：unlink 原子，无需互斥；shared：读-改-写必须进 guard，
         // 否则两个并发 release 的 rename 互相覆盖，丢失对方的移除结果。
@@ -259,23 +357,30 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
             if (!cur) return true
             const rest = cur.owners.filter(o => !sameOwner(o.owner, request.owner))
             if (rest.length === 0) {
-              try { fs.unlinkSync(p) } catch {}
+              // V5.7：unlink 失败（Windows AV/索引器短暂占用 → EPERM/EBUSY）
+              // 不再吞错——静默成功会把"锁文件残留+进程存活"伪装成已释放，
+              // 该锁到进程退出前都不可回收（allSlotsStale 要求进程死亡）。
+              fs.unlinkSync(p)
             } else {
               const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
               fs.writeFileSync(tmp, JSON.stringify({ ...cur, owners: rest }, null, 2))
               fs.renameSync(tmp, p)
             }
             return true
-          })
+          }, guardHolderAlive)
           if (done !== true) {
-            return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用' })
+            // released 未置位：guard 恢复后可重试 release
+            return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用（可重试 release）' })
           }
         } else {
-          try { fs.unlinkSync(p) } catch {}
+          fs.unlinkSync(p)
         }
+        released = true
         return ok(undefined)
       } catch (e) {
-        return err(ioError('释放锁失败', e))
+        // released 未置位：锁文件可能仍存在，调用方可重试 release 或交给
+        // 陈旧回收（进程退出 + TTL 过期后自动兜底）
+        return err(ioError('释放锁失败（锁文件可能被暂时占用，可重试 release）', e))
       }
     }
 
@@ -314,7 +419,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     }
   }
 
-  async function acquire(request: LockRenewRequest): Promise<Result<LockHandle>> {
+  async function acquire(request: LockRequest): Promise<Result<LockHandle>> {
     const deadline = now() + request.waitTimeoutMs
     let attempt = 0
     for (;;) {
@@ -327,15 +432,17 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
         const cur = readLock(lockPath(request.scope))
         const t = now()
         const holders = cur?.owners.map(o => {
-          const dead = !probe.isAlive(o.owner.pid, o.owner.hostname)
+          const reuse = pidReuseOf(o.owner)
+          const dead = reuse === true || !probe.isAlive(o.owner.pid, o.owner.hostname)
           const expired = o.expiresAt <= t
+          // 四象限单口径（与 inspect()/allSlotsStale 同判据）：
+          //  活跃 / 已过期仍存活（SIGSTOP/长 GC，绝不可回收）/ 已死未到期
+          //  （给出自动回收倒计时）/ 陈旧残留（reap 不可达时的兜底报告）
           if (!dead && !expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 活跃)`
-          if (dead && expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 陈旧残留)`
-          if (dead) {
-            const remainSec = Math.max(0, Math.round((o.expiresAt - t) / 1000))
-            return `${o.owner.purpose}(pid ${o.owner.pid}, 进程已死, TTL 剩余 ${remainSec}s 后自动回收)`
-          }
-          return `${o.owner.purpose}(pid ${o.owner.pid}, 已过期但进程仍存活)`
+          if (!dead) return `${o.owner.purpose}(pid ${o.owner.pid}, 已过期但进程仍存活)`
+          if (expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 陈旧残留)`
+          const remainSec = Math.max(0, Math.round((o.expiresAt - t) / 1000))
+          return `${o.owner.purpose}(pid ${o.owner.pid}, 进程已死, TTL 剩余 ${remainSec}s 后自动回收)`
         }).join(', ') ?? 'unknown'
         return err({
           code: 'E_LOCK_HELD',
@@ -354,7 +461,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     acquire,
     async tryAcquire(request) { return await tryOnce(request) },
 
-    async withLock<T>(request: LockRenewRequest, fn: (handle: LockHandle) => Promise<Result<T>>): Promise<Result<T>> {
+    async withLock<T>(request: LockRequest, fn: (handle: LockHandle) => Promise<Result<T>>): Promise<Result<T>> {
       const got = await acquire(request)
       if (!got.ok) return got
       try {
@@ -388,7 +495,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
           const staleSlots = cur.owners.filter(o =>
             sameOwner(o.owner, proof.owner)
             && o.expiresAt <= now()
-            && !probe.isAlive(o.owner.pid, o.owner.hostname))
+            && !holderAlive(o.owner))
           if (staleSlots.length === 0) return
           const rest = cur.owners.filter(o => !staleSlots.includes(o))
           if (rest.length === 0) {
@@ -399,7 +506,7 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
             fs.renameSync(tmp, fp)
           }
           broken++
-        })
+        }, guardHolderAlive)
         if (done === null) continue // 该锁的 guard 不可用：跳过，留待下次巡检
       }
       if (broken === 0) {
@@ -412,6 +519,41 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       const cur = readLock(lockPath(scope))
       if (!cur) return []
       return cur.owners.filter(o => o.expiresAt > now()).map(o => o.owner)
+    },
+
+    /** V5.7 锁诊断：全部锁文件的零副作用快照。存活判定与陈旧回收同一
+     *  口径（holderAlive），杜绝"诊断说活、回收说死"的分裂报告。 */
+    inspect(): readonly LockFileStatus[] {
+      const out: LockFileStatus[] = []
+      let names: readonly string[]
+      try { names = fs.readdirSync(lockDir) } catch { return out }
+      const t = now()
+      for (const f of names) {
+        if (!f.endsWith('.lock')) continue
+        const cur = readLock(path.join(lockDir, f))
+        if (!cur) continue
+        // 全体 owner 进程已死 → TTL 全部过期后自动回收（allSlotsStale 同判据）
+        const allDead = cur.owners.length > 0
+          && cur.owners.every(o => !holderAlive(o.owner))
+        const lastExpire = Math.max(...cur.owners.map(o => o.expiresAt))
+        const slots: readonly LockSlotStatus[] = cur.owners.map(o => {
+          const reuse = pidReuseOf(o.owner)
+          const alive = reuse !== true && probe.isAlive(o.owner.pid, o.owner.hostname)
+          return {
+            pid: o.owner.pid,
+            hostname: o.owner.hostname,
+            purpose: o.owner.purpose,
+            acquiredAt: o.acquiredAt,
+            expiresAt: o.expiresAt,
+            alive,
+            expired: o.expiresAt <= t,
+            pidReused: reuse,
+            autoReapInSec: allDead ? Math.max(0, Math.round((lastExpire - t) / 1000)) : null,
+          }
+        })
+        out.push({ file: f, scope: cur.scope, mode: cur.mode, slots })
+      }
+      return out
     },
   }
 }
@@ -431,8 +573,15 @@ const GUARD_SUPERSEDE_MS = 10_000
 const GUARD_RETRY_MS = 20
 const GUARD_MAX_WAIT_MS = 15_000
 
-/** 在 p 的 guard 保护下执行 fn（同步体）。返回 null = guard 在等待窗口内不可用。 */
-async function withGuard<T>(p: string, now: () => number, fn: () => T): Promise<T | null> {
+/** 在 p 的 guard 保护下执行 fn（同步体）。返回 null = guard 在等待窗口内不可用。
+ *  V5.7 第四参 isHolderAlive：guard 持有进程的存活查询（owner 文件记录
+ *  pid），年龄强拆前核验 —— 持有者活着只是慢（SMB/NFS/AV 钩住）不允许拆。 */
+async function withGuard<T>(
+  p: string,
+  now: () => number,
+  fn: () => T,
+  isHolderAlive?: (pid: number) => boolean,
+): Promise<T | null> {
   const guard = p + GUARD_SUFFIX
   const token = crypto.randomBytes(8).toString('hex')
   const start = now()
@@ -445,8 +594,21 @@ async function withGuard<T>(p: string, now: () => number, fn: () => T): Promise<
       try {
         const st = fs.statSync(guard)
         if (now() - st.mtimeMs > GUARD_SUPERSEDE_MS) {
-          fs.rmSync(guard, { recursive: true, force: true })
-          continue
+          // V5.7：强拆前核验持有进程。旧实现纯按年龄拆：guard 临界区是同步
+          // fs 调用，被慢速存储/杀软钩住超 10s 完全可能 —— 慢而未死的持有者
+          // 被强拆后并发进入，两个进程的读-改-写 rename 互相覆盖、owner 条目
+          // 丢失，互斥语义被破坏。持有者已死（或无法判定身份）才允许拆。
+          let gp = -1
+          try {
+            const raw = fs.readFileSync(path.join(guard, 'owner'), 'utf-8')
+            const n = Number(raw.split('\n')[1] ?? '')
+            if (Number.isInteger(n) && n > 0) gp = n
+          } catch { /* owner 不可读：无法证明持有者存活，维持旧强拆语义 */ }
+          if (gp <= 0 || !isHolderAlive?.(gp)) {
+            fs.rmSync(guard, { recursive: true, force: true })
+            continue
+          }
+          // 持有者活着只是慢：不拆，继续等待（受 GUARD_MAX_WAIT_MS 上界约束）
         }
       } catch { /* guard 恰被释放，直接重试 mkdir */ }
       if (now() - start > GUARD_MAX_WAIT_MS) return null
@@ -454,12 +616,13 @@ async function withGuard<T>(p: string, now: () => number, fn: () => T): Promise<
       continue
     }
     try {
-      fs.writeFileSync(path.join(guard, 'owner'), token, 'utf-8')
+      // owner 文件第二行记录 pid：供强拆核验（第一行仍是归属 token）
+      fs.writeFileSync(path.join(guard, 'owner'), `${token}\n${process.pid}`, 'utf-8')
       return fn()
     } finally {
       try {
         // 归属核验：guard 可能已被强拆并被他人重建，只删自己的
-        if (fs.readFileSync(path.join(guard, 'owner'), 'utf-8') === token) {
+        if (fs.readFileSync(path.join(guard, 'owner'), 'utf-8') === `${token}\n${process.pid}`) {
           fs.rmSync(guard, { recursive: true, force: true })
         }
       } catch { /* guard 已消失/被接管 */ }

@@ -296,4 +296,26 @@ describe('事务引擎', () => {
     const status = await engine2.status(okv(session).txId)
     expect(status?.state).toBe('rolled-back')
   })
+
+  it('V5.7 list()：本进程活跃事务与崩溃残留（WAL 未终结）合并清单', async () => {
+    seedWorkspace()
+    // 引擎 A：begin 后保持活跃（本进程 runtime 持锁中）
+    const engineA = buildEngine(() => [opRemoveStorage()])
+    const sessionA = await engineA.begin(request())
+    const entriesA = await engineA.list()
+    expect(entriesA).toHaveLength(1)
+    expect(entriesA[0]!.origin).toBe('active')
+    expect(entriesA[0]!.state).toBe('draft')   // begin 后未 plan
+
+    // 引擎 B（模拟重启的新实例，同一 WAL 目录）：A 的事务在其视角是崩溃残留
+    const engineB = buildEngine(() => [opRemoveStorage()])
+    const entriesB = await engineB.list()
+    expect(entriesB.some(e => e.txId === okv(sessionA).txId && e.origin === 'unfinished')).toBe(true)
+
+    // A 正常 commit 终结后：新实例清单不再包含该事务
+    const plan = await engineA.plan(okv(sessionA))
+    await engineA.commit(okv(plan))
+    const entriesC = await engineB.list()
+    expect(entriesC.some(e => e.txId === okv(sessionA).txId)).toBe(false)
+  })
 })

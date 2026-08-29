@@ -44,7 +44,7 @@ const plugin = (s: string) => s as PluginName
 const profile = (s: string) => s as ProfileName
 const absPath = (s: string) => s as AbsolutePath
 
-/** 本插件 23 个工具均不消费 exec（无取消/嵌套分发），空对象即可满足契约 */
+/** 本插件 24 个工具均不消费 exec（无取消/嵌套分发），空对象即可满足契约 */
 const EXEC = {} as ToolRunContext
 
 /** skipLibCheck 下 ToolDefinition 的基类（来自未安装的 dsh-llm）成员
@@ -219,6 +219,11 @@ function makeRt(overrides: Record<string, unknown> = {}): Runtime {
       })),
       recover: vi.fn(async () => ok([])),
       status: vi.fn(async () => null),
+      list: vi.fn(async () => []),
+    },
+    lockManager: {
+      inspect: vi.fn((): readonly unknown[] => []),
+      holders: vi.fn(() => []),
     },
     restorePoints: {
       create: vi.fn(async () => ok(makeRestorePoint())),
@@ -286,12 +291,12 @@ function registerAll(rtOverrides: Record<string, unknown> = {}): ToolHarness {
 // ─── 1. 注册完整性 ──────────────────────────────────────────
 
 describe('注册完整性', () => {
-  it('23 个工具全部注册且名称唯一', () => {
+  it('24 个工具全部注册且名称唯一', () => {
     const { defs } = registerAll()
     const names = [...defs.keys()]
-    // 5 感知 + 10 决策 + 3 执行 + 6 恢复保障
-    expect(names).toHaveLength(23)
-    expect(new Set(names).size).toBe(23)
+    // 5 感知 + 10 决策 + 3 执行 + 7 恢复保障
+    expect(names).toHaveLength(24)
+    expect(new Set(names).size).toBe(24)
     for (const n of names) expect(n).toMatch(/^nuke_[a-z]+$/)
   })
 
@@ -1076,6 +1081,57 @@ describe('恢复保障域', () => {
     const found = await runTool(h2.defs.get('nuke_status')!, { tx_id: 'a1b2c3d4e5f60718' })
     expect(found).toContain('committed')
     expect(found).toContain('remove-node-modules')
+  })
+
+  it('nuke_status：无参清单模式 —— 活跃 + 崩溃残留合并视图，残留时提示 recover', async () => {
+    const { defs } = setup()
+    const empty = await runTool(defs.get('nuke_status')!, {})
+    expect(empty).toContain('没有活跃事务')
+
+    const h2 = makeCtx()
+    const rt2 = makeRt({ engine: {
+      ...makeRt().engine as object,
+      list: vi.fn(async () => ([
+        { txId: 'a1b2c3d4e5f60718', state: 'executing', startedAt: 't0', origin: 'active', steps: 2 },
+        { txId: 'deadbeefdeadbeef', state: 'failed', startedAt: 't1', origin: 'unfinished', steps: 1 },
+      ])),
+    } })
+    registerRecoveryTools(h2.ctx, rt2)
+    const out = await runTool(h2.defs.get('nuke_status')!, {})
+    expect(out).toContain('事务清单（2 个）')
+    expect(out).toContain('本进程活跃')
+    expect(out).toContain('崩溃残留')
+    expect(out).toContain('nuke_recover')
+  })
+
+  it('nuke_locks：空现场 / 陈旧残留 / 全部存活三种形态（零副作用诊断）', async () => {
+    const { defs } = setup()
+    expect(await runTool(defs.get('nuke_locks')!, {})).toContain('没有任何锁文件')
+
+    const mkSlots = (over: Partial<Record<string, unknown>>) => ({
+      pid: 25288, hostname: 'h', purpose: 'clean', acquiredAt: 't0',
+      expiresAt: Date.now() + 60_000, alive: true, expired: false,
+      pidReused: null, autoReapInSec: null, ...over,
+    })
+    const stale = makeRt({ lockManager: { inspect: vi.fn(() => ([{
+      file: 'global.lock', scope: 'global', mode: 'exclusive' as const,
+      slots: [mkSlots({ alive: false, expired: true, autoReapInSec: 0 })],
+    }])) } })
+    const h2 = makeCtx()
+    registerRecoveryTools(h2.ctx, stale)
+    const out2 = await runTool(h2.defs.get('nuke_locks')!, {})
+    expect(out2).toContain('global.lock')
+    expect(out2).toContain('陈旧残留')
+    expect(out2).toContain('自动回收')
+
+    const alive = makeRt({ lockManager: { inspect: vi.fn(() => ([{
+      file: 'global.lock', scope: 'global', mode: 'exclusive' as const,
+      slots: [mkSlots({ pidReused: true, alive: false })],
+    }])) } })
+    const h3 = makeCtx()
+    registerRecoveryTools(h3.ctx, alive)
+    const out3 = await runTool(h3.defs.get('nuke_locks')!, {})
+    expect(out3).toContain('PID 已被无关进程复用')
   })
 
   it('nuke_recover：无需恢复 / 已恢复两种形态', async () => {

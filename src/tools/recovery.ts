@@ -1,5 +1,5 @@
 // src/tools/recovery.ts — 恢复与保障域工具（坏了怎么救、日常怎么守）
-// nuke_status / nuke_recover / nuke_verify / nuke_doctor / nuke_drill / nuke_ledger
+// nuke_status / nuke_locks / nuke_recover / nuke_verify / nuke_doctor / nuke_drill / nuke_ledger
 import type { Context } from '@deepseek-ai/cordis'
 
 import { fmtBytes } from '../contracts/base'
@@ -14,11 +14,30 @@ export function registerRecoveryTools(ctx: Context, rt: Runtime): void {
   // ── nuke_status ──────────────────────────────────────────
   ctx.tools.register(defineTextTool({
     name: 'nuke_status',
-    description: '查询事务状态（活跃/已终结，含步骤明细与回收统计）',
+    description: '查询事务状态：带 tx_id 返回单事务步骤明细；省略 tx_id 列出全部活跃事务与崩溃残留的未终结事务（谁在跑/撞坏了什么，一眼可见）',
     parameters: {
-      tx_id: { type: 'string', required: true, description: '16 位十六进制事务 ID' },
+      tx_id: { type: 'string', description: '16 位十六进制事务 ID（省略 = 清单模式）' },
     },
     execute: async ({ tx_id }) => {
+      // 清单模式（V5.7）：E_LOCK_HELD 排障第一现场 —— 活跃 + 崩溃残留合并视图
+      if (tx_id === undefined) {
+        const entries = await rt.engine.list()
+        if (entries.length === 0) {
+          return { content: '✅ 没有活跃事务，也没有崩溃残留的未终结事务。' }
+        }
+        const lines = [`📋 事务清单（${entries.length} 个）`]
+        for (const e of entries) {
+          const origin = e.origin === 'active'
+            ? '▶ 本进程活跃'
+            : '💀 崩溃残留（WAL 无终结符）'
+          lines.push(`  ${e.txId}  ${e.state}  ${e.steps} 步  ${origin}`)
+          lines.push(`     开始于 ${e.startedAt || '未知（审计缺 tx-begin）'}`)
+        }
+        if (entries.some(e => e.origin === 'unfinished')) {
+          lines.push('', '💡 存在崩溃残留：运行 nuke_recover 反向补偿恢复到执行前状态。')
+        }
+        return { content: lines.join('\n') }
+      }
       // tx_id 直接拼入 WAL 文件路径：白名单校验堵死 "../" 式路径穿越
       //（格式约束超出 DSL 表达力，属领域校验）
       if (!/^[0-9a-f]{16}$/.test(tx_id)) {
@@ -32,6 +51,44 @@ export function registerRecoveryTools(ctx: Context, rt: Runtime): void {
         `  回收总计: ${fmtBytes(s.bytesFreedTotal)}  步骤: ${s.steps.length}`,
         ...s.steps.map(x => `    [${x.index}] ${x.action} → ${x.status} (${fmtBytes(x.bytesFreed)})`),
       ]
+      return { content: lines.join('\n') }
+    },
+  }))
+
+  // ── nuke_locks（V5.7 锁诊断：零副作用） ──────────────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_locks',
+    description: '锁诊断：列出全部锁文件的持有者现场 —— 进程存活/TTL 状态/PID 复用甄别/自动回收倒计时。E_LOCK_HELD 排障第一工具，零副作用（绝不破锁，只看不动）',
+    parameters: {},
+    execute: async () => {
+      const files = rt.lockManager.inspect()
+      if (files.length === 0) {
+        return { content: '✅ 当前没有任何锁文件 —— 无持有者，无陈旧残留。' }
+      }
+      const lines = [`🔒 锁现场（${files.length} 个锁文件）`]
+      for (const f of files) {
+        lines.push('', `─ ${f.file}  scope=${f.scope}  mode=${f.mode} ─`)
+        for (const s of f.slots) {
+          // 状态合成：与陈旧回收完全同一口径（holderAlive），杜绝口径分裂
+          const state = s.pidReused === true
+            ? 'PID 已被无关进程复用（原持有者确死，可回收）'
+            : !s.alive
+              ? s.expired ? '陈旧残留（已过期且进程已死）' : `进程已死，TTL 剩余 ${Math.max(0, Math.round((s.expiresAt - Date.now()) / 1000))}s`
+              : s.expired ? '已过期但进程仍存活' : '活跃持有'
+          lines.push(`  pid ${s.pid}  ${s.purpose}  ${state}`)
+          lines.push(`     获取于 ${s.acquiredAt}${s.autoReapInSec !== null ? `  自动回收 ${s.autoReapInSec}s 后` : ''}`)
+        }
+      }
+      const anyStale = files.some(f => f.slots.some(s => (!s.alive && s.expired) || s.pidReused === true))
+      const anyDead = files.some(f => f.slots.some(s => !s.alive && !s.expired))
+      lines.push('')
+      if (anyStale) {
+        lines.push('💡 存在陈旧残留：任意 nuke 操作的锁获取路径会自动回收（无需人工干预）。')
+      } else if (anyDead) {
+        lines.push('💡 存在已死持有者：TTL 到期后由下次获取自动回收。')
+      } else {
+        lines.push('✅ 全部持有者均存活 —— 锁被正常占用，请等待其释放。')
+      }
       return { content: lines.join('\n') }
     },
   }))

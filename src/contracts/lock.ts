@@ -21,6 +21,12 @@ export interface LockOwner {
   /** 随机 token：区分同 PID 复活的进程，防止陈旧 PID 误判 */
   readonly bootToken: string
   readonly purpose: string   // 'clean' | 'scan' | 'dry-run' | 'health'
+  /** V5.7 进程启动时间指纹（epoch ms，由 lock-manager 获取时自动补全）：
+   *  PID 复用甄别的物理依据 —— pid 存活但启动时间与记录不符 = 原持有者
+   *  已死、PID 被无关新进程复用，陈旧锁可安全回收。bootToken 只能区分
+   *  本插件自己写入的锁内容，无法对抗"PID 被复用后存活探测恒真"；
+   *  启动时间是操作系统事实，不随锁文件内容伪造。 */
+  readonly startTime?: number
 }
 
 export interface LockRequest {
@@ -31,6 +37,10 @@ export interface LockRequest {
   readonly waitTimeoutMs: number
   /** 锁 TTL：持有者崩溃后锁自动失效的窗口（需配合 refresh 心跳） */
   readonly ttlMs: number
+  /** V5.7 后台心跳周期（ms）：> 0 时句柄持有期间自动 refresh 防 TTL 到期。
+   *  原为 lock-manager 私有扩展，并入契约后引擎/调用方无需感知扩展类型。
+   *  建议取 ttlMs 的 1/3；定时器 unref 不阻止进程退出。 */
+  readonly autoRenewMs?: number
 }
 
 export interface LockHandle {
@@ -46,6 +56,10 @@ export interface LockHandle {
 /** 持有者存活探测 —— 破锁流程的依赖注入点，单测时可 mock */
 export interface ProcessProbe {
   isAlive(pid: number, hostname: string): boolean
+  /** V5.7 进程启动时间指纹（epoch ms）：null = 本平台不可用（退回纯
+   *  存活判定，保守）。仅被陈旧锁回收路径调用（锁已 TTL 过期后），
+   *  不在获取热路径上。 */
+  startTimeOf?(pid: number): number | null
 }
 
 export interface StaleProof {
@@ -53,6 +67,32 @@ export interface StaleProof {
   readonly owner: LockOwner
   readonly verifiedDead: boolean   // ProcessProbe 证实进程已死
   readonly ttlExpired: boolean
+}
+
+/** V5.7 锁诊断（nuke_locks 零副作用工具的数据源）：单个持有者槽位的
+ *  现场快照 —— 存活判定 / TTL 状态 / 自动回收倒计时 / PID 复用甄别。 */
+export interface LockSlotStatus {
+  readonly pid: number
+  readonly hostname: string
+  readonly purpose: string
+  readonly acquiredAt: string
+  readonly expiresAt: number
+  /** 进程存活（含指纹核验：PID 复用视为已死） */
+  readonly alive: boolean
+  /** TTL 已过期 */
+  readonly expired: boolean
+  /** PID 被无关进程复用（原持有者确死）——null = 本平台无法甄别 */
+  readonly pidReused: boolean | null
+  /** 全体 owner 陈旧时的自动回收等待秒数；不可回收为 null */
+  readonly autoReapInSec: number | null
+}
+
+/** V5.7 单个锁文件的诊断视图 */
+export interface LockFileStatus {
+  readonly file: string
+  readonly scope: string
+  readonly mode: LockMode
+  readonly slots: readonly LockSlotStatus[]
 }
 
 export interface ILockManager {
@@ -69,4 +109,6 @@ export interface ILockManager {
   breakStale(proof: StaleProof): Promise<Result<void>>
   /** 当前某作用域下的全部持有者（调试/健康检查展示用） */
   holders(scope: LockScope): readonly LockOwner[]
+  /** V5.7 全部锁文件的零副作用诊断快照（nuke_locks 工具数据源） */
+  inspect(): readonly LockFileStatus[]
 }

@@ -79,6 +79,11 @@ export function buildRuntime() {
       clock: { now: () => new Date() },
       verifyConfirmationToken: (token, req) =>
         token === confirmationTokenOf(req.profile, req.plugins),
+      // V5.7 纵深防御：引擎自身的 profile/插件名白名单（工具层之外的第二道闸）。
+      // 不注入 = 引擎校验分支永久休眠，直连引擎的调用方仍可传恶意 profile
+      // 让"白名单根与目标同源逃逸"。装配层必须注入 —— fail-closed。
+      validateProfile: p => validator.validateProfileName(p).ok,
+      validatePlugin: n => validator.validatePluginName(n).ok,
       // V5.4 预测存证：commit 执行前把逐步预测写进 hash chain ——
       // 预测先于结局、事后不可篡改，先知从此可被问责（nuke_scorecard）
       predictor: () => createReliabilityModel({ audit }),
@@ -147,7 +152,7 @@ export function buildRuntime() {
 
   return {
     resolver, platform, nukeRoot, logger, validator,
-    engine, wal, audit, toolRegistry,
+    engine, wal, audit, toolRegistry, lockManager,
     scorer, analyzer, scanner, orphans, health,
     doctor, dedup, dedupExec, restorePoints, reporter,
     blastRadius, trend, policy,

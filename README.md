@@ -42,7 +42,7 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 5. **保护名单 + 限额 + 黑窗** — 作为引擎 pre-hook veto，超限即拒绝（纵深防御，不依赖单层检查）
 6. **回收区代替物理删除** — commit 后才允许 purge；restore 失败或存在孤儿产物时绝不 purge
 
-## 工具速查（23 个）
+## 工具速查（24 个）
 
 所有工具注册为 dsh Agent 工具，安装后直接让 Agent 调用即可。
 
@@ -81,7 +81,8 @@ dsh plugin add beijingwahw/dsh-nuke-plugin --profile web
 
 | 工具 | 说明 |
 |---|---|
-| `nuke_status` | 查询事务状态（活跃/已终结，含步骤明细与回收统计） |
+| `nuke_status` | 查询事务状态：带 tx_id 返回步骤明细与回收统计；省略 tx_id 列出活跃事务与崩溃残留的未终结事务 |
+| `nuke_locks` | 锁诊断（零副作用）：全部锁文件的持有者现场 —— 进程存活 / TTL 状态 / PID 复用甄别 / 自动回收倒计时；E_LOCK_HELD 排障第一工具 |
 | `nuke_recover` | 崩溃恢复：扫描未终结事务的 WAL，反向补偿恢复到执行前状态 |
 | `nuke_verify` | 审计链完整性校验（hash chain 任何篡改均可定位） |
 
@@ -116,7 +117,7 @@ nuke_clean --strategy aggressive \
 ### 崩溃后恢复
 
 ```
-1. nuke_status                  # 查看未终结事务
+1. nuke_status                  # 查看未终结事务（省略 tx_id = 清单模式）
 2. nuke_recover                 # WAL 重放 + 反向补偿
 3. nuke_verify                  # 校验审计链完整性
 ```

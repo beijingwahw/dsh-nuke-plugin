@@ -31,13 +31,16 @@ function runCli(args: string[], home = dshHome) {
 }
 
 /** 构造 V4 协议锁文件（与插件版 lock-manager 同格式） */
-function writeV4Lock(name: string, pid: number, expiresAt: number, purpose = 'test') {
+function writeV4Lock(name: string, pid: number, expiresAt: number, purpose = 'test', startTime?: number) {
   const lockDir = path.join(dshHome, '.nuke', 'locks')
   fs.mkdirSync(lockDir, { recursive: true })
   fs.writeFileSync(path.join(lockDir, name), JSON.stringify({
     version: 1, scope: 'global', mode: 'exclusive',
     owners: [{
-      owner: { pid, hostname: os.hostname(), bootToken: `test-${name}`, purpose },
+      owner: {
+        pid, hostname: os.hostname(), bootToken: `test-${name}`, purpose,
+        ...(startTime !== undefined ? { startTime } : {}),
+      },
       acquiredAt: new Date().toISOString(), expiresAt,
     }],
   }, null, 2))

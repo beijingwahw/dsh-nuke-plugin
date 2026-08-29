@@ -4,6 +4,8 @@
 // 与插件版共享 V4 锁协议（.nuke/locks/）与备份、日志、快照目录 —— 并发清理真正互斥。
 // V4 升级：锁协议对齐插件版（O_EXCL + bootToken + 安全破锁）· --json 机器可读输出
 //          --version · 崩溃兜底 · symlink/深度防护遍历 · 瞬态 IO 重试 · 修复 strategies undefined 缺陷
+// V5.7 对齐：存活探测 EPERM+EACCES 双码（Windows libuv 误判修复）· PID 复用甄别
+//          （/proc 启动时间指纹，轻量零依赖版）· 锁占用报错四象限现场诊断
 
 const { spawnSync } = require('child_process');
 const crypto = require('crypto');
@@ -213,12 +215,46 @@ const LOCK_TTL_MS = 300000;
 const CLI_BOOT_TOKEN = `cli-${crypto.randomBytes(8).toString('hex')}`;
 
 /** 进程存活探测（与插件版 ProcessProbe 同语义：pid + hostname 双重核验）。
- *  POSIX 语义：kill(pid,0) 抛 ESRCH = 不存在；抛 EPERM = 存在但无权限。
- *  EPERM 误判为死会让 breakStaleV4Lock 回收活持有者的锁 → 并发清理，
- *  必须按存活处理（保守方向，与插件版 v5.6.2 修复对齐）。 */
+ *  POSIX 语义：kill(pid,0) 抛 ESRCH = 不存在；抛 EPERM（POSIX）/ EACCES
+ *  （Windows libuv）= 存在但无权限。两者误判为死会让 breakStaleV4Lock
+ *  回收活持有者的锁 → 并发清理，必须按存活处理（保守方向，与插件版
+ *  V5.7 修复对齐 —— 旧 CLI 只认 EPERM，Windows 提权/跨会话持有者被误杀）。 */
 function isProcessAlive(pid, hostname) {
   if (hostname && hostname !== os.hostname()) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e && e.code === 'EPERM'; }
+  try { process.kill(pid, 0); return true; } catch (e) { const k = e && e.code; return k === 'EPERM' || k === 'EACCES'; }
+}
+
+/** V5.7 PID 复用甄别（插件版 startTime 指纹的零依赖轻量实现）：
+ *  场景：持有者崩溃 → PID 被无关新进程复用 → kill(pid,0) 恒真 →
+ *  「已过期但存活」→ 破锁永不满足 → CLI 永久拒绝服务。
+ *  Linux 读 /proc/<pid>/stat 第 22 字段（自启动滴答）+ /proc/stat btime
+ *  → epoch ms；其他平台返回 null（无法甄别，退回保守存活判定）。
+ *  锁记录的 startTime 与当前不符（>2s 容差）→ 原持有者确死。 */
+let _btimeMs = null;
+const START_TOLERANCE_MS = 2000;
+function procStartTimeOf(pid) {
+  if (process.platform !== 'linux') return null;
+  try {
+    if (_btimeMs === null) {
+      const m = /(?:^|\n)btime:\s*(\d+)/.exec(fs.readFileSync('/proc/stat', 'utf-8'));
+      if (!m) return null;
+      _btimeMs = Number(m[1]) * 1000;
+    }
+    // comm 可含空格/括号：从最后一个 ')' 之后切分，第 22 字段落在 index 19
+    const raw = fs.readFileSync(`/proc/${pid}/stat`, 'utf-8');
+    const fields = raw.slice(raw.lastIndexOf(')') + 2).trim().split(/\s+/);
+    const ticks = Number(fields[19]);
+    if (!Number.isFinite(ticks) || ticks < 0) return null;
+    return Math.round(_btimeMs + (ticks * 1000) / 100); // CLK_TCK 缺省 100
+  } catch { return null; }
+}
+
+/** PID 复用判定：true = 原持有者确死；null = 无法甄别（保守） */
+function pidReused(owner) {
+  if (!owner || typeof owner.startTime !== 'number') return null;
+  const cur = procStartTimeOf(owner.pid);
+  if (cur === null) return null;
+  return Math.abs(cur - owner.startTime) > START_TOLERANCE_MS;
 }
 
 /** 读取 V4 锁文件（结构非法视为无锁） */
@@ -243,7 +279,10 @@ function hasActiveOwner(lock) {
   const now = Date.now();
   return lock.owners.some(o => {
     // pid 正整数校验（磁盘数据不可信）：非正值传入 kill(pid,0) 会演化为进程组/全体信号探测
+    // V5.7：PID 复用甄别并入口径 —— pid "存活"但启动时间指纹不符 = 原持有者
+    // 已死、PID 被无关新进程复用，不得再计为活跃（否则陈旧锁永久不可破）
     const alive = o.owner && Number.isInteger(o.owner.pid) && o.owner.pid > 0
+      && pidReused(o.owner) !== true
       && isProcessAlive(o.owner.pid, o.owner.hostname);
     return o.expiresAt > now || alive;
   });
@@ -291,13 +330,26 @@ function acquireLock(operation) {
     } catch { try { fs.unlinkSync(LEGACY_LOCK_FILE); } catch {} }
   }
 
-  // 2) V4 互斥：global.lock 已存在 → 尝试安全破锁，破不动即拒绝
+  // 2) V4 互斥：global.lock 已存在 → 尝试安全破锁，破不动即拒绝（附持有者现场诊断）
   if (fs.existsSync(LOCK_FILE)) {
     const holder = readV4Lock(LOCK_FILE);
     if (holder && !breakStaleV4Lock(LOCK_FILE)) {
       const o = holder.owners[0].owner;
-      console.error(c.red(`🔒 另一个 nuke 操作持有全局锁（PID: ${o.pid}，用途: ${o.purpose || 'unknown'}）`));
+      const slot = holder.owners[0];
+      const reused = pidReused(o);
+      const expired = slot.expiresAt <= Date.now();
+      const aliveRaw = Number.isInteger(o.pid) && o.pid > 0 && isProcessAlive(o.pid, o.hostname);
+      // 四象限诊断（与插件版 E_LOCK_HELD 报错同口径）：谁占着、还活着吗、何时可回收
+      const state = !expired && (aliveRaw && reused !== true)
+        ? '活跃清理中'
+        : expired && (!aliveRaw || reused === true)
+          ? '陈旧残留（破锁受阻，请重试）'
+          : !expired && (!aliveRaw || reused === true)
+            ? `持有者已死，TTL 剩余 ${Math.max(0, Math.round((slot.expiresAt - Date.now()) / 1000))}s 后可自动清除`
+            : '已过期但进程仍存活（SIGSTOP/长任务，不可回收）';
+      console.error(c.red(`🔒 另一个 nuke 操作持有全局锁（PID: ${o.pid}，用途: ${o.purpose || 'unknown'}，状态: ${state}）`));
       console.error(c.dim('   破锁纪律：仅当持有者进程死亡且 TTL 过期时自动清除；否则请等待其完成。'));
+      console.error(c.dim('   诊断：插件版可运行 nuke_locks 查看全部锁现场。'));
       process.exit(1);
     }
   }
@@ -313,6 +365,9 @@ function acquireLock(operation) {
   // 4) O_EXCL 原子创建（与插件版 writeLockAtomic 同构）
   try {
     const fd = fs.openSync(LOCK_FILE, 'wx');
+    // V5.7 启动时间指纹：Linux 写入本进程启动时刻，供后续 PID 复用甄别
+    //（其他平台不写 → 退回保守存活判定；与插件版锁文件格式互通）
+    const myStart = procStartTimeOf(process.pid);
     fs.writeSync(fd, JSON.stringify({
       version: 1,
       scope: 'global',
@@ -321,6 +376,7 @@ function acquireLock(operation) {
         owner: {
           pid: process.pid, hostname: os.hostname(),
           bootToken: CLI_BOOT_TOKEN, purpose: `cli:${operation}`,
+          ...(myStart !== null ? { startTime: myStart } : {}),
         },
         acquiredAt: new Date().toISOString(),
         expiresAt: Date.now() + LOCK_TTL_MS,

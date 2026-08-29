@@ -26,7 +26,7 @@ import type { IReliabilityModel } from '../contracts/reliability.contract'
 import type {
   BackupRecord, CleanOperation, CleanRequest, DryRunActionDetail, DryRunReport,
   IBackupStore, ITransactionEngine, IWal, OperationPlan, PlanWarning, TxContext,
-  TxPlan, TxSession, TxState, TxSummary,
+  TxListEntry, TxPlan, TxSession, TxState, TxSummary,
 } from '../contracts/transaction'
 import { forEachPool } from '../infra/fs-utils'
 
@@ -55,6 +55,11 @@ export interface EngineDeps {
    *  对账因此衡量"修正后的预测"，残差 → 0 则 δ → 0（迭代收敛）。
    *  学习失败 → 不校准（恒等），绝不阻断真实清理。 */
   readonly calibrator?: () => Promise<CalibrationShift | null>
+  /** V5.7 纵深防御：profile / 插件名白名单（validator 注入）。缺省不校验
+   *  （旧装配形态兼容）；runtime 装配层应始终注入 —— 直连引擎的调用方
+   *  不再能靠恶意 profile 让"白名单根与目标同源逃逸"。 */
+  readonly validateProfile?: (profile: string) => boolean
+  readonly validatePlugin?: (name: string) => boolean
 }
 
 /** V5：引擎行为选项（全部缺省安全，不传即沿用 V4 语义） */
@@ -90,13 +95,15 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
 
-/** 状态机合法迁移表 */
+/** 状态机合法迁移表（V5.7：draft/planned/validating 补 rolling-back 出边 ——
+ *  回滚本就应从任意未终态可达。旧表里"plan 后放弃"的正常用户流会补偿照跑
+ *  但内存态停在 planned，与 WAL 重建口径（rolled-back）互相矛盾） */
 const TRANSITIONS: Record<TxState, readonly TxState[]> = {
-  draft: ['planned'],
-  planned: ['validating', 'draft'],
-  validating: ['executing', 'planned'],
+  draft: ['planned', 'rolling-back'],
+  planned: ['validating', 'draft', 'rolling-back'],
+  validating: ['executing', 'planned', 'rolling-back'],
   executing: ['committing', 'rolling-back'],
-  committing: ['committed'],
+  committing: ['committed', 'rolling-back'],
   'rolling-back': ['rolled-back', 'failed'],
   committed: [], 'rolled-back': [], failed: [],
 }
@@ -200,8 +207,11 @@ export function createTransactionEngine(
       }
     }
     // undo 钩子（非备份类清理，如 pnpm prune 无需恢复但可通知）
+    // V5.7：undo 按执行逆序（LIFO）—— 与 manifest 恢复同一纪律。旧实现
+    // 正序遍历：后执行者的 undo 依赖的"后置状态"会被先执行的 undo 提前
+    // 破坏，补偿后状态与崩溃前不一致。
     const executedOps = new Map(rt.steps.filter(s => s.status === 'done').map(s => [s.operationId, s.backup]))
-    for (const op of operationFactory(rt.request)) {
+    for (const op of [...operationFactory(rt.request)].reverse()) {
       const backup = executedOps.get(op.id) ?? null
       try {
         const undo = await op.undo(ctx, backup)
@@ -217,7 +227,11 @@ export function createTransactionEngine(
       deps.logger.error('回滚 WAL 追加失败（事务将保持可恢复状态）', { tx: ctx.txId, error: errorToMessage(e) })
     }
     rt.finishedAt = deps.clock.now().toISOString()
-    setState(rt, rt.state === 'rolling-back' ? 'rolled-back' : 'failed')
+    // V5.7：终态迁移失败不再静默（与 WAL 重建口径分裂的观测信号）
+    const end = setState(rt, rt.state === 'rolling-back' ? 'rolled-back' : 'failed')
+    if (!end.ok) {
+      deps.logger.error('回滚终态迁移被拒（内存态与 WAL 口径可能分裂）', { tx: rt.txId, state: rt.state })
+    }
     try {
       await deps.audit.append({
         timestamp: rt.finishedAt, actor: rt.request.actor, action: 'tx-rollback',
@@ -290,6 +304,20 @@ export function createTransactionEngine(
           message: 'aggressive 策略必须携带 confirmationToken（二次确认）',
         })
       }
+      // V5.7 纵深防御：工具层 checkProfile/checkPlugins 之外，引擎自身再
+      // 校验一次。旧实现的"白名单根"由同一份未校验 profile 拼出 —— 直连
+      // 引擎的调用方传 '../../x' 时目标与 allowedRoot 一起逃逸 dshHome，
+      // containment 检查同源污染、形同虚设。fail-closed。
+      if (deps.validateProfile && !deps.validateProfile(request.profile)) {
+        return err({ code: 'E_VALIDATION', message: `profile 非法: ${JSON.stringify(request.profile)}` })
+      }
+      if (deps.validatePlugin) {
+        for (const p of request.plugins) {
+          if (!deps.validatePlugin(p)) {
+            return err({ code: 'E_VALIDATION', message: `插件名非法: ${JSON.stringify(p)}` })
+          }
+        }
+      }
       const owner: LockOwner = {
         pid: process.pid,
         hostname: os.hostname(),
@@ -298,6 +326,10 @@ export function createTransactionEngine(
       }
       const acquired = await deps.lockManager.acquire({
         scope: { kind: 'global' }, mode: 'exclusive', owner, waitTimeoutMs: 5000, ttlMs: 300_000,
+        // V5.7：启用契约已声明的后台心跳续期（README 宣称此前与实现不符）。
+        // 慢盘上的大清理（巨型 node_modules）超 5 分钟不再被监控口径判为
+        // "挂死持有者"；release/异常路径由 lock-manager 自动停表。
+        autoRenewMs: 100_000,
       })
       if (!acquired.ok) return err(acquired.error)
 
@@ -322,12 +354,26 @@ export function createTransactionEngine(
       }
       runtimes.set(txId, rt)
 
-      await deps.wal.append(txId, { type: 'tx-begin', txId, request })
-      await deps.audit.append({
-        timestamp: rt.startedAt, actor: request.actor, action: 'tx-begin',
-        txId, outcome: 'success',
-        detail: { plugins: request.plugins, profile: request.profile, strategy: request.strategy, dryRun: request.dryRun },
-      })
+      // V5.7：WAL/审计追加的异常路径必须回收锁与运行时。旧实现完全裸奔 ——
+      // tx-begin 落盘时 ENOSPC/EACCES/EMFILE 抛出后 session 无法返回，
+      // 调用方无从 rollback，长驻进程里锁悬挂到进程退出 = 全局死锁。
+      try {
+        await deps.wal.append(txId, { type: 'tx-begin', txId, request })
+      } catch (e) {
+        runtimes.delete(txId)
+        await acquired.value.release()
+        return err(ioError('事务开启失败：tx-begin WAL 落盘异常', e))
+      }
+      try {
+        await deps.audit.append({
+          timestamp: rt.startedAt, actor: request.actor, action: 'tx-begin',
+          txId, outcome: 'success',
+          detail: { plugins: request.plugins, profile: request.profile, strategy: request.strategy, dryRun: request.dryRun },
+        })
+      } catch (e) {
+        // WAL 已落盘（事务存在且可恢复）：审计属可观测性，缺失只降级为日志
+        deps.logger.warn('tx-begin 审计追加失败（可靠性统计缺此样本）', { tx: txId, error: errorToMessage(e) })
+      }
       const session: TxSession = { txId, lockId: acquired.value.id, request }
       return ok(session)
     },
@@ -549,7 +595,16 @@ export function createTransactionEngine(
 
           // pre 钩子（可 veto）
           const pre = await deps.hooks.emit('pre', hookCtx(txId, rt.request, op))
-          if (pre.ok && pre.value.verdict.kind === 'veto') {
+          // V5.7：emit 失败（fail-fast 命令钩子超时/不在白名单）按 veto 处理。
+          // 旧实现只处理 ok 分支：钩子失败被静默吞掉，破坏性步骤照常执行，
+          // "fail-fast" 语义名存实亡。
+          if (!pre.ok) {
+            rt.steps[index] = { ...rt.steps[index]!, status: 'skipped' }
+            await rollbackRuntime(rt, `pre 钩子执行失败: ${pre.error.message}`)
+            await finalize(rt)
+            return err({ code: 'E_HOOK_VETO', message: `pre 钩子执行失败（按否决处理）: ${pre.error.message}` })
+          }
+          if (pre.value.verdict.kind === 'veto') {
             rt.steps[index] = { ...rt.steps[index]!, status: 'skipped' }
             await rollbackRuntime(rt, `pre 钩子否决: ${pre.value.verdict.reason}`)
             await finalize(rt)
@@ -654,14 +709,22 @@ export function createTransactionEngine(
         await deps.wal.append(txId, { type: 'tx-commit', txId })
         rt.finishedAt = deps.clock.now().toISOString()
         setState(rt, 'committed')
-        await deps.audit.append({
-          timestamp: rt.finishedAt, actor: rt.request.actor, action: 'tx-commit',
-          txId, outcome: 'success',
-          detail: {
-            steps: rt.steps.length,
-            bytesFreed: rt.steps.reduce((s, x) => s + x.bytesFreed, 0),
-          },
-        })
+        // V5.7：tx-commit 已落盘 = 进入不可补偿区。旧实现审计追加失败会
+        // 落入外层 catch 走 rollbackRuntime —— 从 committed 迁移被拒但补偿
+        // 照跑，WAL 同时含 tx-commit 与 tx-rollback，status() 重建报
+        // committed 而文件系统实际已回滚（状态分裂）。审计缺失只降级为日志。
+        try {
+          await deps.audit.append({
+            timestamp: rt.finishedAt, actor: rt.request.actor, action: 'tx-commit',
+            txId, outcome: 'success',
+            detail: {
+              steps: rt.steps.length,
+              bytesFreed: rt.steps.reduce((s, x) => s + x.bytesFreed, 0),
+            },
+          })
+        } catch (e) {
+          deps.logger.error('tx-commit 审计追加失败（事务已提交，结果不受影响）', { tx: txId, error: errorToMessage(e) })
+        }
         // 释放锁：事务终结
         await finalize(rt)
         return ok(summarize(rt, txId))
@@ -790,6 +853,43 @@ export function createTransactionEngine(
         bytesFreedTotal: steps.reduce((s, x) => s + x.bytesFreed, 0),
         startedAt: await startedAtFromAudit(txId),
       }
+    },
+
+    /** V5.7 事务清单：活跃（本进程运行时）+ 未终结（WAL 崩溃残留）合并。
+     *  状态判定与 status() 的 WAL 重建路径同一口径（终结符缺失 = failed），
+     *  杜绝"清单说活跃、status 说已终结"的分裂报告。单个 WAL 重放失败
+     *  只降级为跳过（list 是诊断能力，绝不因一个坏文件拒绝服务）。 */
+    async list(): Promise<readonly TxListEntry[]> {
+      const out: TxListEntry[] = []
+      for (const rt of runtimes.values()) {
+        out.push({
+          txId: rt.txId,
+          state: rt.state,
+          startedAt: rt.startedAt,
+          origin: 'active',
+          steps: rt.steps.length,
+        })
+      }
+      for (const txId of deps.wal.unfinishedTxIds()) {
+        if (runtimes.has(txId)) continue   // 活跃事务已上报，不重复
+        try {
+          const records = await deps.wal.replay(txId)
+          if (records.length === 0) continue
+          const state: TxState = records.some(r => r.type === 'tx-commit') ? 'committed'
+            : records.some(r => r.type === 'tx-rollback') ? 'rolled-back' : 'failed'
+          if (state !== 'failed') continue   // WAL 已有终结符但清单滞后：非未终结，跳过
+          out.push({
+            txId,
+            state,
+            startedAt: await startedAtFromAudit(txId),
+            origin: 'unfinished',
+            steps: records.filter(r => r.type === 'step-intent').length,
+          })
+        } catch (e) {
+          deps.logger.warn('list() 重放 WAL 失败，跳过该事务', { txId, error: errorToMessage(e) })
+        }
+      }
+      return out
     },
   }
 }

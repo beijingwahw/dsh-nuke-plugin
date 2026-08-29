@@ -229,6 +229,20 @@ export interface TxSummary {
   readonly finishedAt?: string
 }
 
+/** V5.7 事务清单条目（nuke_status 无参模式数据源）：本进程活跃事务与
+ *  WAL 未终结事务（上次运行崩溃残留）的合并视图。修复缺陷：用户撞上
+ *  E_LOCK_HELD 后除了读日志文件没有任何工具能回答"谁在跑/撞坏了什么"——
+ *  事务可见性是排障的第一现场。 */
+export interface TxListEntry {
+  readonly txId: TxId
+  readonly state: TxState
+  readonly startedAt: string
+  /** 'active' = 本进程运行时持有锁；'unfinished' = WAL 无终结符（崩溃残留，recover() 可恢复） */
+  readonly origin: 'active' | 'unfinished'
+  /** 步骤数（崩溃残留从 step-intent 计数；仅 begin 未 plan 时为 0） */
+  readonly steps: number
+}
+
 export interface ITransactionEngine {
   /** 受理请求：获取锁（独占）→ 创建 WAL → 返回会话。锁由引擎全程持有 */
   begin(request: CleanRequest): Promise<Result<TxSession>>
@@ -243,6 +257,8 @@ export interface ITransactionEngine {
   /** 启动时扫描 .nuke-tx/ 下未终结的 WAL：有 step-done 无 tx-commit → 反向补偿 */
   recover(): Promise<Result<readonly TxSummary[]>>
   status(txId: TxId): Promise<TxSummary | null>
+  /** V5.7 活跃 + 崩溃残留事务清单（零副作用，nuke_status 无参模式） */
+  list(): Promise<readonly TxListEntry[]>
 }
 
 export interface TxSession {

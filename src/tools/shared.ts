@@ -1,6 +1,6 @@
 // src/tools/shared.ts — 工具注册公共件
 //
-// 23 个工具共享的薄适配层：defineTextTool（统一 output 契约注入）、
+// 24 个工具共享的薄适配层：defineTextTool（统一 output 契约注入）、
 // 图标映射与领域入参校验（白名单）。DSL 表达不了的领域约束
 //（插件名格式/profile 白名单）全部收敛到这里，各域工具不再重复。
 import { defineTool } from '@deepseek-ai/dsh-tools'
@@ -22,7 +22,7 @@ export const BAND_ICON: Record<SeverityBand, string> = {
 
 /** dsh-tools 契约：execute 返回 canonical value，先经 output.schema 校验，
  *  再由 render(args, value) 投影为 ContentBlock 数组。
- *  本插件 23 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
+ *  本插件 24 个工具统一 shape：{ content: string }（纯文本）→ 单个 text 块，
  *  契约集中声明一次，由 defineTextTool 注入 —— 避免逐个注册重复 23 份。 */
 const TEXT_OUTPUT_SCHEMA = {
   type: 'object',

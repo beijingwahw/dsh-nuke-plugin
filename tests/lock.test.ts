@@ -2,11 +2,11 @@ import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import { ok } from '../src/contracts/base'
 import type { LockOwner, LockRequest } from '../src/contracts/lock'
-import { createLockManager } from '../src/infra/lock-manager'
+import { createLockManager, defaultProcessProbe } from '../src/infra/lock-manager'
 
 let tmp: string
 const nowStub = { value: 1_000_000 }
@@ -334,5 +334,257 @@ describe('锁升级（指数退避等待 + 自动心跳续期）', () => {
     expect(fs.existsSync(lockFile)).toBe(false)   // 心跳绝不重建锁文件
     expect(m.holders({ kind: 'global' }).length).toBe(0)
     await r.value.release()
+  })
+})
+
+describe('V5.7 存活探测：EACCES/EPERM 误判修复', () => {
+  /** process.kill mock：指定 pid 抛携带 errno 的异常（模拟跨会话/提权进程） */
+  function mockKill(code: string | null) {
+    return vi.spyOn(process, 'kill').mockImplementation((() => {
+      if (code === null) return true
+      throw Object.assign(new Error(`mock ${code}`), { code })
+    }) as typeof process.kill)
+  }
+
+  it('EACCES（Windows libuv 的"存在但无权限"）→ 按存活处理，绝不误判已死', () => {
+    const k = mockKill('EACCES')
+    try {
+      // 旧实现只认 EPERM：Windows 提权/跨会话持有者被误判已死 → 活锁被回收
+      expect(defaultProcessProbe().isAlive(process.pid, os.hostname())).toBe(true)
+    } finally { k.mockRestore() }
+  })
+
+  it('EPERM（POSIX 的"存在但无权限"）→ 按存活处理', () => {
+    const k = mockKill('EPERM')
+    try {
+      expect(defaultProcessProbe().isAlive(process.pid, os.hostname())).toBe(true)
+    } finally { k.mockRestore() }
+  })
+
+  it('ESRCH（进程真不存在）→ 已死', () => {
+    const k = mockKill('ESRCH')
+    try {
+      expect(defaultProcessProbe().isAlive(process.pid, os.hostname())).toBe(false)
+    } finally { k.mockRestore() }
+  })
+
+  it('主机名不匹配（其他机器的持有者）→ 已死，不探测本地 pid', () => {
+    const k = mockKill(null)
+    try {
+      expect(defaultProcessProbe().isAlive(process.pid, 'other-host')).toBe(false)
+      expect(k).not.toHaveBeenCalled()
+    } finally { k.mockRestore() }
+  })
+})
+
+describe('V5.7 PID 复用甄别（进程启动时间指纹）', () => {
+  /** 带指纹探测的 manager：startTimes 模拟"该 pid 当前真实启动时间" */
+  function managerWith(
+    alivePids: number[],
+    startTimes: Record<number, number>,
+    clock = (() => nowStub.value),
+  ) {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    return {
+      lockRoot,
+      m: createLockManager({
+        lockRoot, now: clock,
+        probe: {
+          isAlive: pid => alivePids.includes(pid),
+          startTimeOf: pid => startTimes[pid] ?? null,
+        },
+      }),
+    }
+  }
+
+  it('获取时自动补写本进程启动时间指纹进锁文件', async () => {
+    const { lockRoot, m } = managerWith([process.pid], { [process.pid]: 1_234_567 })
+    okv(await m.acquire(req(ownerA, 'exclusive')))
+    const raw = JSON.parse(fs.readFileSync(
+      path.join(lockRoot, 'locks', 'global.lock'), 'utf-8',
+    )) as { owners: { owner: { startTime?: number } }[] }
+    expect(raw.owners[0]!.owner.startTime).toBe(1_234_567)
+  })
+
+  it('PID 存活但启动时间不符（PID 被复用）→ 视为已死，TTL 过期后自动回收', async () => {
+    // 持有者 111 获取锁时指纹 = 1_000_000；之后 PID 111 被"新进程"复用，
+    // 当前真实启动时间 = 1_500_000（差 500s ≫ 容差 2s）
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'global.lock'), JSON.stringify({
+      version: 1, scope: 'global', mode: 'exclusive',
+      owners: [{ owner: { ...ownerA, startTime: 1_000_000 }, acquiredAt: 't', expiresAt: nowStub.value - 1 }],
+    }))
+    const m = createLockManager({
+      lockRoot, now: () => nowStub.value,
+      probe: { isAlive: pid => pid === 111, startTimeOf: pid => pid === 111 ? 1_500_000 : null },
+    })
+    const h2 = await m.acquire(req(ownerB, 'exclusive'))
+    expect(h2.ok).toBe(true)   // 旧实现：kill(111,0) 恒真 → 永远 E_LOCK_HELD
+    if (h2.ok) await h2.value.release()
+  })
+
+  it('PID 存活且启动时间吻合（容差内）→ 真持有者，过期也不回收（防误伤）', async () => {
+    // ownerA 持有指纹 1_000_000；探测返回 1_000_800（差 800ms < 2s 容差）
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'global.lock'), JSON.stringify({
+      version: 1, scope: 'global', mode: 'exclusive',
+      owners: [{ owner: { ...ownerA, startTime: 1_000_000 }, acquiredAt: 't', expiresAt: nowStub.value - 1 }],
+    }))
+    const m = createLockManager({
+      lockRoot, now: () => nowStub.value,
+      probe: { isAlive: pid => pid === 111, startTimeOf: pid => pid === 111 ? 1_000_800 : null },
+    })
+    const r = await m.acquire(req(ownerB, 'exclusive'))
+    expect(r.ok).toBe(false)   // 指纹吻合 → 判活 → 不回收
+    if (!r.ok) expect(r.error.message).toContain('已过期但进程仍存活')
+  })
+
+  it('指纹平台不可用（startTimeOf 恒 null）→ 退回保守纯存活判定', async () => {
+    const m = createLockManager({
+      lockRoot: path.join(tmp, `run-${Math.random().toString(36).slice(2)}`),
+      now: () => nowStub.value,
+      probe: { isAlive: pid => pid === 111 },   // 无 startTimeOf
+    })
+    okv(await m.acquire(req(ownerA, 'exclusive', 500)))
+    nowStub.value += 1000
+    const r = await m.acquire(req(ownerB, 'exclusive'))
+    expect(r.ok).toBe(false)   // 无法甄别 → 保守：仍按存活处理
+    if (!r.ok) expect(r.error.message).toContain('已过期但进程仍存活')
+  })
+
+  it('E_LOCK_HELD 报错：PID 复用 + TTL 未到期 → 报"进程已死 + 回收倒计时"（不再误报为存活）', async () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'global.lock'), JSON.stringify({
+      version: 1, scope: 'global', mode: 'exclusive',
+      owners: [{ owner: { ...ownerA, startTime: 1_000_000 }, acquiredAt: 't', expiresAt: nowStub.value + 6_000 }],
+    }))
+    const m = createLockManager({
+      lockRoot, now: () => nowStub.value,
+      // kill(111,0) 恒真（PID 被复用）但指纹不符：旧实现报"已过期但进程仍存活"
+      probe: { isAlive: () => true, startTimeOf: () => 9_999_999 },
+    })
+    const r = await m.acquire(req(ownerB, 'exclusive'))
+    expect(r.ok).toBe(false)
+    if (!r.ok) {
+      expect(r.error.message).toContain('进程已死')
+      expect(r.error.message).toContain('自动回收')
+    }
+  })
+})
+
+describe('V5.7 inspect() 锁诊断快照', () => {
+  it('活跃 / 已死未到期 / 陈旧残留 / PID 复用四形态的合成口径', () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    const t = nowStub.value
+    const mk = (pid: number, start: number | undefined, expiresAt: number): unknown => ({
+      owner: { pid, hostname: 'h', bootToken: `t${pid}`, purpose: 'clean', ...(start !== undefined ? { startTime: start } : {}) },
+      acquiredAt: 't0', expiresAt,
+    })
+    // 三个 scope 三种形态：active(111) / dead-not-expired(222) / stale(333)
+    fs.writeFileSync(path.join(dir, 'global.lock'), JSON.stringify({
+      version: 1, scope: 'global', mode: 'exclusive',
+      owners: [mk(111, 1_000_000, t + 60_000)],
+    }))
+    fs.writeFileSync(path.join(dir, 'profile_web.lock'), JSON.stringify({
+      version: 1, scope: 'profile:web', mode: 'shared',
+      owners: [mk(222, undefined, t + 5_000)],
+    }))
+    fs.writeFileSync(path.join(dir, 'plugin_web_x.lock'), JSON.stringify({
+      version: 1, scope: 'plugin:web/x', mode: 'exclusive',
+      owners: [mk(333, 2_000_000, t - 1)],
+    }))
+    const m = createLockManager({
+      lockRoot, now: () => t,
+      probe: {
+        // 222 已死（未到期）；111 活着且指纹吻合；333 被 PID 复用
+        isAlive: pid => pid === 111 || pid === 333,
+        startTimeOf: pid => pid === 111 ? 1_000_500 : pid === 333 ? 8_888_888 : null,
+      },
+    })
+    const files = m.inspect()
+    expect(files).toHaveLength(3)
+    const byFile = new Map(files.map(f => [f.file, f]))
+    const active = byFile.get('global.lock')!.slots[0]!
+    expect(active.alive).toBe(true)        // 指纹吻合（差 500ms）→ 判活
+    expect(active.expired).toBe(false)
+    expect(active.pidReused).toBe(false)
+    expect(active.autoReapInSec).toBeNull()  // 有活人 → 不可自动回收
+    const dead = byFile.get('profile_web.lock')!.slots[0]!
+    expect(dead.alive).toBe(false)         // isAlive=false（无指纹也判死）
+    expect(dead.expired).toBe(false)
+    expect(dead.autoReapInSec).toBe(5)     // TTL 剩余 5s 后可回收
+    const reused = byFile.get('plugin_web_x.lock')!.slots[0]!
+    expect(reused.pidReused).toBe(true)    // 指纹不符 → PID 被复用
+    expect(reused.alive).toBe(false)
+    expect(reused.autoReapInSec).toBe(0)   // 已过期 → 立即可回收
+  })
+
+  it('空锁目录 → 空快照（不抛错）', () => {
+    const m = createLockManager({
+      lockRoot: path.join(tmp, `run-${Math.random().toString(36).slice(2)}`),
+      now: () => nowStub.value,
+    })
+    expect(m.inspect()).toEqual([])
+  })
+
+  it('结构损坏的锁文件不出现在快照中（readLock 同口径过滤）', () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(path.join(dir, 'broken.lock'), '{"version":1,"mode":"exclu')
+    const m = createLockManager({ lockRoot, now: () => nowStub.value })
+    expect(m.inspect()).toEqual([])
+  })
+})
+
+describe('V5.7 guard 强拆核验（慢而未死不拆）', () => {
+  /** 手工构造超龄 guard（mtime=epoch）+ owner 文件记录 pid */
+  function plantAgedGuard(lockRoot: string, pid: number): string {
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    const guard = path.join(dir, 'global.lock.mut')
+    fs.mkdirSync(guard)
+    fs.writeFileSync(path.join(guard, 'owner'), `tok-${pid}\n${pid}`)
+    fs.utimesSync(guard, 0, 0)   // mtime=epoch → 远超 10s 强拆阈值
+    return guard
+  }
+
+  it('超龄 guard 的持有进程已死 → 强拆后获取成功', async () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const guard = plantAgedGuard(lockRoot, 4242)
+    const m = createLockManager({
+      lockRoot, now: () => nowStub.value,
+      probe: { isAlive: pid => pid !== 4242 },   // 4242 已死 → 允许强拆
+    })
+    const h = await m.acquire(req(ownerA, 'shared'))   // shared 路径经由 guard
+    expect(h.ok).toBe(true)
+    expect(fs.existsSync(guard)).toBe(false)   // 被强拆并由本次获取者接管后正常释放
+    if (h.ok) await h.value.release()
+  })
+
+  it('超龄 guard 的持有进程仍存活 → 核验生效不强拆（互斥语义保全）', async () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const guard = plantAgedGuard(lockRoot, 5252)
+    const m = createLockManager({
+      lockRoot, now: () => Date.now(),   // 真实时钟：等待循环依赖时间推进
+      probe: { isAlive: pid => pid === 5252 },   // 5252 活着（只是慢）→ 绝不拆
+    })
+    const acquiring = m.acquire(req(ownerA, 'shared'))
+    await new Promise(r => setTimeout(r, 400))
+    // 旧实现纯按年龄强拆：400ms 内必然已被拆掉。核验生效 → guard 仍在
+    expect(fs.existsSync(guard)).toBe(true)
+    // 让等待方退出（GUARD_MAX_WAIT_MS=15s 太久，直接移除 guard 模拟持有者完成）
+    fs.rmSync(guard, { recursive: true, force: true })
+    const h = await acquiring
+    expect(h.ok).toBe(true)
+    if (h.ok) await h.value.release()
   })
 })
