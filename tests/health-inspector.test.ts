@@ -187,6 +187,43 @@ describe('HealthInspector', () => {
     }
   })
 
+  it('V5.6.2 锁残留分级监控：区分陈旧可回收 / 已死未到期 / 活跃持有者', async () => {
+    const locksDir = path.join(home, '.nuke', 'locks')
+    fs.mkdirSync(locksDir, { recursive: true })
+    fs.writeFileSync(path.join(locksDir, 'global.lock'), JSON.stringify({
+      version: 1, scope: 'global', mode: 'exclusive',
+      owners: [
+        {   // 用户报告的典型场景：11 小时前崩溃的清理进程（过期且死亡）
+          owner: { pid: 23468, hostname: 'h', bootToken: 'dead', purpose: 'clean' },
+          acquiredAt: '2026-08-28T00:00:00Z', expiresAt: 1,
+        },
+        {   // 进程已死但 TTL 未到 → 报告回收倒计时
+          owner: { pid: 200, hostname: 'h', bootToken: 'soon', purpose: 'clean' },
+          acquiredAt: '2026-08-29T00:00:00Z', expiresAt: Date.now() + 5_000,
+        },
+        {   // 活跃持有者：绝不回收
+          owner: { pid: 100, hostname: 'h', bootToken: 'live', purpose: 'scan' },
+          acquiredAt: '2026-08-29T00:00:00Z', expiresAt: Date.now() + 600_000,
+        },
+      ],
+    }, null, 2))
+    try {
+      const r = await make({ isProcessAlive: (pid) => pid === 100 }).inspect(PROFILE)
+      if (!r.ok) throw new Error('inspect failed')
+      const lock = r.value.results.find(x => x.check === 'nuke 锁残留')!
+      expect(lock.passed).toBe(false)
+      expect(lock.severity).toBe('warning')
+      expect(lock.message).toContain('clean(pid 23468): 已过期且进程已死，下次获取自动回收')
+      expect(lock.message).toContain('clean(pid 200): 进程已死，TTL 剩余')
+      expect(lock.message).toContain('scan(pid 100): 活跃')
+      expect(lock.fix).toContain('自动回收')
+      // 分级监控仍是 warning，不阻断
+      expect(r.value.blocking).toBe(false)
+    } finally {
+      fs.rmSync(locksDir, { recursive: true, force: true })
+    }
+  })
+
   it('package.json 比 lockfile 新 → lockfile 新鲜度 warning', async () => {
     const pd = path.join(home, 'profiles', 'default')
     const lockPath = path.join(pd, 'pnpm-lock.yaml')

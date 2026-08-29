@@ -8,6 +8,11 @@
 //     guard 目录（mkdir 原子 EEXIST，不跟随符号链接）串行化 —— 旧实现的
 //     随机后缀 guard 每个进程创建不同文件名，O_EXCL 永不冲突，形同虚设。
 //  5. 等待重试 = 指数退避 + 等值抖动（防惊群）；acquire 可选自动心跳续期
+//  6. V5.6.2 陈旧锁自动回收：获取路径内嵌 reapStale —— 全体 owner 均
+//     TTL 过期且进程已死（verifiedDead && ttlExpired 双条件，纪律同 2.）
+//     的锁文件在 guard 互斥下就地删除。修复缺陷：持有者崩溃后锁文件永久
+//     残留，O_EXCL 永远失败，acquire 只能 E_LOCK_HELD —— 全部 nuke 操作
+//     被一个早已死亡的进程无限期阻塞（breakStale 从未被生产代码调用）。
 import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
@@ -130,6 +135,36 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     }
   }
 
+  /** V5.6.2 锁文件整体陈旧判定：全体 owner 均 TTL 过期且进程已死
+   *  （verifiedDead && ttlExpired 双条件，与 breakStale 同纪律）。任一
+   *  owner 未过期或仍存活 → false：慢而未死（SIGSTOP/长 GC）的持有者
+   *  可能随时恢复工作，绝不能在它头上并发第二个清理者。空 owners 视为
+   *  非陈旧（结构异常保守处理）。 */
+  function allSlotsStale(cur: LockFileContent, t: number): boolean {
+    return cur.owners.length > 0 && cur.owners.every(o =>
+      o.expiresAt <= t && !probe.isAlive(o.owner.pid, o.owner.hostname))
+  }
+
+  /** V5.6.2 陈旧锁自动回收（获取路径内嵌，唯一被生产触发的破锁路径）：
+   *  锁文件全体 owner 过期且死亡 → 在 guard 互斥下删除，返回 true 表示
+   *  锁已消失（调用方立即重试创建）。guard 内二次核验防 TOCTOU：等待
+   *  guard 期间持有者可能已正常释放（readLock null → true）或新 shared
+   *  持有者已加入（重新判定，不可回收则返回 false）。guard 不可用返回
+   *  false —— 保守留给下轮重试，绝不强拆。 */
+  async function reapStale(p: string): Promise<boolean> {
+    const pre = readLock(p)
+    if (pre === null) return true // 锁文件已消失：直接进入重试创建
+    if (!allSlotsStale(pre, now())) return false
+    const done = await withGuard(p, now, () => {
+      const cur = readLock(p)
+      if (cur === null) return true
+      if (!allSlotsStale(cur, now())) return false
+      try { fs.unlinkSync(p) } catch { /* 并发已回收 */ }
+      return !fs.existsSync(p)
+    })
+    return done === true
+  }
+
   /** 单次获取尝试（不含等待循环） */
   async function tryOnce(request: LockRenewRequest): Promise<LockHandle | null> {
     const p = lockPath(request.scope)
@@ -140,7 +175,13 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       // exclusive 占据（早检与入锁之间被独占方抢先）必须放弃，绝不能以
       // 新 shared 内容覆盖 exclusive 锁文件。
       const acquired = await withGuard(p, now, () => {
-        const cur = readLock(p)
+        let cur = readLock(p)
+        // V5.6.2 陈旧锁回收（guard 内原子判定）：exclusive 陈旧锁同样会把
+        // shared 挡死在门外；回收后重读（可能被并发抢先）走正常建文件路径
+        if (cur !== null && allSlotsStale(cur, now())) {
+          try { fs.unlinkSync(p) } catch { /* 并发已回收 */ }
+          cur = readLock(p)
+        }
         if (cur?.mode === 'exclusive') return false
         const content: LockFileContent = cur?.mode === 'shared'
           ? { ...cur, owners: [...cur.owners.filter(o => o.expiresAt > now()), me] }
@@ -156,7 +197,13 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       const content: LockFileContent = {
         version: 1, scope: scopeKey(request.scope), mode: 'exclusive', owners: [me],
       }
-      if (!writeLockAtomic(p, content)) return null
+      let created = writeLockAtomic(p, content)
+      if (!created && await reapStale(p)) {
+        // 陈旧锁已回收（全体持有者过期且死亡）：立即重试一次创建；
+        // 再失败 = 并发者抢先重建，走正常等待重试语义
+        created = writeLockAtomic(p, content)
+      }
+      if (!created) return null
     }
 
     const lockId = crypto.randomBytes(8).toString('hex') as LockId
@@ -260,9 +307,22 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       const handle = await tryOnce(request)
       if (handle) return ok(handle)
       if (now() >= deadline) {
-        // 超时：报告当前持有者
+        // 超时：报告当前持有者及其存活/过期状态（V5.6.2 监控增强：
+        // 区分 活跃 / 已过期仍存活 / 已死未到期（给出自动回收倒计时）/
+        // 陈旧残留 —— 旧报错把 11 小时前死亡的持有者仍报告为"当前持有"）
         const cur = readLock(lockPath(request.scope))
-        const holders = cur?.owners.map(o => `${o.owner.purpose}(pid ${o.owner.pid})`).join(', ') ?? 'unknown'
+        const t = now()
+        const holders = cur?.owners.map(o => {
+          const dead = !probe.isAlive(o.owner.pid, o.owner.hostname)
+          const expired = o.expiresAt <= t
+          if (!dead && !expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 活跃)`
+          if (dead && expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 陈旧残留)`
+          if (dead) {
+            const remainSec = Math.max(0, Math.round((o.expiresAt - t) / 1000))
+            return `${o.owner.purpose}(pid ${o.owner.pid}, 进程已死, TTL 剩余 ${remainSec}s 后自动回收)`
+          }
+          return `${o.owner.purpose}(pid ${o.owner.pid}, 已过期但进程仍存活)`
+        }).join(', ') ?? 'unknown'
         return err({
           code: 'E_LOCK_HELD',
           message: `获取锁超时（${request.waitTimeoutMs}ms）：scope=${scopeKey(request.scope)} mode=${request.mode}，当前持有: ${holders}`,

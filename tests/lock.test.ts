@@ -159,6 +159,66 @@ describe('安全破锁', () => {
   })
 })
 
+describe('陈旧锁自动回收（V5.6.2）', () => {
+  it('exclusive 陈旧锁（过期且进程死亡）在下次获取时自动回收', async () => {
+    const m = makeManager([])   // 111 已死
+    okv(await m.acquire(req(ownerA, 'exclusive', 500)))
+    nowStub.value += 1000      // TTL 过期：旧实现此处永久 E_LOCK_HELD
+    const h2 = await m.acquire(req(ownerB, 'exclusive'))
+    expect(h2.ok).toBe(true)
+    expect(m.holders({ kind: 'global' }).length).toBe(1)
+    if (h2.ok) await h2.value.release()
+  })
+
+  it('exclusive 陈旧锁不再阻塞 shared 获取（guard 内回收）', async () => {
+    const m = makeManager([])
+    okv(await m.acquire(req(ownerA, 'exclusive', 500)))
+    nowStub.value += 1000
+    const h2 = await m.acquire(req(ownerB, 'shared'))
+    expect(h2.ok).toBe(true)
+    expect(m.holders({ kind: 'global' }).length).toBe(1)
+    if (h2.ok) await h2.value.release()
+  })
+
+  it('持有者已死但 TTL 未到期 → 不回收，报错携带自动回收倒计时', async () => {
+    const m = makeManager([])
+    okv(await m.acquire(req(ownerA, 'exclusive', 10_000)))
+    nowStub.value += 4000   // 剩余 6s
+    const r = await m.acquire(req(ownerB, 'exclusive'))
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.code).toBe('E_LOCK_HELD')
+    expect(r.error.message).toContain('进程已死')
+    expect(r.error.message).toContain('6')
+    expect(r.error.message).toContain('自动回收')
+  })
+
+  it('持有者存活且过期 → 严格破锁纪律，不自动回收（防 SIGSTOP/长 GC 误伤）', async () => {
+    const m = makeManager([111])   // 111 存活
+    okv(await m.acquire(req(ownerA, 'exclusive', 500)))
+    nowStub.value += 1000
+    const r = await m.acquire(req(ownerB, 'exclusive'))
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.message).toContain('已过期但进程仍存活')
+  })
+
+  it('活跃持有者不受回收影响（exclusive 仍阻塞 shared）', async () => {
+    const m = makeManager([111])
+    okv(await m.acquire(req(ownerA, 'exclusive')))
+    expect(await m.tryAcquire(req(ownerB, 'shared'))).toBeNull()
+  })
+
+  it('E_LOCK_HELD 报错区分活跃与陈旧持有者', async () => {
+    const m = makeManager([111])
+    okv(await m.acquire(req(ownerA, 'exclusive')))
+    const r = await m.acquire(req(ownerB, 'exclusive'))
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.message).toContain('活跃')
+  })
+})
+
 describe('withLock RAII', () => {
   it('fn 抛异常也释放锁', async () => {
     const m = makeManager()

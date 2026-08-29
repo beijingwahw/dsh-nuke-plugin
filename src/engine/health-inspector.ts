@@ -10,6 +10,7 @@
 import { spawnSync } from 'child_process'
 import * as fs from 'fs'
 import * as fsp from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 
 import { parse as parseYaml } from 'yaml'
@@ -48,6 +49,9 @@ export interface HealthInspectorOptions {
   readonly toolRegistry?: IToolRegistry
   readonly walUnfinished?: () => readonly string[]
   readonly now?: () => Date
+  /** V5.6.2：锁持有者存活探测注入点（默认 process.kill(pid,0) + hostname
+   *  核验，与 lock-manager 的 ProcessProbe 同语义）；测试可注入桩。 */
+  readonly isProcessAlive?: (pid: number, hostname: string) => boolean
 }
 
 /** V5：检查结果的扩展形态 —— skipped 标记"探测不到"（既非失败也非通过）。
@@ -76,6 +80,12 @@ function asRecord(v: unknown): Record<string, unknown> | null {
 
 export function createHealthInspector(options: HealthInspectorOptions): IHealthInspector {
   const now = options.now ?? (() => new Date())
+  // V5.6.2：锁持有者存活探测（默认与 lock-manager ProcessProbe / CLI
+  // isProcessAlive 同语义：hostname 核验 + kill(pid,0) 信号 0 探测）
+  const isAlive = options.isProcessAlive ?? ((pid: number, hostname: string) => {
+    if (hostname && hostname !== os.hostname()) return false
+    try { process.kill(pid, 0); return true } catch { return false }
+  })
   // spawnSync 失败时 stdout/stderr 可能为 null —— 归一化为 string（与 exec-ops 同纪律）
   const runCommand = options.runCommand ?? ((cmd, args, opts) => {
     const r = spawnSync(cmd, args, { cwd: opts.cwd, encoding: 'utf-8', timeout: opts.timeoutMs })
@@ -246,29 +256,63 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
     return R(label, true, res.detail, 'info', 'runtime')
   }
 
+  /** V5.6.2：锁文件持有者状态描述（只读探测，不做任何回收动作 —— 删除
+   *  统一收敛在 lock-manager 获取路径的 reapStale，健康检查保持只读）。
+   *  磁盘数据不可信：字段缺失/类型不符一律降级为"结构异常"。 */
+  function describeLockHolders(p: string): string {
+    try {
+      const c = asRecord(JSON.parse(fs.readFileSync(p, 'utf-8')) as unknown)
+      const ownersRaw = Array.isArray(c?.owners) ? c.owners : null
+      if (ownersRaw === null || ownersRaw.length === 0) return '结构异常'
+      const t = now().getTime()
+      const states = ownersRaw.map(o => {
+        const slot = asRecord(o)
+        const owner = asRecord(slot?.owner)
+        if (owner === null || typeof owner.pid !== 'number') return '结构异常'
+        const hostname = typeof owner.hostname === 'string' ? owner.hostname : ''
+        const purpose = typeof owner.purpose === 'string' ? owner.purpose : 'unknown'
+        const expiresAt = typeof slot?.expiresAt === 'number' ? slot.expiresAt : 0
+        const alive = isAlive(owner.pid, hostname)
+        if (alive && expiresAt > t) return `${purpose}(pid ${owner.pid}): 活跃`
+        if (!alive && expiresAt <= t) {
+          return `${purpose}(pid ${owner.pid}): 已过期且进程已死，下次获取自动回收`
+        }
+        if (!alive) {
+          const remainSec = Math.max(0, Math.round((expiresAt - t) / 1000))
+          return `${purpose}(pid ${owner.pid}): 进程已死，TTL 剩余 ${remainSec}s 后自动回收`
+        }
+        return `${purpose}(pid ${owner.pid}): 已过期但进程仍存活`
+      })
+      return states.join('; ')
+    } catch { return '无法读取' }
+  }
+
   async function checkRuntime(): Promise<HealthCheckResultV5[]> {
     const out: HealthCheckResultV5[] = []
     // V5.2：CLI 探测统一委托注册表（防两类误报：宿主 PATH 环境差异 / 旗标行为差异）
     out.push(await probeCli('dsh CLI', 'dsh'))
     out.push(await probeCli('pnpm CLI', 'pnpm'))
 
-    // 锁残留（V5.1 修正路径）：V4/V5 锁协议写 .nuke/locks/<scope>.lock；
-    // 旧检查只看 V3 死路径 .nuke/nuke.lock，真实锁残留永远漏检。
+    // 锁残留（V5.1 修正路径 + V5.6.2 状态分级监控）：V4/V5 锁协议写
+    // .nuke/locks/<scope>.lock；旧检查只看 V3 死路径 .nuke/nuke.lock，真实
+    // 锁残留永远漏检。V5.6.2 起逐文件读取 owner 并探测存活/过期分级呈现，
+    // 不再笼统提示"由管理员破锁" —— 陈旧锁由获取路径自动回收。
     const staleLocks: string[] = []
     try {
-      for (const f of await fsp.readdir(path.join(options.dshHome, '.nuke', 'locks'))) {
-        if (f.endsWith('.lock')) staleLocks.push(f)
+      const locksDir = path.join(options.dshHome, '.nuke', 'locks')
+      for (const f of await fsp.readdir(locksDir)) {
+        if (f.endsWith('.lock')) staleLocks.push(`${f}[${describeLockHolders(path.join(locksDir, f))}]`)
       }
     } catch { /* 锁目录不存在 = 无残留 */ }
     // V3 遗留锁（CLI 旧版写 DSH_HOME/.nuke.lock）一并纳入
     try {
       await fsp.access(path.join(options.dshHome, '.nuke.lock'))
-      staleLocks.push('.nuke.lock')
+      staleLocks.push('.nuke.lock[V3 遗留]')
     } catch { /* 无遗留锁 */ }
     if (staleLocks.length > 0) {
       out.push(R('nuke 锁残留', false,
         `发现 ${staleLocks.length} 个锁文件: ${staleLocks.join(', ')}（可能存在并发清理或上次异常退出）`,
-        'warning', 'runtime', '确认无清理进行后由管理员破锁（锁文件含 owner/TTL，破锁纪律见 lock-manager）'))
+        'warning', 'runtime', '陈旧锁（已过期且进程已死）在下次 nuke 操作获取锁时自动回收；活跃/未过期锁请等待其持有进程结束'))
     } else {
       out.push(R('nuke 锁残留', true, '无锁残留', 'info', 'runtime'))
     }
