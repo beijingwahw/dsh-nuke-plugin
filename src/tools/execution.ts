@@ -95,6 +95,13 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
         return { content: `❌ 事务开启失败 [${begin.error.code}]: ${begin.error.message}` }
       }
       const session = begin.value
+      // V5.8.3 死锁修复：begin 成功即持有独占锁，try 覆盖域必须从 plan 开始。
+      // 旧结构 try 从 dryRun 前才开 —— plan()/policy.check() 所在窗口内任何
+      // 逃逸异常都会带着锁 + autoRenew 心跳逃出本工具函数（dsh 宿主长驻
+      // 进程内 = 永久死锁）。窗口内已有分支各自回滚，异常路径由下方统一
+      // catch 的 txCommitted=false 分支回滚。
+      let txCommitted = false
+      try {
       const planR = await rt.engine.plan(session)
       if (!planR.ok) {
         await rt.engine.rollback(session.txId)
@@ -131,11 +138,9 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
       ]
       for (const w of plan.warnings) out.push(`  ${w.blocking ? '⛔' : '⚠️'} ${w.message}`)
 
-      let txCommitted = false
-      try {
-        if (dry_run) {
-          const dr = await rt.engine.dryRun(plan)
-          if (dr.ok) {
+      if (dry_run) {
+        const dr = await rt.engine.dryRun(plan)
+        if (dr.ok) {
             out.push('', '─ 预演明细 ─')
             for (const p of dr.value.plans) out.push(`  • ${p.summary}`)
             // V4.1：动作级明细（风险等级 + 幂等跳过标记），元数据存在时输出

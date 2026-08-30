@@ -213,7 +213,20 @@ export function createTransactionEngine(
     // "已执行但无备份"，未启动/被跳过的步骤触发补偿属于语义越界（依赖各 undo
     // 实现自行判空的隐式约定不可靠）。
     const executedOps = new Map(rt.steps.filter(s => s.status === 'done').map(s => [s.operationId, s.backup]))
-    for (const op of [...operationFactory(rt.request)].reverse()) {
+    // V5.8.3：工厂重建失败不得让补偿路径抛出（违反本函数"绝不抛出"契约，
+    // 会让 rollback() reject、调用方误判补偿失败）。工厂与 plan 期同源：
+    // plan 期已抛过的工厂这里必抛 —— 已执行步骤为空时零补偿即语义正确；
+    // 极端非确定性工厂抛出时记日志留观测，锁仍经 finalize 释放。
+    let ops: CleanOperation[]
+    try {
+      ops = operationFactory(rt.request)
+    } catch (e) {
+      deps.logger.error('补偿期操作工厂重建失败（跳过 undo 钩子，备份恢复不受影响）', {
+        tx: rt.txId, error: errorToMessage(e),
+      })
+      ops = []
+    }
+    for (const op of [...ops].reverse()) {
       if (!executedOps.has(op.id)) continue
       const backup = executedOps.get(op.id) ?? null
       try {
@@ -384,9 +397,13 @@ export function createTransactionEngine(
     async plan(session) {
       const rt = runtimes.get(session.txId)
       if (!rt) return err({ code: 'E_TX_NOT_FOUND', message: `事务不存在: ${session.txId}` })
+      // V5.8.3 死锁修复：plan 全程收敛为 Result 契约。operationFactory 等任何
+      // 逃逸异常若让 plan() reject，工具层 try 之前的调用点（begin 与 try 之间
+      // 的窗口）无人回滚 —— 独占锁 + autoRenew 心跳随异常逃出工具函数，在
+      // 宿主长驻进程内 = 永久死锁（与 commit 前置拒绝路径同源的锁悬挂）。
+      try {
       const st = setState(rt, 'planned')
       if (!st.ok) return err(st.error)
-
       const ctx = makeCtxFromRt(rt)
       const ops = operationFactory(rt.request)
       const warnings: PlanWarning[] = []
@@ -428,6 +445,11 @@ export function createTransactionEngine(
         requiresConfirmationToken: rt.request.strategy === 'aggressive',
       }
       return ok(plan)
+      } catch (e) {
+        // 与 preview 循环同一纪律：plan() 永不 reject（Result 契约）。
+        // 调用方按 !ok → rollback 分支处理，锁的生命周期闭环。
+        return err(ioError('计划编译异常（事务仍持有锁，调用方应 rollback）', e))
+      }
     },
 
     async dryRun(plan) {

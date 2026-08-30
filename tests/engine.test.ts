@@ -263,6 +263,24 @@ describe('事务引擎', () => {
     }
   })
 
+  // V5.8.3 锁窗口回归：plan() 的 operationFactory 抛异常若让 plan reject，
+  // 工具层 try 之前的调用点无人回滚 → 独占锁 + 心跳逃逸 = 宿主进程内
+  // 永久死锁（与 commit 前置拒绝同源）。plan 必须收敛为 Result。
+  it('operationFactory 抛异常 → plan 收敛为 Result（不 reject），回滚后锁可用', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => { throw new Error('factory boom') })
+    const session = await engine.begin(request())
+    expect(session.ok).toBe(true)
+    const plan = await engine.plan(okv(session))
+    expect(plan.ok).toBe(false)
+    // 回滚释放后，下一个事务必须能立即拿到锁（无 E_LOCK_HELD）
+    const rb = await engine.rollback(okv(session).txId)
+    expect(rb.ok).toBe(true)
+    const session2 = await engine.begin(request())
+    expect(session2.ok).toBe(true)
+    if (session2.ok) await engine.rollback(session2.value.txId)
+  })
+
   it('pre 钩子 veto → 回滚', async () => {
     seedWorkspace()
     const engineRef: { current?: ITransactionEngine } = {}
