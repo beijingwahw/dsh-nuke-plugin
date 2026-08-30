@@ -41,6 +41,12 @@ export interface LockRequest {
    *  原为 lock-manager 私有扩展，并入契约后引擎/调用方无需感知扩展类型。
    *  建议取 ttlMs 的 1/3；定时器 unref 不阻止进程退出。 */
   readonly autoRenewMs?: number
+  /** V5.8.7 心跳续期的持有硬上限（ms）：> 0 时自获取起经过此时长后心跳
+   *  停跳，锁交还 TTL 自然到期回收。防「句柄被调用方遗忘 + autoRenew
+   *  无限续期」—— TTL 永不到期 = 锁在进程存活期间永久占用，全部清理
+   *  事务被阻塞（「绝不占用」的兜底上限）。正常路径不受影响：release
+   *  幂等且先于上限触发。最坏占用被界定为 maxHoldMs + ttlMs。 */
+  readonly maxHoldMs?: number
 }
 
 export interface LockHandle {

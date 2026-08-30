@@ -456,6 +456,36 @@ describe('锁升级（指数退避等待 + 自动心跳续期）', () => {
     expect(m.holders({ kind: 'global' }).length).toBe(0)
     await r.value.release()
   })
+
+  // V5.8.7 maxHoldMs：autoRenew 的无限续期把 TTL 变成永不到期 —— 句柄
+  // 被调用方遗忘（事务半途被宿主抛弃）= 锁在进程存活期间永久占用。
+  it('V5.8.7 maxHoldMs 持有硬上限：超限后心跳停跳，锁交还 TTL 回收（遗忘句柄不再永久占用）', async () => {
+    const { m } = realManager()
+    const r = await m.acquire({
+      scope: { kind: 'global' }, mode: 'exclusive', owner: ownerA,
+      waitTimeoutMs: 0, ttlMs: 150, autoRenewMs: 40, maxHoldMs: 120,
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    // 400ms > maxHold 120ms：停跳发生在首次超限 tick（≈120~160ms），
+    // 最后一次续期最多保到 ≈停跳点+TTL 150ms < 400ms
+    await sleep(400)
+    expect(m.holders({ kind: 'global' }).length).toBe(0)   // 不再无限续期
+    await r.value.release()
+  })
+
+  it('V5.8.7 对照：未设 maxHoldMs 的心跳持续保活（硬上限不误伤正常长持有）', async () => {
+    const { m } = realManager()
+    const r = await m.acquire({
+      scope: { kind: 'global' }, mode: 'exclusive', owner: ownerA,
+      waitTimeoutMs: 0, ttlMs: 150, autoRenewMs: 40,
+    })
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    await sleep(400)   // 与上例同窗口：无上限 → 心跳保活
+    expect(m.holders({ kind: 'global' }).length).toBe(1)
+    await r.value.release()
+  })
 })
 
 describe('V5.7 存活探测：EACCES/EPERM 误判修复', () => {

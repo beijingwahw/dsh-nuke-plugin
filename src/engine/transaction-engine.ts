@@ -259,16 +259,24 @@ export function createTransactionEngine(
     }
   }
 
-  /** 事务终结收尾：摘要入缓存 → 释放独占锁 → 移除运行时。
+  /** 事务终结收尾：释放独占锁 → 摘要入缓存 → 移除运行时。
    *  commit/rollback 的所有终态路径（成功/补偿失败/逃逸异常）都必须经过这里，
-   *  否则锁悬挂会阻塞后续全部清理事务。 */
+   *  否则锁悬挂会阻塞后续全部清理事务。
+   *  V5.8.7 顺序加固：锁释放置于首位 —— 旧顺序摘要记账在前，summarize/
+   *  缓存路径抛异常会跳过 release（辅助观测数据绝不允许阻塞关键资源释放）。 */
   async function finalize(rt: TxRuntime): Promise<void> {
-    rememberFinished(rt.txId, summarize(rt, rt.txId))
-    // V5.8.6：release 内部已带瞬态重试；此处仅记录残余失败（永久性 IO
+    // V5.8.6：release 内部已带瞬态重试；此处记录残余失败（永久性 IO
     // 故障）—— 静默丢弃会把"锁占用中"伪装成"已释放"，排障无从下手。
     const releasedResult = await rt.lockHandle.release()
+    try {
+      rememberFinished(rt.txId, summarize(rt, rt.txId))
+    } catch (e) {
+      deps.logger.error('事务摘要缓存失败（锁已释放，不影响正确性）', {
+        tx: rt.txId, error: errorToMessage(e),
+      })
+    }
     if (!releasedResult.ok) {
-      deps.logger.error('事务锁释放失败（陈旧回收将在进程退出后兜底）', {
+      deps.logger.error('事务锁释放失败（陈旧回收将在 TTL 到期后兜底）', {
         tx: rt.txId, error: releasedResult.error.message,
       })
     }
@@ -353,6 +361,12 @@ export function createTransactionEngine(
         // 慢盘上的大清理（巨型 node_modules）超 5 分钟不再被监控口径判为
         // "挂死持有者"；release/异常路径由 lock-manager 自动停表。
         autoRenewMs: 100_000,
+        // V5.8.7 持有硬上限：事务半途被宿主抛弃（commit/rollback 永不被
+        // 调、句柄被遗忘）时心跳会把 TTL 无限续期 —— 独占锁在宿主进程
+        // 存活期间永久占用，全部清理事务被阻塞。30 分钟远超最慢合法清理
+        // （慢盘巨型 node_modules 为分钟级），超限停跳后最坏占用
+        // = 30min + TTL 5min，仍远小于「永久」。
+        maxHoldMs: 30 * 60_000,
       })
       if (!acquired.ok) return err(acquired.error)
 

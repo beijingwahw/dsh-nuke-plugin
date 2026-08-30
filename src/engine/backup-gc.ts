@@ -112,7 +112,12 @@ export function createBackupGc(deps: BackupGcDeps): IBackupGc {
         try {
           return await collect({ dryRun, areas, started })
         } finally {
-          await acquired.value.release()
+          // V5.8.7：释放失败不再静默 —— 锁残留会阻塞后续 GC/清理事务，
+          // 且 GC 进程存活期间陈旧回收不会接管（须等 TTL 过期）
+          const released = await acquired.value.release()
+          if (!released.ok) {
+            log.warn('备份 GC 锁释放失败（TTL 到期后自动回收）', { error: released.error.message })
+          }
         }
       } catch (e) {
         return err(ioError('备份 GC 失败', e))

@@ -455,7 +455,13 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     // 定时器泄漏 + 已释放锁被反复"复活"）。锁确认丢失（E_LOCK_STALE）
     // 后停跳止血 —— 对已不存在的锁续期只是空转 IO。
     // unref()：心跳不阻止进程正常退出（守护语义，非生命周期语义）。
+    // V5.8.7 maxHoldMs 持有硬上限：句柄被调用方遗忘（事务半途被宿主
+    // 抛弃、异常路径漏释放）时，autoRenew 让 TTL 永不到期 —— 锁在进程
+    // 存活期间永久占用，全部清理事务被阻塞。超过上限后停跳，锁交还
+    // TTL 自然到期回收；最坏占用被界定为 maxHoldMs + ttlMs。
     const autoRenewMs = request.autoRenewMs
+    const maxHoldMs = request.maxHoldMs
+    const acquiredAtMs = me.expiresAt - request.ttlMs   // 获取时刻（ms）
     let renewTimer: NodeJS.Timeout | null = null
     const stopAutoRenew = (): void => {
       if (renewTimer !== null) {
@@ -465,6 +471,10 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     }
     if (autoRenewMs !== undefined && autoRenewMs > 0) {
       renewTimer = setInterval(() => {
+        if (maxHoldMs !== undefined && maxHoldMs > 0 && now() - acquiredAtMs >= maxHoldMs) {
+          stopAutoRenew()   // 持有超上限：停跳，TTL 接管回收
+          return
+        }
         void doRefresh().then(r => {
           if (!r.ok && r.error.code === 'E_LOCK_STALE') stopAutoRenew()
         })
