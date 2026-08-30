@@ -236,6 +236,33 @@ describe('事务引擎', () => {
     expect(result.ok).toBe(false)
   })
 
+  // V5.8.3 死锁回归：真实故障 —— 令牌复验失败的 commit 拒绝路径不释放
+  // 独占锁，且 autoRenew 心跳持续续期 → 持有者（宿主进程）存活期间锁
+  // 永不过期，recover() 又跳过"活跃"运行时 → 后续全部事务 E_LOCK_HELD。
+  it('aggressive 令牌无效 → commit 拒绝后锁必须释放（下一个事务立即可用）', async () => {
+    seedWorkspace()
+    const engine = buildEngine(() => [opRemoveStorage()])
+    const session = await engine.begin(request({ strategy: 'aggressive', confirmationToken: 'BAD' }))
+    expect(session.ok).toBe(true)
+    const plan = await engine.plan(okv(session))
+    expect(plan.ok).toBe(true)
+    const result = await engine.commit(okv(plan))
+    expect(result.ok).toBe(false)
+    // 拒绝后事务应已终结：status 报 rolled-back 而非卡在 planned
+    const st = await engine.status(okv(session).txId)
+    expect(st?.state).toBe('rolled-back')
+    // 死锁核心断言：全局独占锁必须已释放 —— 新事务必须能立即拿到锁
+    //（旧实现此处 E_LOCK_HELD：持有者=本进程存活 + 心跳续期 → 永久死锁）
+    const session2 = await engine.begin(request())
+    expect(session2.ok).toBe(true)
+    if (session2.ok) {
+      const plan2 = await engine.plan(session2.value)
+      expect(plan2.ok).toBe(true)
+      const r2 = await engine.commit(okv(plan2))
+      expect(r2.ok).toBe(true)
+    }
+  })
+
   it('pre 钩子 veto → 回滚', async () => {
     seedWorkspace()
     const engineRef: { current?: ITransactionEngine } = {}

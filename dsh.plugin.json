@@ -1,6 +1,6 @@
 {
   "id": "dsh-nuke-plugin",
-  "version": "5.8.2",
+  "version": "5.8.3",
   "main": "lib/index.js",
   "description": "DeepSeek Harness 工业级 Nuke 环境清理引擎 — 事务回滚 · 崩溃自恢复 · 审计链 · 硬链接去重 · 趋势预测",
   "engines": {

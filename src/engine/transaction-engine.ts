@@ -494,11 +494,18 @@ export function createTransactionEngine(
 
       // aggressive 令牌复验：plan 可能由外部构造，其 warnings 字段不可信。
       // 此处以 begin 时登记的 request 为准重新校验，堵死"伪造 plan 跳过令牌"的路径。
+      // V5.8.3 死锁修复：前置拒绝路径同样必须终结事务（rollbackRuntime +
+      // finalize）。旧实现直接 return err —— 独占锁不释放且 autoRenew 心跳
+      // 持续续期，持有者（dsh 宿主进程）长期存活 → 锁永不过期、recover 又
+      // 跳过"活跃"运行时 → 全部后续事务 E_LOCK_HELD 永久死锁（真实故障：
+      // 令牌格式错误的 aggressive 清理卡死整个 nuke 系统）。
       if (rt.request.strategy === 'aggressive') {
         const tokenOk = deps.verifyConfirmationToken && rt.request.confirmationToken !== undefined
           ? deps.verifyConfirmationToken(rt.request.confirmationToken, rt.request)
           : false
         if (!tokenOk) {
+          await rollbackRuntime(rt, 'aggressive 策略确认令牌无效（commit 前置拒绝）')
+          await finalize(rt)
           return err({
             code: 'E_VALIDATION',
             message: 'aggressive 策略确认令牌无效，commit 被拒绝（令牌复验失败）',
@@ -506,9 +513,11 @@ export function createTransactionEngine(
         }
       }
 
-      // blocking 警告闸门
+      // blocking 警告闸门（与令牌拒绝同一纪律：拒绝即终结，锁不悬挂）
       const blocking = plan.warnings.find(w => w.blocking)
       if (blocking) {
+        await rollbackRuntime(rt, `阻断性警告: ${blocking.message}`)
+        await finalize(rt)
         return err({ code: 'E_VALIDATION', message: `计划存在阻断性警告: ${blocking.message}` })
       }
 

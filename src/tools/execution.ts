@@ -189,6 +189,10 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
 
         const commit = await rt.engine.commit(plan)
         if (!commit.ok) {
+          // V5.8.3 防御纵深：引擎理论上已回滚释放，此处再补一次 —— 万一未来
+          // 出现未覆盖的失败路径，锁也不会悬挂（已终结事务返回
+          // E_TX_NOT_FOUND，无害；rollback 不抛异常）。
+          await rt.engine.rollback(session.txId)
           out.push('', `❌ 执行失败已自动回滚 [${commit.error.code}]: ${commit.error.message}`)
           return { content: out.join('\n') }
         }
