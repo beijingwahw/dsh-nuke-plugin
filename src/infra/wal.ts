@@ -24,6 +24,12 @@ export interface WalOptions {
  * replay/unfinishedTxIds 逐条校验：CRC 不匹配按损坏处理（同语法损坏纪律）。
  * 无 __crc 的历史行（旧版本写入）按原样接受 —— 读取宽容，写入严格。
  *
+ * CRC 覆盖面（V5.8.1 修复）：规范化序列化必须递归覆盖所有层级。旧实现的
+ * JSON.stringify 数组 replacer 是逐层递归的键白名单，嵌套载荷（outcome 的
+ * bytesFreed、backup 的 originalPath/fingerprint、error 的 details…）被序列化
+ * 为空对象 —— 深层篡改零成本通过校验。现改为递归键排序序列化；存量行的
+ * __crc 用旧算法复现校验（双算法接受），新写入一律走修复版。
+ *
  * 归档（archiveFinished）：已终结事务（含 tx-commit/tx-rollback）的 WAL 文件
  * 移入 archive/ 子目录 —— append-only 语义保留（replay 仍可查询归档文件），
  * unfinishedTxIds 只扫活跃文件，崩溃恢复的扫描面随归档单调收缩。
@@ -43,10 +49,49 @@ const CRC_FIELD = '__crc'
 
 type CrcCarrier = WalRecord & { __crc?: string }
 
-/** 规范化 CRC：键序稳定的 JSON 序列化后取 SHA-256 前 16 hex */
+/** 递归规范化序列化：所有层级的键按码位排序、undefined 值剔除。
+ *
+ *  为什么不能用 JSON.stringify 的数组 replacer 做键序稳定化：数组 replacer
+ *  在 ECMAScript 语义里是"逐层递归生效的键白名单"（SerializeJSONObject
+ *  对每个嵌套对象都用同一 PropertyList 过滤），不是"只排序顶层键"。
+ *  顶层键名之外的嵌套内容一律被序列化为 {} —— 实测 step-done 记录的
+ *  canonical 只剩 {"backup":{},"index":0,...,"outcome":{}}，bytesFreed/
+ *  backupPath/fingerprint/error.details 等嵌套载荷完全缺席，CRC 对深层
+ *  篡改形同虚设。本实现逐层显式排序，任意深度的内容都参与哈希。
+ *
+ *  标量仍走 JSON.stringify：与旧算法的数字/字符串序列化（1e+21、-0→0、
+ *  NaN/Infinity→null）逐位一致，保证只有"嵌套覆盖面"这一维度发生变化。 */
+function canonicalJson(v: unknown): string {
+  if (v === null || typeof v !== 'object') {
+    // JSON.stringify 运行时对 undefined/symbol/function 返回 undefined，
+    // 但其类型签名声明为 string —— 经 unknown 桥接后显式判空
+    const s = JSON.stringify(v) as string | undefined
+    return s ?? 'null'
+  }
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(',')}]`
+  const entries = Object.entries(v as Record<string, unknown>)
+    .filter(([, val]) => val !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+  return `{${entries.map(([k, val]) => `${JSON.stringify(k)}:${canonicalJson(val)}`).join(',')}}`
+}
+
+/** 规范化 CRC（修复版）：递归规范化序列化后取 SHA-256 前 16 hex */
 function computeCrc(record: WalRecord): string {
   const { ...rest } = record as CrcCarrier
   // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- 剔除 __crc 字段后做规范化序列化（delete 动态键是契约字段名的直接表达）
+  delete (rest as Record<string, unknown>)[CRC_FIELD]
+  return crypto.createHash('sha256').update(canonicalJson(rest)).digest('hex').slice(0, 16)
+}
+
+/** 旧版 CRC（缺陷版，仅用于读取历史行）：已落盘记录的 __crc 由旧算法计算，
+ *  读取侧必须能用同一算法复现，否则升级后全部存量 WAL 被误判为篡改
+ *  （fail-closed 保留现场 → 永不归档、恢复面永不收缩）。与"无 __crc 的
+ *  历史行按原样接受"同一读取宽容纪律；新写入一律走修复版 computeCrc。
+ *  已知局限：旧算法不覆盖嵌套内容，历史行的深层篡改仍不可检 —— 这是
+ *  存量数据的固有属性，只能向前修复，无法追溯补强。 */
+function legacyCrc(record: WalRecord): string {
+  const { ...rest } = record as CrcCarrier
+  // eslint-disable-next-line @typescript-eslint/no-dynamic-delete -- 同上：复现旧算法的规范化输入
   delete (rest as Record<string, unknown>)[CRC_FIELD]
   const canonical = JSON.stringify(rest, Object.keys(rest).sort())
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16)
@@ -67,7 +112,10 @@ function lineVerdict(line: string): { verdict: LineVerdict; record: WalRecord | 
     return { verdict: 'corrupt', record: null }
   }
   if (parsed[CRC_FIELD] !== undefined) {
-    if (typeof parsed[CRC_FIELD] !== 'string' || parsed[CRC_FIELD] !== computeCrc(parsed)) {
+    // 双算法接受：修复版（新写入）或缺陷版（升级前的存量行）任一匹配即通过。
+    // 只认修复版会把全部存量 WAL 误判为篡改；只认缺陷版则修复毫无意义。
+    if (typeof parsed[CRC_FIELD] !== 'string'
+      || (parsed[CRC_FIELD] !== computeCrc(parsed) && parsed[CRC_FIELD] !== legacyCrc(parsed))) {
       return { verdict: 'corrupt', record: null }   // CRC 不匹配：静默篡改/位腐烂
     }
     const { ...clean } = parsed

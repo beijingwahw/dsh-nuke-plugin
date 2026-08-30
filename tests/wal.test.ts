@@ -1,3 +1,4 @@
+import * as crypto from 'crypto'
 import * as fs from 'fs'
 import * as os from 'os'
 import * as path from 'path'
@@ -184,5 +185,98 @@ describe('WAL 升级（归档 + 尾部修复 + CRC 完整性）', () => {
     lines[1] = JSON.stringify(tampered)
     fs.writeFileSync(fp, lines.join('\n') + '\n')
     expect((await wal.replay(tx))).toEqual([])   // 中间行损坏 → 空记录集（宁可保守也不误恢复）
+  })
+})
+
+describe('WAL CRC 覆盖面（V5.8.1：嵌套载荷篡改必须可检）', () => {
+  // 带深度嵌套载荷的 step-done：outcome（含 command）、backup（含 fingerprint）
+  const stepDone: WalRecord = {
+    type: 'step-done', index: 0, operationId: 'op0',
+    outcome: {
+      bytesFreed: 1024, message: 'done',
+      command: {
+        cmd: 'dsh', args: ['--version'], exitCode: 0, stdout: '', stderr: '',
+        durationMs: 5, attempts: 1, timedOut: false,
+      },
+    },
+    backup: {
+      operationId: 'op0', kind: 'dir-move',
+      originalPath: '/original/path' as never, backupPath: '/backup/path' as never,
+      fingerprint: { path: '/backup/path' as never, hash: 'abcd0123abcd0123', size: 42, mtime: 1 },
+    },
+  }
+
+  /** 复现旧版（缺陷）CRC 算法：数组 replacer = 逐层键白名单 */
+  function legacyCrcOf(record: Record<string, unknown>): string {
+    const rest = { ...record }
+    delete rest.__crc
+    return crypto.createHash('sha256')
+      .update(JSON.stringify(rest, Object.keys(rest).sort()))
+      .digest('hex').slice(0, 16)
+  }
+
+  it('嵌套载荷篡改（bytesFreed/originalPath/fingerprint/command）→ CRC 失配判损坏', async () => {
+    const dir = path.join(tmp, 'crc2')
+    const wal = createWal({ walRoot: dir })
+    const tx = 'i999' as TxId
+    await wal.append(tx, { type: 'tx-begin', txId: tx, request: {} as never })
+    await wal.append(tx, stepDone)
+    await wal.append(tx, { type: 'tx-commit', txId: tx })
+    const fp = path.join(dir, `${tx}.wal.jsonl`)
+    const tampers: ((r: Record<string, unknown>) => void)[] = [
+      r => { (r.outcome as Record<string, unknown>).bytesFreed = 999_999_999 },
+      r => { ((r.backup as Record<string, unknown>).originalPath) = '/etc/passwd' },
+      r => {
+        const fp2 = (r.backup as Record<string, unknown>).fingerprint as Record<string, unknown>
+        fp2.hash = 'deadbeefdeadbeef'
+      },
+      r => {
+        const cmd = (r.outcome as Record<string, unknown>).command as Record<string, unknown>
+        cmd.stdout = 'injected'
+      },
+    ]
+    for (const tamper of tampers) {
+      const lines = fs.readFileSync(fp, 'utf-8').split('\n').filter(l => l)
+      const parsed = JSON.parse(lines[1]!) as Record<string, unknown>
+      tamper(parsed)
+      lines[1] = JSON.stringify(parsed)
+      fs.writeFileSync(fp, lines.join('\n') + '\n')
+      // 旧算法对这些篡改全部失明（嵌套内容不参与其 canonical）；
+      // 修复后 CRC 必须失配 → 中间行损坏 → 空记录集
+      expect(await wal.replay(tx)).toEqual([])
+    }
+  })
+
+  it('旧算法 CRC 的存量行（升级前写入）仍被接受（读取宽容，写入严格）', async () => {
+    const dir = path.join(tmp, 'crc3')
+    const wal = createWal({ walRoot: dir })
+    const tx = 'j012' as TxId
+    const record: WalRecord = {
+      type: 'tx-begin', txId: tx,
+      request: {
+        plugins: ['p'], profile: 'web', strategy: 'safe', dryRun: false, actor: 'legacy',
+      } as never,
+    }
+    // 手工按旧算法落盘：升级前的真实磁盘形态
+    fs.mkdirSync(dir, { recursive: true })
+    fs.writeFileSync(
+      path.join(dir, `${tx}.wal.jsonl`),
+      JSON.stringify({ ...record, __crc: legacyCrcOf(record as unknown as Record<string, unknown>) }) + '\n',
+    )
+    const replayed = await wal.replay(tx)
+    expect(replayed.length).toBe(1)
+    expect(replayed[0]).toEqual(record)
+  })
+
+  it('新写入的 CRC 与旧算法可区分（防修复退化的哨兵）', async () => {
+    const dir = path.join(tmp, 'crc4')
+    const wal = createWal({ walRoot: dir })
+    const tx = 'k345' as TxId
+    await wal.append(tx, stepDone)
+    const line = JSON.parse(
+      fs.readFileSync(path.join(dir, `${tx}.wal.jsonl`), 'utf-8').split('\n')[0]!,
+    ) as Record<string, unknown>
+    expect(typeof line.__crc).toBe('string')
+    expect(line.__crc).not.toBe(legacyCrcOf(line))   // 相同 = 修复退化回了白名单算法
   })
 })

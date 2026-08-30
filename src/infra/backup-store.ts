@@ -27,7 +27,7 @@ import type {
   FileFingerprint, IBackupStore,
 } from '../contracts/transaction'
 
-import { DEFAULT_IO_CONCURRENCY, dirSize, forEachPool, readJsonl, writeAllSync } from './fs-utils'
+import { DEFAULT_IO_CONCURRENCY, dirSize, forEachPool, fsyncDir, readJsonl, writeAllSync } from './fs-utils'
 
 // 与 wal.ts 同源的白名单：字母数字与-_，长度 ≤ 64；路径分隔符/点/空白一律非法
 const TXID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -151,6 +151,26 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
     return path.join(txArea(txId), 'manifest.jsonl')
   }
 
+  /** 备份产物内容落盘（copy 路径的持久性补齐）：copyFileSync/cpSync 只进
+   *  页缓存，而 manifest 落盘带 fdatasync —— 掉电窗口内会出现"manifest
+   *  已持久、内容未落盘"，恢复时指纹校验失败；file-copy 路径的原位随后
+   *  即被 unlink，备份是唯一副本，内容丢失 = 数据永久丢失。
+   *  yaml-edit 路径的 writeSync 已带 fsync；dir-move 的 rename 路径搬移的
+   *  是既有数据块，无此窗口。fail-soft：个别平台不支持时降级（fsyncDir
+   *  同纪律），持久性是尽力而为的加强项。 */
+  function fsyncPath(p: string): void {
+    try {
+      const st = fs.lstatSync(p)
+      if (st.isFile()) {
+        const fd = fs.openSync(p, 'r+')
+        try { fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+      } else if (st.isDirectory()) {
+        for (const e of fs.readdirSync(p)) fsyncPath(path.join(p, e))
+        fsyncDir(p)
+      }
+    } catch { /* 平台不支持/已被并发移走：降级为无内容级持久性 */ }
+  }
+
   // ─── V5.8 墓碑（purged.jsonl）：GC 清理凭证，与事务区同域存放 ──
   const tombstoneFile = path.join(options.backupRoot, 'purged.jsonl')
 
@@ -260,6 +280,7 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
         async stageFile(original: AbsolutePath): Promise<BackupRecord> {
           const backupPath = path.join(txArea(txId), `f-${counter()}-${path.basename(original)}`) as AbsolutePath
           fs.copyFileSync(original, backupPath)
+          fsyncPath(backupPath)   // 内容落盘先于 manifest 记录（见 fsyncPath 注释）
           const record: BackupRecord = {
             operationId: counter(),
             kind: 'file-copy',
@@ -289,6 +310,8 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
           } catch {
             try {
               fs.cpSync(original, backupPath, { recursive: true })
+              // cp 回退路径同 file-copy：内容落盘先于 manifest（见 fsyncPath 注释）
+              fsyncPath(backupPath)
             } catch (e) {
               try { fs.rmSync(backupPath, { recursive: true, force: true }) } catch { /* 残留交由 orphan 守卫 */ }
               throw e   // 原位未动，半写备份已清理

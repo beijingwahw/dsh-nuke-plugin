@@ -299,3 +299,95 @@ describe('makeOperationFactory（策略编译）', () => {
     for (const b of STRATEGY_ACTIONS.balanced) expect(STRATEGY_ACTIONS.aggressive).toContain(b)
   })
 })
+
+describe('makePurgeTempOp（V5.8.1：多条目备份完整性与并发清理容忍）', () => {
+  /** 制造一个过期（30 天）TEMP 条目：目录或文件 */
+  function seedStale(name: string, isDir: boolean, content: string): string {
+    const p = path.join(tempRoot, name)
+    if (isDir) {
+      fs.mkdirSync(p, { recursive: true })
+      fs.writeFileSync(path.join(p, 'x'), content)
+    } else {
+      fs.writeFileSync(p, content)
+    }
+    const t = new Date(Date.now() - 30 * 86_400_000)
+    fs.utimesSync(p, t, t)
+    return p
+  }
+
+  it('多条目全部 stage；undo 仅凭单条记录（WAL step-done 形态）恢复全部条目', async () => {
+    const d1 = seedStale('dsh-purge-a', true, 'aaa')
+    const d2 = seedStale('dsh-purge-b', true, 'bbb')
+    const f1 = seedStale('dsh-purge-f.txt', false, 'ccc')
+
+    const op = makePurgeTempOp({ tempRoot, ttlDays: 7 })
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.outcome.bytesFreed).toBeGreaterThan(0)
+    expect(fs.existsSync(d1)).toBe(false)
+    expect(fs.existsSync(d2)).toBe(false)
+    expect(fs.existsSync(f1)).toBe(false)
+    // 契约的 backup 是单记录形态（WAL step-done 同构）：只有首条
+    const firstBackup = r.value.backup
+    expect(firstBackup).not.toBeNull()
+
+    // 回归点：undo 必须以 manifest 为事实源恢复 tempRoot 下全部条目，
+    // 只恢复传入单条 = 漏掉其余 N-1 个
+    const undo = await op.undo(ctx, firstBackup)
+    expect(undo.ok).toBe(true)
+    expect(fs.readFileSync(path.join(d1, 'x'), 'utf-8')).toBe('aaa')
+    expect(fs.readFileSync(path.join(d2, 'x'), 'utf-8')).toBe('bbb')
+    expect(fs.readFileSync(f1, 'utf-8')).toBe('ccc')
+  })
+
+  it('undo 只恢复 tempRoot 内的 manifest 记录（不碰其他操作的备份）', async () => {
+    const stale = seedStale('dsh-purge-c', true, 'ddd')
+    const op = makePurgeTempOp({ tempRoot, ttlDays: 7 })
+    await op.execute(ctx)
+    // 侦听 restore 目标：共享 manifest 里还有本事务其他操作（config-edit 等
+    // dshHome 路径）的记录 —— undo 绝不能碰它们（越权恢复 = 破坏补偿边界）
+    const restoredPaths: string[] = []
+    const spyArea: BackupArea = {
+      stageFile: area.stageFile,
+      stageDir: area.stageDir,
+      stageEdit: area.stageEdit,
+      restore: async rec => {
+        restoredPaths.push(rec.originalPath)
+        return area.restore(rec)
+      },
+      manifest: () => area.manifest(),
+      orphanArtifacts: () => area.orphanArtifacts(),
+      purge: area.purge,
+    }
+    const undo = await op.undo({ ...ctx, backups: spyArea }, null)
+    expect(undo.ok).toBe(true)
+    expect(fs.existsSync(path.join(stale, 'x'))).toBe(true)
+    expect(restoredPaths.length).toBeGreaterThan(0)
+    for (const p of restoredPaths) {
+      expect(p.startsWith(tempRoot + path.sep)).toBe(true)
+    }
+  })
+
+  it('扫描后条目被并发清理（stage 抛 ENOENT）→ 幂等跳过而非拖垮事务', async () => {
+    seedStale('dsh-vanish-1', true, 'x')
+    seedStale('dsh-vanish-2', false, 'y')
+    const op = makePurgeTempOp({ tempRoot, ttlDays: 7 })
+    // stage 阶段全部 ENOENT = 模拟 OS 临时目录清洁器抢先清掉了全部条目
+    const vanishArea: BackupArea = {
+      stageFile: async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
+      stageDir: async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) },
+      stageEdit: async () => { throw new Error('unused') },
+      restore: async () => ({ ok: true as const, value: undefined }),
+      manifest: () => [],
+      orphanArtifacts: () => 0,
+      purge: async () => ({ ok: true as const, value: undefined }),
+    }
+    const vanishCtx = { ...ctx, backups: vanishArea }
+    const r = await op.execute(vanishCtx)
+    expect(r.ok).toBe(true)   // 不是 err：条目消失 = 目标已被达成
+    if (!r.ok) return
+    expect(r.value.outcome.skipped).toBe(true)
+    expect(r.value.outcome.bytesFreed).toBe(0)
+  })
+})

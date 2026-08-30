@@ -368,12 +368,17 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       //（移入 doRelease：失败重试路径同样不允许心跳复活已删的锁）
       stopAutoRenew()
       try {
-        // exclusive：unlink 原子，无需互斥；shared：读-改-写必须进 guard，
-        // 否则两个并发 release 的 rename 互相覆盖，丢失对方的移除结果。
-        if (request.mode === 'shared') {
-          const done = await withGuard(p, now, () => {
-            const cur = readLock(p)
-            if (!cur) return true
+        // shared：读-改-写必须进 guard，否则两个并发 release 的 rename 互相
+        // 覆盖，丢失对方的移除结果。exclusive 同样进 guard 且核验归属后再
+        // unlink：锁文件可能已被陈旧回收 + 他人重建（跨机共享锁目录上，
+        // 持有者挂起恢复后 TTL 早已过期 —— 本机视角 kill(pid,0) 探不到他机
+        // 进程，他机按"已死+过期"回收是设计内行为）。盲 unlink 会删掉现任
+        // 持有者的锁，两个 exclusive 并存 = 互斥语义静默破产；check 与
+        // unlink 必须在同一 guard 临界区内（无 TOCTOU 窗口）。
+        const done = await withGuard(p, now, () => {
+          const cur = readLock(p)
+          if (!cur) return true   // 文件已不存在：幂等成功
+          if (request.mode === 'shared') {
             const rest = cur.owners.filter(o => !sameOwner(o.owner, request.owner))
             if (rest.length === 0) {
               // V5.7：unlink 失败（Windows AV/索引器短暂占用 → EPERM/EBUSY）
@@ -386,13 +391,17 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
               fs.renameSync(tmp, p)
             }
             return true
-          }, guardHolderAlive)
-          if (done !== true) {
-            // released 未置位：guard 恢复后可重试 release
-            return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用（可重试 release）' })
           }
-        } else {
-          fs.unlinkSync(p)
+          // exclusive：仅当锁文件仍含本人 slot 才删除；已易主（本人 slot 被
+          // 安全回收）视同已释放，绝不删他人的锁
+          if (cur.owners.some(o => sameOwner(o.owner, request.owner))) {
+            fs.unlinkSync(p)
+          }
+          return true
+        }, guardHolderAlive)
+        if (done !== true) {
+          // released 未置位：guard 恢复后可重试 release
+          return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用（可重试 release）' })
         }
         released = true
         return ok(undefined)

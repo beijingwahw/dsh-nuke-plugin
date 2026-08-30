@@ -10,11 +10,12 @@
 import * as fs from 'fs'
 import * as path from 'path'
 
-import type { AbsolutePath, PluginName, Result } from '../contracts/base'
+import type { AbsolutePath, NukeError, PluginName, Result } from '../contracts/base'
 import { err, errorToMessage, ioError, ok } from '../contracts/base'
 import type { PathPolicy } from '../contracts/paths'
 import type {
-  CleanOperation, DirImpactDetail, DirImpactEntry, ExecutedStep, OperationPlan, TxContext,
+  BackupRecord, CleanOperation, DirImpactDetail, DirImpactEntry, ExecutedStep,
+  OperationPlan, TxContext,
 } from '../contracts/transaction'
 import { dirSize, dirStats, existsSafe, tempOrphanEntries } from '../infra/fs-utils'
 
@@ -176,6 +177,14 @@ export interface PurgeTempOptions {
 
 const DEFAULT_MARKER = /dsh|deepseek|cordis/i
 
+/** child 是否位于 parent 目录内部（不含 parent 自身）。
+ *  purge-temp 的 undo 用它从 manifest 筛出本操作 stage 的条目 ——
+ *  判定纪律与 backup-store 的路径包含逻辑同源（'..' 越出 = 在外）。 */
+function isInsideDir(parent: string, child: string): boolean {
+  const rel = path.relative(parent, child)
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel)
+}
+
 export function makePurgeTempOp(options: PurgeTempOptions): CleanOperation {
   const ttlDays = options.ttlDays ?? 7
   const now = options.now ?? (() => new Date())
@@ -218,37 +227,70 @@ export function makePurgeTempOp(options: PurgeTempOptions): CleanOperation {
       let bytes = 0
       let backup = null
       const failures: string[] = []
+      let vanished = 0
       for (const e of entries) {
         try {
+          let rec: BackupRecord
           if (e.isDir) {
-            const rec = await ctx.backups.stageDir(e.entry as AbsolutePath)
-            backup = backup ?? rec
-            bytes += e.size
+            rec = await ctx.backups.stageDir(e.entry as AbsolutePath)
           } else {
-            const rec = await ctx.backups.stageFile(e.entry as AbsolutePath)
-            backup = backup ?? rec
+            rec = await ctx.backups.stageFile(e.entry as AbsolutePath)
             fs.unlinkSync(e.entry)
-            bytes += e.size
           }
+          // 契约的 backup 字段是单记录形态，本操作实际 stage 了 N 条 ——
+          // 完整恢复依据是 manifest（undo 按 tempRoot 筛选全量恢复），
+          // 此字段只承载"首条记录"（status/审计可观测用）
+          backup = backup ?? rec
+          bytes += e.size
         } catch (err2) {
+          // 扫描与执行之间条目消失（OS 临时目录清洁器/并发清理的常态）：
+          // 目标已不存在 = 该条目已被别人清理，幂等跳过而非失败 ——
+          // 否则无竞争失败的整个事务会被这 N 个 ENOENT 拖垮回滚
+          if ((err2 as NodeJS.ErrnoException).code === 'ENOENT') {
+            vanished++
+            continue
+          }
           failures.push(`${e.entry}: ${errorToMessage(err2)}`)
         }
       }
       if (failures.length > 0 && bytes === 0) {
         return err({ code: 'E_IO', message: `TEMP 清理全部失败: ${failures.join('; ')}` })
       }
+      const done = entries.length - failures.length - vanished
+      const notes: string[] = []
+      if (failures.length > 0) notes.push(`失败 ${failures.length}`)
+      if (vanished > 0) notes.push(`已被并发清理 ${vanished}`)
       return ok({
         outcome: {
           bytesFreed: bytes,
-          message: `TEMP 清理 ${entries.length - failures.length}/${entries.length} 条${failures.length > 0 ? `（失败 ${failures.length}）` : ''}`,
+          message: `TEMP 清理 ${done}/${entries.length} 条${notes.length > 0 ? `（${notes.join('，')}）` : ''}`,
+          // 全部条目都被并发清掉 = 目标已达成，与"无过期条目"同一幂等语义
+          ...(done === 0 && failures.length === 0 ? { skipped: true } : {}),
         },
         backup,
       })
     },
 
     async undo(ctx, record): Promise<Result<void>> {
-      if (!record) return ok(undefined)
-      return ctx.backups.restore(record)
+      // 本操作 stage 的条目数与过期 TEMP 条目数一致（可能 N 个），而 WAL
+      // step-done 只携带单条 backup。恢复的第一事实源是 manifest：凡
+      // originalPath 位于 tempRoot 内的记录都属于本操作，逆序全量恢复
+      //（与引擎 rollbackRuntime 的 manifest 逆序纪律一致）；只恢复传入
+      // 单条会漏掉其余 N-1 个条目。manifest 为空时退回单条记录兜底。
+      const mine = ctx.backups.manifest()
+        .filter(r => isInsideDir(options.tempRoot, r.originalPath))
+      const targets = mine.length > 0
+        ? [...mine].reverse()
+        : record !== null
+          ? [record]
+          : []
+      if (targets.length === 0) return ok(undefined)
+      let firstError: NukeError | null = null
+      for (const t of targets) {
+        const r = await ctx.backups.restore(t)
+        if (!r.ok && firstError === null) firstError = r.error
+      }
+      return firstError === null ? ok(undefined) : err(firstError)
     },
   }
 }
