@@ -51,6 +51,13 @@ export function registerRecoveryTools(ctx: Context, rt: Runtime): void {
         `  回收总计: ${fmtBytes(s.bytesFreedTotal)}  步骤: ${s.steps.length}`,
         ...s.steps.map(x => `    [${x.index}] ${x.action} → ${x.status} (${fmtBytes(x.bytesFreed)})`),
       ]
+      // V5.8 墓碑语义：已提交事务的备份被 GC 清理后，精确回答"何时因何
+      // 不可恢复"—— 而非留给人猜的含糊沉默
+      const tomb = rt.backups.tombstone(tx_id as TxId)
+      if (tomb !== null) {
+        const reason = tomb.reason === 'quota' ? '配额泄压' : '宽限期到期'
+        lines.push(`  🗑️ 备份已于 ${tomb.purgedAt} 清理（${reason}，原占 ${fmtBytes(tomb.bytes)}）—— 该事务不可再恢复`)
+      }
       return { content: lines.join('\n') }
     },
   }))
@@ -206,6 +213,57 @@ export function registerRecoveryTools(ctx: Context, rt: Runtime): void {
           ? '本次演习证明：崩溃后 recover() 能完整还原环境，审计链无断裂，后续事务不受阻塞。建议定期演习（尤其升级后）。'
           : '存在失败项：崩溃恢复能力存疑，请勿在生产依赖自动恢复，优先人工核查。演习现场保留在 .nuke/drill/ 供取证。',
       )
+      return { content: lines.join('\n') }
+    },
+  }))
+
+  // ── nuke_gc（V5.8 备份保留策略：显式执行/预演） ──────────
+  ctx.tools.register(defineTextTool({
+    name: 'nuke_gc',
+    description: '备份保留策略执行：按宽限期（默认 14 天，policy.json 的 backupRetentionDays 可调）+ 空间配额（backupQuotaBytes）清理已终结事务的备份区，未终结事务永不淘汰；dir-move 隔离量在此时结算为真实物理回收（台账 pending→freed）。nuke_clean 每次执行前会自动顺带运行，本工具用于手动执行或 dry_run 预演',
+    parameters: {
+      dry_run: { type: 'boolean', description: '只报告将清理什么，不动盘（默认 false）' },
+    },
+    execute: async ({ dry_run = false }) => {
+      const r = await rt.backupGc.run({ dryRun: dry_run })
+      if (!r.ok) return { content: `❌ ${r.error.message}` }
+      const g = r.value
+      const freedBytes = g.purged.reduce((s, p) => s + p.bytes, 0)
+      const prefix = dry_run ? '🧪 GC 预演（未动盘）' : '🧹 备份 GC 完成'
+      if (g.purged.length === 0) {
+        const lines = [`${prefix}：无可清理项`]
+        if (g.skippedUnfinished > 0) {
+          lines.push(`   ${g.skippedUnfinished} 个未终结事务备份保留（永不淘汰，nuke_recover 可恢复）`)
+        }
+        if (g.skippedUnknown > 0) {
+          lines.push(`   ⚠️ ${g.skippedUnknown} 个状态不明事务备份跳过（WAL 缺失/损坏，fail-closed 保留现场）`)
+        }
+        if (g.retainedBytes > 0) {
+          lines.push(`   备份区现存 ${fmtBytes(g.retainedBytes)}（均在宽限期内）`)
+        }
+        return { content: lines.join('\n') }
+      }
+      const lines = [
+        `${prefix}：物理清理 ${g.purged.length} 个事务备份，释放 ${fmtBytes(freedBytes)}`,
+        `   台账结算（隔离 → 物理回收）: ${fmtBytes(g.settledBytes)}  |  备份区残余: ${fmtBytes(g.retainedBytes)}  |  耗时 ${g.durationMs}ms`,
+        '',
+        '─ 清理明细 ─',
+      ]
+      const reasonLabel: Record<string, string> = {
+        retention: '宽限期到期',
+        quota: '配额泄压',
+      }
+      for (const p of g.purged.slice(0, 20)) {
+        lines.push(`  ${dry_run ? '·' : '🗑️'} ${p.txId}  ${fmtBytes(p.bytes)}  ${reasonLabel[p.reason] ?? p.reason}`)
+      }
+      if (g.purged.length > 20) lines.push(`  …（其余 ${g.purged.length - 20} 个略）`)
+      if (g.skippedUnfinished > 0) {
+        lines.push('', `💡 ${g.skippedUnfinished} 个未终结事务备份保留（永不淘汰）。`)
+      }
+      if (g.skippedUnknown > 0) {
+        lines.push(`⚠️ ${g.skippedUnknown} 个状态不明事务备份跳过（WAL 缺失/损坏，fail-closed 保留现场）。`)
+      }
+      lines.push('', '说明：被清理的事务备份已不可恢复（墓碑记录在 backups/purged.jsonl）；宽限期与配额由 policy.json 的 backupRetentionDays / backupQuotaBytes 配置。')
       return { content: lines.join('\n') }
     },
   }))

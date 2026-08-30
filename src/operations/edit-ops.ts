@@ -43,6 +43,8 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
           skipped: true,
         }
       }
+      // 读取失败（EACCES/TOCTOU）直接抛出：plan()/dryRun() 均有逐 op 异常收敛，
+      // 异常会被转成 Result 上报而不会逃逸出契约
       const content = fs.readFileSync(file, 'utf-8')
       const next = removePluginFromYaml(content, spec.target)
       const touched = next === null ? [] : [file as AbsolutePath]
@@ -76,7 +78,14 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
           backup: null,
         })
       }
-      const content = fs.readFileSync(file, 'utf-8')
+      // 读盘纳入 err 收敛：execute 的 IO 失败走 Result 才能享受引擎的
+      // 瞬态重试（EMFILE/EAGAIN 类）；裸抛会绕过重试直达回滚
+      let content: string
+      try {
+        content = fs.readFileSync(file, 'utf-8')
+      } catch (e) {
+        return err(ioError(`${spec.description}: 读取配置失败`, e))
+      }
       const next = removePluginFromYaml(content, spec.target)
       if (next === null) {
         return ok({

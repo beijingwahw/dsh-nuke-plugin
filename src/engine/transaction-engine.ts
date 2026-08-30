@@ -7,10 +7,9 @@
 import * as crypto from 'crypto'
 import * as os from 'os'
 
-import type {
-  Clock, Result, TxId,
+import {
+  type Clock, type Result, type TxId, err, errorToMessage, ioError, isCleanAction, ok, SimulatedCrashError 
 } from '../contracts/base'
-import { err, errorToMessage, ioError, ok, SimulatedCrashError } from '../contracts/base'
 import {
   classifyFailureMode, DEFAULT_RETRY_POLICY, MODE_TRANSIENCE,
 } from '../contracts/failure.contract'
@@ -210,8 +209,12 @@ export function createTransactionEngine(
     // V5.7：undo 按执行逆序（LIFO）—— 与 manifest 恢复同一纪律。旧实现
     // 正序遍历：后执行者的 undo 依赖的"后置状态"会被先执行的 undo 提前
     // 破坏，补偿后状态与崩溃前不一致。
+    // V5.8：仅对已执行（done）的步骤调用 undo —— undo 的 null-backup 契约是
+    // "已执行但无备份"，未启动/被跳过的步骤触发补偿属于语义越界（依赖各 undo
+    // 实现自行判空的隐式约定不可靠）。
     const executedOps = new Map(rt.steps.filter(s => s.status === 'done').map(s => [s.operationId, s.backup]))
     for (const op of [...operationFactory(rt.request)].reverse()) {
+      if (!executedOps.has(op.id)) continue
       const backup = executedOps.get(op.id) ?? null
       try {
         const undo = await op.undo(ctx, backup)
@@ -404,7 +407,15 @@ export function createTransactionEngine(
 
       let total = 0
       for (const op of ops) {
-        const p = await op.preview(ctx)
+        // preview 做真实 IO（读 yaml/stat），IO 异常必须收敛为 Result：
+        // 若任其逃逸，plan() 直接 reject，事务停留在 planned 态且独占锁持续持有
+        //（dryRun 有同款防护，plan 是 Result 契约的最后一块拼图）
+        let p: Awaited<ReturnType<typeof op.preview>>
+        try {
+          p = await op.preview(ctx)
+        } catch (e) {
+          return err(ioError(`计划预演失败（操作 ${op.id}）`, e))
+        }
         rt.estimates.set(op.id, p.estimatedBytesReclaimable)
         total += p.estimatedBytesReclaimable
       }
@@ -464,11 +475,16 @@ export function createTransactionEngine(
         warnings: plan.warnings,
         ...(actions ? { actions } : {}),
       }
-      await deps.audit.append({
-        timestamp: deps.clock.now().toISOString(), actor: rt.request.actor, action: 'dry-run',
-        txId: plan.txId, outcome: 'success',
-        detail: { operations: reports.length, estimatedBytes: total },
-      })
+      // 审计是增强能力：dry-run 报告已就绪，审计 IO 故障只降级为日志（与 begin/commit 同一纪律）
+      try {
+        await deps.audit.append({
+          timestamp: deps.clock.now().toISOString(), actor: rt.request.actor, action: 'dry-run',
+          txId: plan.txId, outcome: 'success',
+          detail: { operations: reports.length, estimatedBytes: total },
+        })
+      } catch (e) {
+        deps.logger.warn('dry-run 审计追加失败', { tx: plan.txId, error: errorToMessage(e) })
+      }
       return ok(report)
     },
 
@@ -841,7 +857,12 @@ export function createTransactionEngine(
         .filter((r): r is Extract<typeof r, { type: 'step-done' }> => r.type === 'step-done')
         .map(r => ({
           index: r.index, operationId: r.operationId,
-          action: (actionByIndex.get(r.index) ?? 'standard-remove') as 'standard-remove',
+          // WAL 中的 action 名义上是 CleanAction，实际可能被篡改/来自旧版本 ——
+          // 经运行时守卫窄化，未知值诚实归入 standard-remove（诊断口径，非执行路径）
+          action: (() => {
+            const a = actionByIndex.get(r.index)
+            return isCleanAction(a) ? a : 'standard-remove' as const
+          })(),
           status: 'done' as const, bytesFreed: r.outcome.bytesFreed, backup: r.backup,
         }))
       const state: TxState = records.some(r => r.type === 'tx-commit') ? 'committed'

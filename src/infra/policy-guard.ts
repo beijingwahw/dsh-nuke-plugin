@@ -72,9 +72,9 @@ function parsePolicy(raw: unknown): ParsedPolicy {
   const obj = (raw ?? {}) as Partial<CleanPolicy>
   const issues: PolicyLoadIssue[] = []
 
-  // 数量上限三兄弟：非负有限整数，否则忽略 + 记录
+  // 数量上限四兄弟：非负有限整数，否则忽略 + 记录
   const numLimit = (
-    field: 'maxPluginsPerTx' | 'maxReclaimBytesPerTx' | 'minFreeDiskBytes' | 'maxFilesPerTx',
+    field: 'maxPluginsPerTx' | 'maxReclaimBytesPerTx' | 'minFreeDiskBytes' | 'maxFilesPerTx' | 'backupQuotaBytes',
   ): number | null => {
     const v = (obj as Record<string, unknown>)[field]
     if (v === undefined || v === null) return null
@@ -97,6 +97,27 @@ function parsePolicy(raw: unknown): ParsedPolicy {
       issues.push({
         field: 'blackout',
         problem: `畸形黑窗 { startHour: ${String(b.startHour)}, endHour: ${String(b.endHour)} }（小时必须是 0~23 的整数），该窗口已被忽略；请修正 policy.json`,
+      })
+    }
+  }
+
+  // 备份保留期（tri-state）：undefined = 未配置（GC 层用默认 14 天）；
+  // null = 显式关闭时间维度 GC；≥1 整数 = 自定义宽限期。0 会被拒绝 ——
+  // 0 天 = 提交即销毁备份，等于亲手拆掉回收区安全网（这正是本字段要防的）。
+  let backupRetentionDays: number | null | undefined
+  {
+    const v = (obj as Record<string, unknown>).backupRetentionDays
+    if (v === undefined) {
+      backupRetentionDays = undefined
+    } else if (v === null) {
+      backupRetentionDays = null
+    } else if (typeof v === 'number' && Number.isInteger(v) && v >= 1) {
+      backupRetentionDays = v
+    } else {
+      issues.push({
+        field: 'backupRetentionDays',
+        // eslint-disable-next-line @typescript-eslint/no-base-to-string -- 诊断信息容忍 [object Object]：值来自 JSON 解析，仅用于人工定位非法配置项
+        problem: `非法数值 ${String(v)}（必须是 ≥1 的整数天；显式 null = 关闭时间维度 GC），该项已被忽略（视为未配置）；请修正 policy.json`,
       })
     }
   }
@@ -143,6 +164,10 @@ function parsePolicy(raw: unknown): ParsedPolicy {
     blackout,
     ...(freezeWindows !== undefined ? { freezeWindows } : {}),
     maxFilesPerTx: numLimit('maxFilesPerTx'),
+    // V5.8 备份保留策略：retentionDays 的 tri-state（undefined/null/数值）
+    // 必须原样透传 —— GC 层需要区分"未配置（用默认）"与"显式关闭"。
+    ...(backupRetentionDays !== undefined ? { backupRetentionDays } : {}),
+    backupQuotaBytes: numLimit('backupQuotaBytes'),
   }
   return { policy, issues }
 }

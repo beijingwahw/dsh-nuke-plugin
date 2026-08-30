@@ -22,13 +22,28 @@ import type {
   AuditEntry, ChainVerification, IAuditLog, HashedAuditEntry,
 } from '../contracts/logging'
 
-import { readJsonl, writeJsonAtomic } from './fs-utils'
+import { readJsonl, writeAllSync, writeJsonAtomic } from './fs-utils'
 
 export interface AuditLogOptions {
   readonly filePath: string   // <dshHome>/.nuke/audit/chain.jsonl
 }
 
 const GENESIS = '0'.repeat(16)
+
+/** V5.8 尾部半行修复（构造时一次，字节精确）：append 中途崩溃（writeSync
+ *  部分完成）会残留无换行结尾的半行。不修复的后果：readAll 永久跳过它，
+ *  后续 append 追加在其后 —— 垃圾字节永久卡在链条中间（逐行容错使其
+ *  不可见），审计文件从此非规范化。截断到最后一个换行符恢复"每行一条
+ *  完整记录"的文件不变量；半行从未进入 tail 缓存，链尾/哨兵保持一致。
+ *  WAL 的 repairTail 同一纪律 —— 审计链是全局单文件，修复收进构造路径。 */
+function repairTailHalfLine(file: string): void {
+  try {
+    const buf = fs.readFileSync(file)
+    if (buf.length === 0 || buf[buf.length - 1] === 0x0a) return
+    const lastNl = buf.lastIndexOf(0x0a)
+    fs.truncateSync(file, lastNl >= 0 ? lastNl + 1 : 0)
+  } catch { /* 不可读：交由 readAll 的容错语义兜底（跳过半行） */ }
+}
 
 interface ChainHead {
   readonly seq: number
@@ -73,6 +88,8 @@ export interface AuditLogRuntime extends IAuditLog {
 export function createAuditLog(options: AuditLogOptions): AuditLogRuntime {
   fs.mkdirSync(path.dirname(options.filePath), { recursive: true })
   if (!fs.existsSync(options.filePath)) fs.writeFileSync(options.filePath, '')
+  // 修复先于链尾缓存加载：缓存必须建立在规范化文件之上
+  repairTailHalfLine(options.filePath)
 
   /** 链尾哨兵文件：独立记录最后一次 append 的 seq/hash。
    *  单独删除链文件尾部不会破坏剩余链的连续性（尾条目无后继引用），
@@ -150,7 +167,7 @@ export function createAuditLog(options: AuditLogOptions): AuditLogRuntime {
     // append 模式 + fdatasync：审计链物理上的追加不可改写
     const fd = fs.openSync(options.filePath, 'a')
     try {
-      fs.writeSync(fd, lines.join(''))
+      writeAllSync(fd, Buffer.from(lines.join(''), 'utf-8'))
       fs.fdatasyncSync(fd)
     } finally {
       fs.closeSync(fd)

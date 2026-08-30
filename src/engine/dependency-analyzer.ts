@@ -35,6 +35,11 @@ export interface IDependencyAnalyzerDetail extends IDependencyAnalyzer {
    *  filesRead = 实际读盘解析的文件数（新增/变更条目），
    *  cacheHits = 复用上次解析产物、跳过读盘解析的文件数 */
   cacheStats(): { readonly filesRead: number; readonly cacheHits: number }
+  /** 同步构建"插件 → 非 profile 引用方"索引（残留扫描的引用安全层数据源）。
+   *  profile: 合成节点不算引用 —— 清理流程的标准步骤会同步移除 profile 声明，
+   *  引用保护只关心"会被本次删除波及的其他真实插件"。
+   *  构建失败返回空 Map（降级为现状的孤儿口径，扫描本身不受阻）。 */
+  buildReferenceIndex(): ReadonlyMap<string, readonly PluginName[]>
 }
 
 export interface DependencyAnalyzerOptions {
@@ -358,6 +363,23 @@ export function createDependencyAnalyzer(options: DependencyAnalyzerOptions): ID
         return ok(buildGraph(profile))
       } catch (e) {
         return err(ioError('依赖图构建失败', e))
+      }
+    },
+
+    buildReferenceIndex(): ReadonlyMap<string, readonly PluginName[]> {
+      try {
+        const g = buildGraph()
+        const index = new Map<string, PluginName[]>()
+        for (const e of g.edges) {
+          // profile: 合成节点不是真实引用方（标准卸载步骤会移除声明）
+          if (e.from.startsWith('profile:')) continue
+          const list = index.get(e.to)
+          if (list === undefined) index.set(e.to, [e.from])
+          else if (!list.includes(e.from)) list.push(e.from)
+        }
+        return index
+      } catch {
+        return new Map()
       }
     },
 

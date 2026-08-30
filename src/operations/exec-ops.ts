@@ -9,7 +9,16 @@
 //      返回 err 而非挂死；重试耗尽仍超时同样 err
 //   3. 输出结构化 —— stdout/stderr/exitCode/durationMs/attempts 进入 preview（探针）
 //      与 execute（真实命令）的 detail，随 step-done 落 WAL/审计链
-import { spawnSync } from 'child_process'
+//
+// V5.8 升级：
+//   1. SIGTERM→SIGKILL 升级 —— spawnSync 的 timeout 只发一次 SIGTERM，忽略
+//      SIGTERM 的进程会让"5 分钟硬上限"失效（同步等待直到进程退出）。改用异步
+//      spawn：超时先 SIGTERM（优雅），KILL_GRACE_MS 宽限后 SIGKILL（不可忽略）
+//   2. 解析路径贯穿 —— validate 经注册表解析出的可执行实体（裸名/显式 env
+//      路径/救援绝对路径）由 execute 复用，消灭"探测的是 A、执行的是 B"
+//   3. spawn 错误码进消息 —— classifyFailureMode 按 `/spawn .* ENOENT/i` 归类
+//      dependency、EAGAIN 归类 resource，失败档案得到正确处方而非"未知根因"
+import { spawn } from 'child_process'
 
 import type { NukeError, PluginName, ProfileName, Result } from '../contracts/base'
 import { err, ok } from '../contracts/base'
@@ -27,32 +36,80 @@ export interface CommandResult {
   readonly stderr: string
   /** spawn 层错误（如 ENOENT/EAGAIN/ETIMEDOUT）；缺省 = 运行器未提供 */
   readonly error?: unknown
-  /** 子进程被信号终止时的信号名（spawnSync 超时默认 SIGTERM） */
+  /** 子进程被信号终止时的信号名（超时终止为 SIGTERM/SIGKILL） */
   readonly signal?: string | null
 }
 
+/** V5.8：运行器允许返回 Promise（默认实现改为异步 spawn 以支持 SIGKILL 升级）；
+ *  同步注入实现（测试桩/旧代码）天然兼容 —— 返回值协变无需改动 */
 export type CommandRunner = (
   cmd: string, args: readonly string[], opts: { cwd?: string; timeoutMs: number },
-) => CommandResult
+) => CommandResult | Promise<CommandResult>
 
-/** spawnSync 包装：归一化 stdout/stderr（spawn 失败时可能为 null），
- *  调用方拿到的永远是 string —— 消灭各调用点的 String(x || '') 兜底重复。
- *  V4：透传 error/signal 供瞬态判定与超时识别。 */
-export const defaultCommandRunner: CommandRunner = (cmd, args, opts) => {
-  const r = spawnSync(cmd, args, {
-    cwd: opts.cwd, encoding: 'utf-8', timeout: opts.timeoutMs,
+/** SIGTERM 宽限期：优雅终止窗口过后升级 SIGKILL（不可忽略、不可捕获） */
+export const KILL_GRACE_MS = 5_000
+
+/** 输出捕获的内存上限（与 spawnSync 默认 maxBuffer 同量级：失控进程在超时
+ *  窗口内的输出不允许无界膨胀；超出部分丢弃，最终截断到 MAX_CAPTURE_CHARS） */
+const MAX_STREAM_CHARS = 1_000_000
+
+/** 异步 spawn 包装（V5.8）：
+ *  - 归一化 stdout/stderr（spawn 失败时可能为 null）—— 调用方拿到的永远是 string
+ *  - 透传 error/signal 供瞬态判定与超时识别
+ *  - 超时纪律两段式：SIGTERM（优雅）→ KILL_GRACE_MS 宽限 → SIGKILL（硬终止）。
+ *    spawnSync 只发一次 SIGTERM，忽略 SIGTERM 的进程会让同步等待永久挂死，
+ *    "5 分钟硬上限"形同虚设 —— 本实现保证上限是真的上限
+ *  - 超时击杀归一化为 ETIMEDOUT 错误码（与 spawnSync 语义对齐，
+ *    上游 isTimedOut/isRetryable 无需感知实现差异） */
+export const defaultCommandRunner: CommandRunner = (cmd, args, opts) =>
+  new Promise<CommandResult>(resolve => {
+    const child = spawn(cmd, args, { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}) })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let escalationTimer: NodeJS.Timeout | null = null
+
+    const capture = (stream: NodeJS.ReadableStream | null, sink: (s: string) => void): void => {
+      if (stream === null) return
+      stream.setEncoding('utf-8')
+      stream.on('data', (chunk: string) => { sink(chunk) })
+    }
+    capture(child.stdout, s => { if (stdout.length < MAX_STREAM_CHARS) stdout += s })
+    capture(child.stderr, s => { if (stderr.length < MAX_STREAM_CHARS) stderr += s })
+
+    const finish = (r: CommandResult): void => {
+      if (settled) return
+      settled = true
+      if (escalationTimer !== null) clearTimeout(escalationTimer)
+      resolve(r)
+    }
+
+    const timeoutTimer = setTimeout(() => {
+      child.kill('SIGTERM')
+      escalationTimer = setTimeout(() => { child.kill('SIGKILL') }, KILL_GRACE_MS)
+    }, opts.timeoutMs)
+
+    child.on('error', err => {
+      clearTimeout(timeoutTimer)
+      finish({ status: null, stdout, stderr, error: err })
+    })
+    child.on('close', (code, signal) => {
+      clearTimeout(timeoutTimer)
+      const killedByTimeout = escalationTimer !== null
+      finish({
+        status: code,
+        stdout, stderr,
+        // 超时击杀（无干净退出码）→ 合成 ETIMEDOUT 错误码，语义与 spawnSync 对齐；
+        // 恰好在超时瞬间自然退出的竞态（code 非 null）→ 如实上报退出码
+        ...(killedByTimeout && code === null
+          ? {
+              error: Object.assign(new Error(`spawn ${cmd} ETIMEDOUT`), { code: 'ETIMEDOUT' }),
+              signal: signal ?? 'SIGTERM',
+            }
+          : signal !== null ? { signal } : {}),
+      })
+    })
   })
-  return {
-    status: r.status,
-    // 防御性归一化：spawn ENOENT 时 stdout/stderr 为 undefined（Node 类型未建模）
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部进程输出
-    stdout: r.stdout ?? '',
-    // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部进程输出
-    stderr: r.stderr ?? '',
-    ...(r.error !== undefined ? { error: r.error } : {}),
-    ...(r.signal !== null ? { signal: r.signal } : {}),
-  }
-}
 
 // ─── V4：瞬态重试与超时纪律 ─────────────────────────────────
 
@@ -121,7 +178,8 @@ export async function runCommandWithRetry(
   let last: CommandResult
   for (;;) {
     attempts++
-    last = run(cmd, args, { ...(opts.cwd ? { cwd: opts.cwd } : {}), timeoutMs })
+    // V5.8：运行器可异步（默认实现）—— await 对同步返回值同样安全
+    last = await run(cmd, args, { ...(opts.cwd ? { cwd: opts.cwd } : {}), timeoutMs })
     if (!isRetryable(last) || attempts > retry.maxRetries) break
     await sleep(Math.min(1_000, retry.baseDelayMs * 2 ** (attempts - 1)))
   }
@@ -174,10 +232,11 @@ function buildPrivateRegistry(
   })
 }
 
-/** 经注册表校验工具可用性（缺失 → 结构化错误，detail/fixHint 来自单一事实源） */
+/** 经注册表校验工具可用性（缺失 → 结构化错误，detail/fixHint 来自单一事实源；
+ *  成功 → 返回解析结果，调用方可将探测通过的同一可执行实体贯穿到 execute） */
 async function requireTool(
   registry: IToolRegistry, tool: string,
-): Promise<Result<void, NukeError & { details?: { resolution?: ToolResolution } }>> {
+): Promise<Result<ToolResolution, NukeError & { details?: { resolution?: ToolResolution } }>> {
   const res = await registry.resolve(tool)
   if (res.status === 'missing') {
     return err({
@@ -186,15 +245,20 @@ async function requireTool(
       details: { resolution: res },
     })
   }
-  return ok(undefined)
+  return ok(res)
 }
 
-/** 失败路径的统一错误构造：结构化捕获进 details（审计链可见） */
+/** 失败路径的统一错误构造：结构化捕获进 details（审计链可见）。
+ *  V5.8：spawn 层错误码进消息文本 —— classifyFailureMode 据此把
+ *  "spawn ENOENT" 归类 dependency（装包/修 PATH 的处方）、EAGAIN 归类
+ *  resource（瞬态、值得引擎重试），而非一律落进"未知根因" */
 function commandError(context: string, cap: CommandExecutionDetail): NukeError {
   const tail = (cap.stderr || cap.stdout).trim().slice(0, 200)
   const message = cap.timedOut
     ? `${context}超时（${cap.durationMs}ms / 上限 ${MAX_COMMAND_TIMEOUT_MS}ms 内未完成，fail-closed 拒绝）`
-    : `${context}失败（exit ${cap.exitCode}）: ${tail}`
+    : cap.exitCode === null
+      ? `${context}失败（进程未正常退出${cap.errorCode !== undefined ? `，spawn ${cap.cmd} ${cap.errorCode}` : ''}）${tail.length > 0 ? `: ${tail}` : ''}`
+      : `${context}失败（exit ${cap.exitCode}）: ${tail}`
   return {
     code: 'E_IO',
     message,
@@ -212,6 +276,10 @@ export function makeStandardRemoveOp(
   const retry = options.retry ?? DEFAULT_RETRY_POLICY
   // V5.2：CLI 解析委托注册表（共享实例优先，缺省私有组装 —— 语义只有一份）
   const registry = options.toolRegistry ?? buildPrivateRegistry(options, run, retry)
+  // V5.8：validate 解析出的可执行实体（裸名/显式 env 路径/救援绝对路径），
+  // execute 复用同一实体 —— 消灭"validate 经救援放行、execute 裸名再 ENOENT"
+  // 的语义裂缝。引擎保证 validate 先于 execute；操作实例单事务生命周期，无跨程泄漏
+  let resolvedExecPath: string | null = null
 
   return {
     id: `op-standard-remove:${target}`,
@@ -250,14 +318,17 @@ export function makeStandardRemoveOp(
           details: { violations: prof.error },
         })
       }
-      // V5.2：CLI 可用性委托工具注册表（显式 env → PATH → 救援三段式，语义单一事实源；
-      // 救援命中的绝对路径由 execute 阶段实际使用前的 runCommandWithRetry 复核）
-      return requireTool(registry, 'dsh')
+      // V5.2：CLI 可用性委托工具注册表（显式 env → PATH → 救援三段式，语义单一事实源）
+      // V5.8：解析成功的可执行实体 memo 给 execute —— 探测谁就执行谁
+      const tool = await requireTool(registry, 'dsh')
+      if (!tool.ok) return tool
+      resolvedExecPath = tool.value.path ?? 'dsh'
+      return ok(undefined)
     },
 
     async execute(): Promise<Result<ExecutedStep>> {
       const cap = await runCommandWithRetry(
-        run, 'dsh', ['plugin', '--profile', profile, 'remove', target], { timeoutMs }, retry,
+        run, resolvedExecPath ?? 'dsh', ['plugin', '--profile', profile, 'remove', target], { timeoutMs }, retry,
       )
       if (cap.exitCode !== 0) {
         return err(commandError('dsh 卸载', cap))
@@ -289,6 +360,8 @@ export function makePnpmPruneOp(
   const retry = options.retry ?? DEFAULT_RETRY_POLICY
   // V5.2：CLI 解析委托注册表（与 standard-remove 同一事实源）
   const registry = options.toolRegistry ?? buildPrivateRegistry(options, run, retry)
+  // V5.8：与 standard-remove 同一纪律 —— validate 探测谁，execute 就执行谁
+  let resolvedExecPath: string | null = null
 
   return {
     id: 'op-pnpm-store-prune:global',
@@ -312,12 +385,16 @@ export function makePnpmPruneOp(
 
     async validate(): Promise<Result<void>> {
       // V5.2：委托工具注册表（三段式：env 覆盖 → PATH → 救援；旗标差异不再误报）
-      return requireTool(registry, 'pnpm')
+      // V5.8：解析成功的可执行实体 memo 给 execute —— 探测谁就执行谁
+      const tool = await requireTool(registry, 'pnpm')
+      if (!tool.ok) return tool
+      resolvedExecPath = tool.value.path ?? 'pnpm'
+      return ok(undefined)
     },
 
     async execute(ctx): Promise<Result<ExecutedStep>> {
       const cap = await runCommandWithRetry(
-        run, 'pnpm', ['store', 'prune'], { cwd: profileDirOf(ctx), timeoutMs }, retry,
+        run, resolvedExecPath ?? 'pnpm', ['store', 'prune'], { cwd: profileDirOf(ctx), timeoutMs }, retry,
       )
       if (cap.exitCode !== 0) {
         return err(commandError('pnpm store prune', cap))

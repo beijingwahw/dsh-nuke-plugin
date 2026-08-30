@@ -20,6 +20,19 @@ export interface LedgerOptions {
 /** 聚合桶（内部可变累计器；输出前转换为只读 LedgerBreakdown） */
 interface Bucket { bytes: number; count: number }
 
+/** 形状守卫：磁盘行必须是合法 LedgerEntry —— "null"/"42" 等合法 JSON
+ *  直投条目会让 e.at.slice 抛 TypeError、让 bytes 累计变 NaN 毒化全部聚合；
+ *  不合格行与语法半行同纪律（跳过），聚合诚实性优先于行数完整性。 */
+function isLedgerEntry(v: unknown): v is LedgerEntry {
+  if (v === null || typeof v !== 'object') return false
+  const e = v as Record<string, unknown>
+  return (e.kind === 'freed' || e.kind === 'pending')
+    && typeof e.at === 'string'
+    && typeof e.action === 'string'
+    && typeof e.profile === 'string'
+    && typeof e.bytes === 'number' && Number.isFinite(e.bytes)
+}
+
 export function createLedger(options: LedgerOptions): ILedger {
   const file = path.join(options.historyDir, 'ledger.jsonl')
 
@@ -43,7 +56,7 @@ export function createLedger(options: LedgerOptions): ILedger {
   function readAll(): LedgerEntry[] {
     const stamp = statStamp()
     if (stamp === cachedStamp) return cachedEntries
-    const parsed = readJsonl<LedgerEntry>(file)
+    const parsed = readJsonl<LedgerEntry>(file, isLedgerEntry)
     // 可读性失败（权限等瞬态）不落缓存：下次调用仍会重试读盘
     if (parsed !== null) {
       cachedEntries = parsed

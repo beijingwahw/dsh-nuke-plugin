@@ -23,15 +23,25 @@ const EXACT_LIMIT = 16
 
 // ─── 子集评估（纯函数，数学唯一入口） ────────────────────────────
 
-/** 评估一个子集的双目标值（bits 为选中位掩码；顺序由候选数组下标承载） */
+/**
+ * 子集成员谓词：第 i 个候选（按数组下标）是否入选。
+ *
+ * 为什么不用位掩码（number）承载子集：JS 位运算按 mod 32 回绕，
+ * n ≥ 33 时第 i 位与第 i+32 位共享同一位 —— 清理 5 个插件即 n≈37，
+ * 掩码会在静默中损坏。exact 路径（n ≤ 16）仍用位运算实现谓词（数学安全
+ * 且性能最优），heuristic 路径用 Set 实现谓词，谓词本身成为唯一接口。
+ */
+type Membership = (i: number) => boolean
+
+/** 评估一个子集的双目标值（子集由成员谓词承载） */
 function evaluate(
   candidates: readonly CandidateAction[],
-  bits: number,
+  included: Membership,
 ): { p: number; w: number } {
   let p = 1
   let w = 0
   for (let i = 0; i < candidates.length; i++) {
-    if (bits & (1 << i)) {
+    if (included(i)) {
       const c = candidates[i]!
       p *= c.successProbability
       w += c.calibrationRatio * c.estimatedBytes
@@ -43,13 +53,13 @@ function evaluate(
 /** 评估并打包为前沿点（indices 升序 = 工厂序） */
 function toPoint(
   candidates: readonly CandidateAction[],
-  bits: number,
+  included: Membership,
 ): ParetoPoint {
-  const { p, w } = evaluate(candidates, bits)
+  const { p, w } = evaluate(candidates, included)
   const indices: number[] = []
   const actions: CandidateAction['action'][] = []
   for (let i = 0; i < candidates.length; i++) {
-    if (bits & (1 << i)) {
+    if (included(i)) {
       indices.push(candidates[i]!.index)
       actions.push(candidates[i]!.action)
     }
@@ -104,8 +114,9 @@ function paretoFront(points: readonly ParetoPoint[]): ParetoPoint[] {
 function solveExact(candidates: readonly CandidateAction[]): ParetoPoint[] {
   const n = candidates.length
   const points: ParetoPoint[] = []
+  // n ≤ EXACT_LIMIT（16），number 位掩码数学安全；谓词承载使其与 heuristic 路径同构
   for (let bits = 1; bits < (1 << n); bits++) {
-    points.push(toPoint(candidates, bits))
+    points.push(toPoint(candidates, i => (bits & (1 << i)) !== 0))
   }
   return paretoFront(points)
 }
@@ -129,11 +140,11 @@ function solveHeuristic(candidates: readonly CandidateAction[]): ParetoPoint[] {
   // 贪心剔除序列：从全集开始逐个剔除性价比最高者 → n 个嵌套子集
   //（删到单元素为止：空集 = "不清理"，不构成解）
   const keep = new Set<number>([...candidates.keys()])
-  const points: ParetoPoint[] = [toPoint(candidates, maskOf(keep, n))]
+  const points: ParetoPoint[] = [toPoint(candidates, i => keep.has(i))]
   for (const drop of order) {
     keep.delete(drop)
     if (keep.size === 0) break
-    points.push(toPoint(candidates, maskOf(keep, n)))
+    points.push(toPoint(candidates, i => keep.has(i)))
   }
   // 2-swap 局部改善：对每个贪心解尝试"换出一员 + 换入一员"，
   // 生成非支配新解补充前沿（O(n²) 每解，两轮内收敛）
@@ -147,7 +158,7 @@ function solveHeuristic(candidates: readonly CandidateAction[]): ParetoPoint[] {
           if (inSet.has(candidates[inn]!.index) || inn === out) continue
           const swapped = new Set([...inSet].filter(x => x !== candidates[out]!.index))
           swapped.add(candidates[inn]!.index)
-          points.push(toPoint(candidates, maskOf(swapped, n)))
+          points.push(toPoint(candidates, i => swapped.has(i)))
         }
       }
     }
@@ -155,21 +166,15 @@ function solveHeuristic(candidates: readonly CandidateAction[]): ParetoPoint[] {
   return paretoFront(points)
 }
 
-function maskOf(keep: ReadonlySet<number>, n: number): number {
-  let bits = 0
-  for (let i = 0; i < n; i++) if (keep.has(i)) bits |= 1 << i
-  return bits
-}
-
 // ─── 剔除理由（可解释性） ────────────────────────────────────────
 
 function dropReasons(
   candidates: readonly CandidateAction[],
-  recommendedBits: number,
+  recommendedIndices: ReadonlySet<number>,
 ): DropReason[] {
   const reasons: DropReason[] = []
   for (let i = 0; i < candidates.length; i++) {
-    if (recommendedBits & (1 << i)) continue
+    if (recommendedIndices.has(i)) continue
     const c = candidates[i]!
     const uplift = (1 / c.successProbability - 1) * 100
     const cost = c.calibrationRatio * c.estimatedBytes
@@ -234,17 +239,19 @@ export function optimize(
     return err({ code: 'E_VALIDATION', message: '优化器需要至少一个候选动作' })
   }
   const n = candidates.length
-  const fullBits = n >= 31 ? -1 >>> (32 - n) : (1 << n) - 1
   const solver: 'exact' | 'heuristic' = n <= EXACT_LIMIT ? 'exact' : 'heuristic'
   const frontier = solver === 'exact' ? solveExact(candidates) : solveHeuristic(candidates)
-  const fullSet = toPoint(candidates, fullBits)
+  const fullSet = toPoint(candidates, () => true)
   const recommended = selectByGoal(frontier, goal)
 
-  // 推荐点 → 位掩码（按工厂序 index 映射回候选下标）
+  // 推荐点 → 候选下标集合（按工厂序 index 映射回候选下标）
   const byIndex = new Map(candidates.map((c, i) => [c.index, i]))
-  let recBits = 0
-  for (const idx of recommended.indices) recBits |= 1 << byIndex.get(idx)!
-  const drops = dropReasons(candidates, recBits)
+  const recIndices = new Set<number>()
+  for (const idx of recommended.indices) {
+    const i = byIndex.get(idx)
+    if (i !== undefined) recIndices.add(i)
+  }
+  const drops = dropReasons(candidates, recIndices)
 
   const successUpliftPct = (recommended.successProbability - fullSet.successProbability) * 100
   const reclaimSacrificePct = fullSet.expectedReclaimBytes > 0

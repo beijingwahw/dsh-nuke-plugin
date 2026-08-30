@@ -10,6 +10,8 @@ import type {
   ActionReclaimStat, IReporter, ReportFormat, ReportPayload, ReportSummary,
 } from '../contracts/logging'
 
+import { writeTextAtomic } from './fs-utils'
+
 export interface ReporterOptions {
   readonly reportsRoot: string   // 通常 <dshHome>/.nuke/reports
   readonly now?: () => Date
@@ -158,7 +160,9 @@ export function createReporter(options: ReporterOptions): IReporter {
           // JSON 追加式扩展：旧字段原样保留，仅新增 summary 汇总统计键
           ? JSON.stringify({ ...payload, summary: buildSummary(payload) }, null, 2)
           : renderMarkdown(payload)
-        fs.writeFileSync(file, content, 'utf-8')
+        // 原子落盘（tmp+rename）：写一半崩溃不留半份报告 —— 报告是
+        // 事后审计材料，半份报告比没有报告更误导
+        writeTextAtomic(file, content)
         return ok({ path: file, bytes: Buffer.byteLength(content) })
       } catch (e) {
         return err(ioError('报告导出失败', e))

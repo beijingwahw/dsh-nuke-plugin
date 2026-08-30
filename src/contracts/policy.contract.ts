@@ -40,6 +40,11 @@ export function hitFreezeWindow(
   return null
 }
 
+/** V5.8 备份保留期缺省值（天）：已提交事务的备份在回收区至少保留的宽限期。
+ *  缺省值即安全网 —— 无策略文件时备份区不再是无界增长（磁盘回收工具
+ *  不能让自己的备份区先吃满磁盘）。 */
+export const DEFAULT_BACKUP_RETENTION_DAYS = 14
+
 export interface CleanPolicy {
   readonly version: 1
   readonly protectedPlugins: readonly string[]
@@ -52,6 +57,16 @@ export interface CleanPolicy {
   readonly freezeWindows?: readonly FreezeWindow[]
   /** V4 增量（可选）：单事务文件数上限（防单事务波及面失控）；缺省/null = 不限制 */
   readonly maxFilesPerTx?: number | null
+  /** V5.8 增量（可选）：已提交事务备份的保留宽限期（天）。
+   *  缺省 = DEFAULT_BACKUP_RETENTION_DAYS（14 天）；正整数 = 自定义宽限期；
+   *  显式 null = 关闭时间维度 GC（仅配额维度兜底，不建议）。
+   *  语义边界：commit 只证明"步骤成功无需补偿"，不证明"数据不再需要"——
+   *  下游破坏的暴露周期以天计，宽限期内 restore 是 O(1)，过期后不可逆。 */
+  readonly backupRetentionDays?: number | null
+  /** V5.8 增量（可选）：备份区空间配额（字节）。超限时按 mtime LRU 淘汰
+   *  最老的已终结事务备份（可提前于宽限期）；未终结事务永不因配额淘汰。
+   *  缺省/null = 不启用。配额是紧急泄压阀，宽限期是常规纪律。 */
+  readonly backupQuotaBytes?: number | null
 }
 
 export interface PolicyViolation {

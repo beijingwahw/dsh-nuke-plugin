@@ -27,6 +27,7 @@ import type { LedgerSummary } from '../src/contracts/ledger.contract'
 import type { CleanPolicy } from '../src/contracts/policy.contract'
 import type { OrphanReport } from '../src/contracts/scan'
 import type { ResidualEvidence } from '../src/contracts/scoring'
+import type { BackupGcReport } from '../src/contracts/transaction'
 import type { DrillMatrixReport } from '../src/engine/drill'
 import type { MonteCarloSummary, OracleReportDetail } from '../src/engine/oracle'
 import type { TrendReportDetail } from '../src/engine/trend-tracker'
@@ -44,7 +45,7 @@ const plugin = (s: string) => s as PluginName
 const profile = (s: string) => s as ProfileName
 const absPath = (s: string) => s as AbsolutePath
 
-/** 本插件 24 个工具均不消费 exec（无取消/嵌套分发），空对象即可满足契约 */
+/** 本插件 25 个工具均不消费 exec（无取消/嵌套分发），空对象即可满足契约 */
 const EXEC = {} as ToolRunContext
 
 /** skipLibCheck 下 ToolDefinition 的基类（来自未安装的 dsh-llm）成员
@@ -198,6 +199,13 @@ function makeRt(overrides: Record<string, unknown> = {}): Runtime {
         version: 1, protectedPlugins: [], maxPluginsPerTx: null,
         maxReclaimBytesPerTx: null, minFreeDiskBytes: null, blackout: null,
       })),
+      loadValidated: vi.fn(() => ({
+        policy: {
+          version: 1, protectedPlugins: [], maxPluginsPerTx: null,
+          maxReclaimBytesPerTx: null, minFreeDiskBytes: null, blackout: null,
+        } as CleanPolicy,
+        issues: [],
+      })),
       check: vi.fn(() => ok([])),
     },
     engine: {
@@ -273,6 +281,16 @@ function makeRt(overrides: Record<string, unknown> = {}): Runtime {
         linkedFiles: 0, bytesSaved: 0, journal: [], skipped: [], cancelled: false,
       })),
     },
+    // V5.8 备份保留策略：GC 默认"ok-空报告"（未清理任何事务）
+    backupGc: {
+      run: vi.fn(async (): Promise<Result<BackupGcReport>> => ok({
+        purged: [], skippedUnfinished: 0, skippedUnknown: 0,
+        retainedBytes: 0, settledBytes: 0, durationMs: 0,
+      })),
+    },
+    backups: {
+      tombstone: vi.fn(() => null),
+    },
   }
   return { ...defaults, ...overrides } as unknown as Runtime
 }
@@ -291,12 +309,12 @@ function registerAll(rtOverrides: Record<string, unknown> = {}): ToolHarness {
 // ─── 1. 注册完整性 ──────────────────────────────────────────
 
 describe('注册完整性', () => {
-  it('24 个工具全部注册且名称唯一', () => {
+  it('25 个工具全部注册且名称唯一', () => {
     const { defs } = registerAll()
     const names = [...defs.keys()]
-    // 5 感知 + 10 决策 + 3 执行 + 7 恢复保障
-    expect(names).toHaveLength(24)
-    expect(new Set(names).size).toBe(24)
+    // 5 感知 + 9 决策 + 3 执行 + 8 恢复保障（V5.8 +nuke_gc）
+    expect(names).toHaveLength(25)
+    expect(new Set(names).size).toBe(25)
     for (const n of names) expect(n).toMatch(/^nuke_[a-z]+$/)
   })
 
@@ -631,9 +649,32 @@ describe('决策域', () => {
     const out = await runTool(defs.get('nuke_policy')!, {})
     expect(out).toContain('保护名单')
     expect(out).toContain('单事务插件上限')
+    expect(out).toContain('单事务文件上限')
     expect(out).toContain('单事务回收上限')
     expect(out).toContain('磁盘余量下限')
     expect(out).toContain('时间黑窗')
+  })
+
+  it('nuke_policy：非法配置项被忽略时必须可见（绝不静默）', async () => {
+    const loadValidated = vi.fn(() => ({
+      policy: {
+        version: 1, protectedPlugins: ['keep-me'], maxPluginsPerTx: 5,
+        maxReclaimBytesPerTx: null, minFreeDiskBytes: null, blackout: null,
+      },
+      issues: [
+        { field: 'maxReclaimBytesPerTx', problem: '非法数值 -1（必须是非负整数），该项已被忽略（视为未配置）；请修正 policy.json' },
+        { field: 'blackout', problem: '畸形黑窗（小时必须是 0~23 的整数），该窗口已被忽略；请修正 policy.json' },
+      ],
+    }))
+    const { defs } = registerAll({
+      policy: { load: vi.fn(), loadValidated, check: vi.fn(() => ok([])) },
+    })
+    const out = await runTool(defs.get('nuke_policy')!, {})
+    expect(out).toContain('⚠️ 策略加载发现 2 项非法配置（已被忽略，视为未配置）')
+    expect(out).toContain('[maxReclaimBytesPerTx]')
+    expect(out).toContain('非法数值 -1')
+    expect(out).toContain('以上项目当前未生效')
+    expect(loadValidated).toHaveBeenCalled()
   })
 
   it('nuke_guardian：告警 + 建议行动 + 抑制窗口可见', async () => {
@@ -847,6 +888,63 @@ describe('执行域 nuke_clean', () => {
     expect(rt.trend.record).toHaveBeenCalled()               // 趋势快照
     expect(rt.ledger.record).toHaveBeenCalled()              // 空间台账
     expect(rt.reporter.export).toHaveBeenCalledTimes(1)      // 默认 markdown
+  })
+
+  it('V5.8 自动 GC：commit 路径顺带清理过期备份并体现在报告中', async () => {
+    const { defs, rt } = setup({
+      backupGc: { run: vi.fn(async (): Promise<Result<BackupGcReport>> => ok({
+        purged: [{ txId: 'deadbeefdeadbeef' as TxId, bytes: 8192, reason: 'retention' }],
+        skippedUnfinished: 0, skippedUnknown: 0,
+        retainedBytes: 0, settledBytes: 8192, durationMs: 3,
+      })) },
+    })
+    const out = await runTool(defs.get('nuke_clean')!, { plugin_names: ['demo-plugin'] })
+    expect(out).toContain('🧹 备份 GC：清理 1 个过期事务备份')
+    expect(out).toContain('台账结算 8.0KB')
+    expect(rt.backupGc.run).toHaveBeenCalledWith()           // 真实清理前自动触发
+  })
+
+  it('V5.8 自动 GC 失败 → 降级为提示，绝不阻断清理', async () => {
+    const { defs, rt } = setup({
+      backupGc: { run: vi.fn(async () => err(ioErr('锁被长期占用'))) },
+    })
+    const out = await runTool(defs.get('nuke_clean')!, { plugin_names: ['demo-plugin'] })
+    expect(out).toContain('⚠️ 备份 GC 未执行')
+    expect(out).toContain('不影响本次清理')
+    expect(rt.engine.commit).toHaveBeenCalled()              // 清理照常进行
+  })
+
+  it('V5.8 dry-run → GC 零副作用不触发', async () => {
+    const { defs, rt } = setup()
+    await runTool(defs.get('nuke_clean')!, { plugin_names: ['demo-plugin'], dry_run: true })
+    expect(rt.backupGc.run).not.toHaveBeenCalled()
+  })
+
+  it('V5.8 双轨记账：dir-move 步骤记 pending（隔离量 ≠ 物理回收）', async () => {
+    const { defs, rt } = setup({
+      engine: {
+        ...makeRt().engine as object,
+        commit: vi.fn(async () => ok({
+          txId: TX_ID, state: 'committed' as const,
+          steps: [{
+            index: 1, operationId: 'op-1', action: 'remove-storages' as const,
+            status: 'done' as const, bytesFreed: 4096,
+            backup: {
+              operationId: 'op-1', kind: 'dir-move' as const,
+              originalPath: absPath('/x'), backupPath: absPath('/b/x'),
+              fingerprint: 'f' as never,
+            },
+          }],
+          bytesFreedTotal: 4096, startedAt: '', finishedAt: '',
+        })),
+      },
+    })
+    const out = await runTool(defs.get('nuke_clean')!, { plugin_names: ['demo-plugin'] })
+    expect(out).toContain('实际回收: 0B')                    // 隔离量不计入物理回收
+    expect(out).toContain('已隔离进备份区')
+    expect(rt.ledger.record).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: 'pending', bytes: 4096, action: 'remove-storages' }),
+    )
   })
 
   it('commit 失败 → 已自动回滚文案（引擎内部 Saga 已补偿）', async () => {
@@ -1083,6 +1181,27 @@ describe('恢复保障域', () => {
     expect(found).toContain('remove-node-modules')
   })
 
+  it('nuke_status：墓碑语义 —— 已被 GC 清理的备份精确回答何时因何不可恢复', async () => {
+    const h = makeCtx()
+    const rt = makeRt({
+      engine: {
+        ...makeRt().engine as object,
+        status: vi.fn(async () => ({
+          txId: TX_ID, state: 'committed', steps: [], bytesFreedTotal: 0,
+          startedAt: 't0', finishedAt: 't1',
+        })),
+      },
+      backups: { tombstone: vi.fn(() => ({
+        txId: TX_ID, purgedAt: '2026-01-15T00:00:00Z', reason: 'retention', bytes: 4096,
+      })) },
+    })
+    registerRecoveryTools(h.ctx, rt)
+    const out = await runTool(h.defs.get('nuke_status')!, { tx_id: 'a1b2c3d4e5f60718' })
+    expect(out).toContain('备份已于 2026-01-15T00:00:00Z 清理')
+    expect(out).toContain('宽限期到期')
+    expect(out).toContain('不可再恢复')
+  })
+
   it('nuke_status：无参清单模式 —— 活跃 + 崩溃残留合并视图，残留时提示 recover', async () => {
     const { defs } = setup()
     const empty = await runTool(defs.get('nuke_status')!, {})
@@ -1163,6 +1282,60 @@ describe('恢复保障域', () => {
     const out = await runTool(h2.defs.get('nuke_verify')!, {})
     expect(out).toContain('🚨')
     expect(out).toContain('seq=4')
+  })
+
+  it('nuke_gc：无可清理项的诚实空态（不谎报战绩）', async () => {
+    const { defs } = setup()
+    const out = await runTool(defs.get('nuke_gc')!, {})
+    expect(out).toContain('备份 GC 完成')
+    expect(out).toContain('无可清理项')
+  })
+
+  it('nuke_gc：清理明细 + 原因标注 + 未终结保留提示', async () => {
+    const h = makeCtx()
+    const rt = makeRt({ backupGc: {
+      run: vi.fn(async (): Promise<Result<BackupGcReport>> => ok({
+        purged: [
+          { txId: 'a1b2c3d4e5f60718' as TxId, bytes: 1024, reason: 'retention' },
+          { txId: 'deadbeefdeadbeef' as TxId, bytes: 2048, reason: 'quota' },
+        ],
+        skippedUnfinished: 1, skippedUnknown: 0,
+        retainedBytes: 4096, settledBytes: 3072, durationMs: 12,
+      })),
+    } })
+    registerRecoveryTools(h.ctx, rt)
+    const out = await runTool(h.defs.get('nuke_gc')!, {})
+    expect(out).toContain('物理清理 2 个事务备份')
+    expect(out).toContain('a1b2c3d4e5f60718')
+    expect(out).toContain('宽限期到期')
+    expect(out).toContain('配额泄压')
+    expect(out).toContain('1 个未终结事务备份保留')
+    expect(out).toContain('墓碑')
+  })
+
+  it('nuke_gc：dry_run=true → 预演口径且 dryRun 参数透传', async () => {
+    const h = makeCtx()
+    const run = vi.fn(async (): Promise<Result<BackupGcReport>> => ok({
+      purged: [{ txId: 'a1b2c3d4e5f60718' as TxId, bytes: 1024, reason: 'retention' }],
+      skippedUnfinished: 0, skippedUnknown: 0,
+      retainedBytes: 0, settledBytes: 1024, durationMs: 1,
+    }))
+    const rt = makeRt({ backupGc: { run } })
+    registerRecoveryTools(h.ctx, rt)
+    const out = await runTool(h.defs.get('nuke_gc')!, { dry_run: true })
+    expect(out).toContain('GC 预演（未动盘）')
+    expect(run).toHaveBeenCalledWith({ dryRun: true })
+  })
+
+  it('nuke_gc：GC 失败 → ❌ 且不抛异常', async () => {
+    const h = makeCtx()
+    const rt = makeRt({ backupGc: {
+      run: vi.fn(async () => err(ioErr('全局锁被长期占用'))),
+    } })
+    registerRecoveryTools(h.ctx, rt)
+    const out = await runTool(h.defs.get('nuke_gc')!, {})
+    expect(out).toContain('❌')
+    expect(out).toContain('全局锁被长期占用')
   })
 
   it('nuke_doctor：处方 + 环境矩阵', async () => {

@@ -94,6 +94,25 @@ export type CleanAction =
   | 'pnpm-store-prune'
   | 'purge-temp'           // V4 新增：TEMP 目录孤儿清理
 
+/** CleanAction 的运行时白名单 —— 类型联合的值级伴随。
+ *  磁盘数据（WAL/审计链）中的 action 字段名义上是 CleanAction，
+ *  实际可能被篡改或来自旧版本；读侧窄化必须经此守卫而非 as 断言。 */
+export const CLEAN_ACTIONS: readonly CleanAction[] = [
+  'standard-remove',
+  'clean-workspace-yaml',
+  'clean-profile-patch',
+  'clean-home-patch',
+  'remove-node-modules',
+  'remove-storages',
+  'remove-attachments',
+  'pnpm-store-prune',
+  'purge-temp',
+]
+
+export function isCleanAction(v: unknown): v is CleanAction {
+  return typeof v === 'string' && (CLEAN_ACTIONS as readonly string[]).includes(v)
+}
+
 // ─── 可注入时钟：单元测试的时间可控性 ────────────────────────
 export interface Clock {
   now(): Date
@@ -101,13 +120,16 @@ export interface Clock {
 
 export type Unsubscribe = () => void
 
-/** 全项目唯一的字节数人性化格式化（B/KB/MB/GB）。
- *  此前 severity-scorer 与 reporter 各持一份相同实现 —— 统一到契约层。 */
+/** 全项目唯一的字节数人性化格式化（B/KB/MB/GB/TB）。
+ *  此前 severity-scorer 与 reporter 各持一份相同实现 —— 统一到契约层。
+ *  与 fmtDuration 同一防御口径：非有限数/负数 → 'n/a'（NaN 会输出 "NaNGB"）。 */
 export function fmtBytes(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return 'n/a'
   if (n < 1024) return `${n}B`
   if (n < 1024 ** 2) return `${(n / 1024).toFixed(1)}KB`
   if (n < 1024 ** 3) return `${(n / 1024 ** 2).toFixed(1)}MB`
-  return `${(n / 1024 ** 3).toFixed(2)}GB`
+  if (n < 1024 ** 4) return `${(n / 1024 ** 3).toFixed(2)}GB`
+  return `${(n / 1024 ** 4).toFixed(2)}TB`
 }
 
 /** V5.4：耗时格式化（ms → 人类可读）。与 fmtBytes 同层：

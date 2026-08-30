@@ -65,6 +65,19 @@ describe('趋势记录与分析', () => {
     if (r.ok) expect(r.value.bytesPerDay).toBeLessThan(0)
   })
 
+  it('形状守卫：null/数字行跳过，analyze 不抛 TypeError', async () => {
+    const { tracker: t, dir } = tracker()
+    await t.record(snap(T0, 1000))
+    await t.record(snap(T0 + DAY, 2000))
+    // null 行：旧实现 filter(s => s.profile) 访问 null.profile 抛 TypeError
+    fs.appendFileSync(path.join(dir, 'trend.jsonl'), 'null\n42\n')
+    const r = await t.analyze()
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.snapshotCount).toBe(2)
+    expect(Math.round(r.value.bytesPerDay)).toBe(1000)
+  })
+
   it('末值 3σ 突增 → 异常检出', async () => {
     const { tracker: t } = tracker()
     // 前四点完美线性，末点暴增 → 残差远超 3σ

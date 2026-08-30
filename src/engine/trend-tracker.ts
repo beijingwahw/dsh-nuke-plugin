@@ -170,6 +170,17 @@ function robustSigma(values: readonly number[]): number {
   return 1.4826 * median(values.map(v => Math.abs(v - med)))
 }
 
+/** 快照形状守卫：JSON.parse 只拦语法错误，"null"/"42" 等合法 JSON 直投
+ *  TrendSnapshot 后，下游 s.profile 过滤/s.at.localeCompare 会抛 TypeError
+ *  使整个 analyze 失败 —— 单条坏行不该有一票否决权。 */
+function isTrendSnapshot(v: unknown): v is TrendSnapshot {
+  if (v === null || typeof v !== 'object') return false
+  const s = v as Record<string, unknown>
+  return typeof s.at === 'string'
+    && typeof s.bytesReclaimable === 'number'
+    && typeof s.profile === 'string'
+}
+
 /** 快照净化：JSONL 历史可能含损坏/陈旧格式条目（缺字段、非法日期、非有限数）。
  *  NaN 是传染性的 —— 一个坏点会让 slope/σ̂/预测全部变 NaN，进而污染
  *  daysUntilFull 与异常告警。在入口整条剔除，宁缺毋滥。 */
@@ -338,7 +349,7 @@ function detectChangepoints(
 
 export function createTrendTracker(options: TrendTrackerOptions): ITrendTrackerDetail {
   const file = path.join(options.historyDir, 'trend.jsonl')
-  const readAll = (): TrendSnapshot[] => readJsonl<TrendSnapshot>(file) ?? []
+  const readAll = (): TrendSnapshot[] => readJsonl<TrendSnapshot>(file, isTrendSnapshot) ?? []
   const halfLifeMs = (options.halfLifeDays ?? DEFAULT_HALF_LIFE_DAYS) * MS_PER_DAY
   const cusumWarmup = options.cusumWarmup ?? DEFAULT_CUSUM_WARMUP
   const cusumThresholdSigmas = options.cusumThresholdSigmas ?? DEFAULT_CUSUM_THRESHOLD_SIGMAS

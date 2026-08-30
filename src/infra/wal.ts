@@ -7,7 +7,7 @@ import type { Result, TxId } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type { IWal, WalRecord } from '../contracts/transaction'
 
-import { fsyncDir } from './fs-utils'
+import { fsyncDir, writeAllSync } from './fs-utils'
 
 export interface WalOptions {
   readonly walRoot: string   // <dshHome>/.nuke/tx
@@ -176,7 +176,7 @@ export function createWal(options: WalOptions): WalRuntime {
       const existed = fs.existsSync(p)
       const fd = fs.openSync(p, 'a')
       try {
-        fs.writeSync(fd, line + '\n')
+        writeAllSync(fd, Buffer.from(line + '\n', 'utf-8'))
         fs.fdatasyncSync(fd)
       } finally {
         fs.closeSync(fd)
@@ -335,7 +335,7 @@ export function createWal(options: WalOptions): WalRuntime {
         try {
           const fd = fs.openSync(target, 'a')
           try {
-            fs.writeSync(fd, '\n')
+            writeAllSync(fd, Buffer.from('\n', 'utf-8'))
             fs.fdatasyncSync(fd)
           } finally {
             fs.closeSync(fd)

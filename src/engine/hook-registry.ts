@@ -58,7 +58,9 @@ export function createHookRegistry(options: HookRegistryOptions): HookRegistryIn
     ctx: HookContext,
   ): Promise<{ ok: boolean; message: string }> {
     return new Promise(resolve => {
-      const bin = handler.argv[0] ?? ''
+      // 与白名单校验同一归一化口径：'node.exe' 剥离后过白名单，执行也用剥离名
+      //（否则 Windows 名字过白名单、POSIX 上 execFile('node.exe') 必然 ENOENT）
+      const bin = (handler.argv[0] ?? '').replace(/\.exe$/i, '')
       const env: Record<string, string> = { PATH: process.env.PATH ?? '' }
       for (const key of handler.envWhitelist) {
         const v = process.env[key]
@@ -226,14 +228,22 @@ export function createHookRegistry(options: HookRegistryOptions): HookRegistryIn
             if (typeof d !== 'object' || d === null) continue
             const def = d as Partial<HookDefinition> & { timeoutMs?: unknown }
             if (typeof def.timing !== 'string' || typeof def.onFailure !== 'string') continue
+            // actions 是 emit 的热路径依赖（d.actions.includes(ctx.action)）：
+            // 缺失或形态非法的条目注册后必然在 emit 时抛 TypeError，这里前置拦截
+            if (def.actions !== '*'
+              && !(Array.isArray(def.actions) && def.actions.every(a => typeof a === 'string'))) continue
             if (def.handler?.type === 'command') {
               const argv = def.handler.argv
               if (!Array.isArray(argv) || argv.length === 0 || !argv.every(a => typeof a === 'string')) continue
               if (/[\\/]/.test(argv[0] ?? '')) continue   // 路径形式一律拒绝
               if (!Array.isArray(def.handler.envWhitelist)) continue
               if (typeof def.handler.timeoutMs !== 'number') continue
-            } else if (def.handler?.type !== 'inline') {
-              continue   // inline 函数无法从 JSON 反序列化，跳过
+            } else {
+              // inline 钩子的函数体（run）无法从 JSON 反序列化 —— JSON 只能表达数据，
+              // 反序列化出的 {type:'inline'} 没有 run，注册后 emit 必抛
+              // "run is not a function"；未知 handler 类型同样拒绝。
+              // 磁盘钩子只承载 command 形态。
+              continue
             }
             // V5：注册级超时（若存在）必须是正有限数，否则整条丢弃（磁盘数据不可信）
             if (def.timeoutMs !== undefined && (typeof def.timeoutMs !== 'number' || !Number.isFinite(def.timeoutMs) || def.timeoutMs <= 0)) continue

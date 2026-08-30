@@ -9,15 +9,18 @@ import * as path from 'path'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 
 import type { PluginName, ProfileName, TxId } from '../src/contracts/base'
+import { classifyFailureMode } from '../src/contracts/failure.contract'
 import { hitFreezeWindow, NO_FREEZE_WINDOWS } from '../src/contracts/policy.contract'
 import type { BackupArea, TxContext, DryRunReport } from '../src/contracts/transaction'
 import { createBackupStore } from '../src/infra/backup-store'
 import { createLogger } from '../src/infra/logger'
 import { createPathResolver } from '../src/infra/path-resolver'
+import { createToolRegistry } from '../src/infra/tool-registry'
 import { createValidator } from '../src/infra/validator'
 import { configEditOps } from '../src/operations/edit-ops'
 import {
-  MAX_COMMAND_TIMEOUT_MS, makePnpmPruneOp, makeStandardRemoveOp,
+  defaultCommandRunner, KILL_GRACE_MS, MAX_COMMAND_TIMEOUT_MS, makePnpmPruneOp,
+  makeStandardRemoveOp, runCommandWithRetry,
   type CommandResult, type CommandRunner,
 } from '../src/operations/exec-ops'
 import { DEFAULT_IMPACT_TOP_N, dirRemoveOps, makeDirRemoveOp } from '../src/operations/fs-ops'
@@ -241,6 +244,136 @@ describe('exec-ops 结构化输出（stdout/stderr/exitCode/durationMs）', () =
     const cap = r.error.details?.command as { stderr: string }
     expect(cap.stderr.length).toBe(4_000)
   })
+})
+
+// ─── exec-ops V5.8：解析路径贯穿 ────────────────────────────
+
+describe('exec-ops 解析路径贯穿（探测谁就执行谁）', () => {
+  it('validate 经救援命中的绝对路径被 execute 复用（裸名 ENOENT 裂缝消除）', async () => {
+    const run = scriptRun([errnoResult('ENOENT'), okResult(), okResult()])
+    const op = makeStandardRemoveOp(VICTIM, PROFILE, {
+      validator: createValidator(), runCommand: run, retry: FAST_RETRY,
+      // 注入解析器：模拟宿主 PATH 缺口（裸名 ENOENT → 救援目录命中）
+      resolveCommand: () => ({ path: '/rescue/bin/dsh', dir: '/rescue/bin' }),
+    })
+    const v = await op.validate(ctx)
+    expect(v.ok).toBe(true)
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(true)
+    // 调用序列：裸名探针(ENOENT) → 救援路径探针(ok) → 真实执行（必须是救援路径）
+    expect(run.calls.map(c => c.cmd)).toEqual(['dsh', '/rescue/bin/dsh', '/rescue/bin/dsh'])
+    if (!r.ok) return
+    expect(r.value.outcome.command?.cmd).toBe('/rescue/bin/dsh')
+  })
+
+  it('pnpm prune 同一纪律：救援路径贯穿 validate → execute', async () => {
+    const run = scriptRun([errnoResult('ENOENT'), okResult(), okResult()])
+    const op = makePnpmPruneOp(PROFILE, () => '/anywhere', {
+      validator: createValidator(), runCommand: run, retry: FAST_RETRY,
+      resolveCommand: () => ({ path: '/rescue/bin/pnpm', dir: '/rescue/bin' }),
+    })
+    const v = await op.validate(ctx)
+    expect(v.ok).toBe(true)
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(true)
+    expect(run.calls.map(c => c.cmd)).toEqual(['pnpm', '/rescue/bin/pnpm', '/rescue/bin/pnpm'])
+  })
+
+  it('显式 env 覆盖路径同样贯穿（探测的是用户指定实体）', async () => {
+    const run = scriptRun([okResult(), okResult()])
+    const op = makeStandardRemoveOp(VICTIM, PROFILE, {
+      validator: createValidator(), runCommand: run, retry: FAST_RETRY,
+      toolRegistry: createToolRegistry({
+        env: { ...process.env, DSH_BIN: '/explicit/bin/dsh' },
+        probe: () => ({ status: 0, stdout: 'dsh 2.1.0\n', stderr: '' }),
+      }),
+    })
+    const v = await op.validate(ctx)
+    expect(v.ok).toBe(true)
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.outcome.command?.cmd).toBe('/explicit/bin/dsh')
+  })
+})
+
+// ─── exec-ops V5.8：spawn 错误码进消息 ──────────────────────
+
+describe('exec-ops 失败消息携带 spawn 错误码（失败分类学可读）', () => {
+  it('ENOENT：消息采用 Node 原生 "spawn <cmd> ENOENT" 格式，命中 dependency（而非 unknown）', async () => {
+    const run = scriptRun([errnoResult('ENOENT')])
+    const op = makeStandardRemoveOp(VICTIM, PROFILE, {
+      validator: createValidator(), runCommand: run, retry: FAST_RETRY,
+    })
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.message).toContain('spawn dsh ENOENT')
+    expect(classifyFailureMode(r.error.message)).toBe('dependency')
+  })
+
+  it('EAGAIN：消息含错误码，classifyFailureMode 命中 resource（瞬态、值得重试）', async () => {
+    const run = scriptRun([errnoResult('EAGAIN'), errnoResult('EAGAIN'), errnoResult('EAGAIN')])
+    const op = makeStandardRemoveOp(VICTIM, PROFILE, {
+      validator: createValidator(), runCommand: run, retry: FAST_RETRY,
+    })
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(false)
+    if (r.ok) return
+    expect(r.error.message).toContain('EAGAIN')
+    expect(classifyFailureMode(r.error.message)).toBe('resource')
+  })
+})
+
+// ─── exec-ops V5.8：默认运行器（异步 spawn + SIGKILL 升级） ──
+
+describe('exec-ops 默认运行器（SIGTERM→SIGKILL 升级）', () => {
+  const NO_RETRY = { maxRetries: 0, baseDelayMs: 1 }
+
+  it('快速命令：结构化捕获与同步语义一致', async () => {
+    const cap = await runCommandWithRetry(
+      defaultCommandRunner, process.execPath, ['-e', 'console.log("probe-ok")'],
+      { timeoutMs: 5_000 }, NO_RETRY,
+    )
+    expect(cap.exitCode).toBe(0)
+    expect(cap.stdout).toContain('probe-ok')
+    expect(cap.timedOut).toBe(false)
+  }, 15_000)
+
+  it('命令不存在：error 事件收敛为 ENOENT 错误码（与 spawnSync 语义对齐）', async () => {
+    const cap = await runCommandWithRetry(
+      defaultCommandRunner, 'definitely-not-a-command-xyz', ['--version'],
+      { timeoutMs: 5_000 }, NO_RETRY,
+    )
+    expect(cap.exitCode).toBeNull()
+    expect(cap.errorCode).toBe('ENOENT')
+  }, 15_000)
+
+  // POSIX 专属：用 sh 的 trap/exec 构造确定性的信号语义场景
+  // （node 子进程的启动竞态 —— SIGTERM 可能在用户脚本注册 handler 前到达 —— 会让测试不稳定）
+  it.skipIf(process.platform === 'win32')('响应 SIGTERM 的进程：超时被优雅终止，不付宽限期代价', async () => {
+    const cap = await runCommandWithRetry(
+      defaultCommandRunner, 'sh', ['-c', 'exec sleep 600'],
+      { timeoutMs: 150 }, NO_RETRY,
+    )
+    expect(cap.timedOut).toBe(true)
+    expect(cap.exitCode).toBeNull()
+    expect(cap.errorCode).toBe('ETIMEDOUT')
+    expect(cap.durationMs).toBeLessThan(KILL_GRACE_MS)
+  }, 15_000)
+
+  it.skipIf(process.platform === 'win32')('忽略 SIGTERM 的进程：宽限期后 SIGKILL 强杀，超时硬上限是真的上限', async () => {
+    // trap '' TERM 将 SIGTERM 置为 SIG_IGN，exec 后处置保持（POSIX）—— 单进程、启动即生效
+    const cap = await runCommandWithRetry(
+      defaultCommandRunner, 'sh', ['-c', "trap '' TERM; exec sleep 600"],
+      { timeoutMs: 150 }, NO_RETRY,
+    )
+    expect(cap.exitCode).toBeNull()
+    expect(cap.timedOut).toBe(true)
+    // 150ms 超时 + 5s 宽限 ≈ 5.15s，严格有界 —— spawnSync 在此场景会永久挂死
+    expect(cap.durationMs).toBeGreaterThanOrEqual(KILL_GRACE_MS)
+    expect(cap.durationMs).toBeLessThan(KILL_GRACE_MS + 10_000)
+  }, 20_000)
 })
 
 // ─── fs-ops：top-N 影响面明细 ──────────────────────────────

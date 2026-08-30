@@ -58,6 +58,17 @@ export function existsSafe(p: string): boolean {
   try { return fs.existsSync(p) } catch { return false }
 }
 
+/** 全量写入（V5.8）：POSIX write(2) 允许短写（缓冲过大/被信号打断/
+ *  磁盘将满），fs.writeSync 不会自动补齐 —— 不循环就会静默截断。
+ *  全项目唯一的"写满"实现：WAL/审计链/备份 manifest/锁文件的追加与
+ *  覆写全部经此，杜绝各调用点自行处理（或遗忘）短写。 */
+export function writeAllSync(fd: number, buf: Buffer): void {
+  let written = 0
+  while (written < buf.length) {
+    written += fs.writeSync(fd, buf, written, buf.length - written)
+  }
+}
+
 /** statfs 磁盘采样（Node ≥18.15）：free = bsize×bavail，total = bsize×blocks。
  *  旧 Node（API 缺失抛 TypeError）/ 无权限 / 路径不存在 → null（fail-soft，
  *  调用方按"磁盘信息不可用"降级，绝不阻断主流程）。全项目唯一实现。 */
@@ -114,16 +125,26 @@ export function writeJsonAtomic(file: string, value: unknown): void {
 /**
  * 容错式 JSONL 读取：逐行解析，损坏行（含崩溃残留的尾部半行）跳过。
  * 返回 null 表示文件不存在/不可读。
+ *
+ * 形状守卫（V5.8）：JSON.parse 只拦语法错误 —— "null" / "42" / "\"text\""
+ * 都是合法 JSON，直投 T 后下游字段访问会抛 TypeError（null.profile）或
+ * 静默产出 NaN（undefined += number）毒化聚合。传入 guard 的行做形状
+ * 校验，不合格行与语法损坏行同纪律：整条跳过（宁缺毋滥）。
  */
-// eslint-disable-next-line @typescript-eslint/no-unnecessary-type-parameters -- JSON 解析边界：调用方以 readJsonl<T> 声明对磁盘数据的预期形状，T 单次出现在返回位是该模式的固有形态
-export function readJsonl<T>(file: string): T[] | null {
+export function readJsonl<T>(
+  file: string,
+  guard?: (v: unknown) => v is T,
+): T[] | null {
   let text: string
   try { text = fs.readFileSync(file, 'utf-8') } catch { return null }
   const out: T[] = []
   for (const line of text.split('\n')) {
     const trimmed = line.trim()
     if (!trimmed) continue
-    try { out.push(JSON.parse(trimmed) as T) } catch { /* 半行容错 */ }
+    try {
+      const v: unknown = JSON.parse(trimmed)
+      if (guard === undefined || guard(v)) out.push(v as T)
+    } catch { /* 半行容错 */ }
   }
   return out
 }

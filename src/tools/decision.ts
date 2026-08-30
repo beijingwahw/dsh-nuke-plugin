@@ -10,6 +10,7 @@ import type { ForecastSeverity } from '../contracts/disk-forecast.contract'
 import { MODE_PRESCRIPTIONS } from '../contracts/failure.contract'
 import type { AlertSeverity } from '../contracts/guardian.contract'
 import type { OracleConfidence } from '../contracts/oracle.contract'
+import { DEFAULT_BACKUP_RETENTION_DAYS } from '../contracts/policy.contract'
 import type { TrendTrigger } from '../contracts/trend.contract'
 import { createPredictionScorer } from '../infra/prediction-score'
 import { createReliabilityModel } from '../infra/reliability'
@@ -420,13 +421,37 @@ export function registerDecisionTools(ctx: Context, rt: Runtime): void {
     description: '查看当前清理策略守卫配置（保护名单/批量上限/回收上限/磁盘下限/时间黑窗）。策略文件: <dshHome>/.nuke/policy.json',
     parameters: {},
     execute: async () => {
-      const p = rt.policy.load()
+      // loadValidated 而非 load：非法配置项被忽略时必须可见（"绝不静默
+      // 接受非法配置"的承诺需要出口 —— 策略查看工具就是那个出口）
+      const report = rt.policy.loadValidated()
+      const p = report.policy
       const lines = ['🛡️ 当前清理策略（policy.json）:',]
       lines.push(`  保护名单: ${p.protectedPlugins.length > 0 ? p.protectedPlugins.join(', ') : '（空）'}`)
       lines.push(`  单事务插件上限: ${p.maxPluginsPerTx ?? '无限制'}`)
+      lines.push(`  单事务文件上限: ${p.maxFilesPerTx !== null && p.maxFilesPerTx !== undefined ? String(p.maxFilesPerTx) : '无限制'}`)
       lines.push(`  单事务回收上限: ${p.maxReclaimBytesPerTx !== null ? fmtBytes(p.maxReclaimBytesPerTx) : '无限制'}`)
       lines.push(`  磁盘余量下限: ${p.minFreeDiskBytes !== null ? fmtBytes(p.minFreeDiskBytes) : '不检查'}`)
       lines.push(`  时间黑窗: ${p.blackout ? `${p.blackout.startHour}:00 - ${p.blackout.endHour}:00` : '无'}`)
+      // V5.8 备份保留策略：tri-state 忠实展示（未配置=默认 14 天安全网）
+      lines.push(`  备份保留期: ${
+        p.backupRetentionDays === null
+          ? '已关闭（时间维度不清理，不建议）'
+          : p.backupRetentionDays !== undefined
+            ? `${p.backupRetentionDays} 天`
+            : `默认 ${DEFAULT_BACKUP_RETENTION_DAYS} 天（未配置）`
+      }`)
+      lines.push(`  备份区配额: ${p.backupQuotaBytes !== null && p.backupQuotaBytes !== undefined ? fmtBytes(p.backupQuotaBytes) : '无限制'}`)
+      if (p.freezeWindows !== undefined && p.freezeWindows.length > 0) {
+        lines.push(`  冻结窗: ${p.freezeWindows.map(w =>
+          `${w.startHour}:00-${w.endHour}:00${w.reason ? `（${w.reason}）` : ''}`).join('、')}`)
+      }
+      if (report.issues.length > 0) {
+        lines.push('', `⚠️ 策略加载发现 ${report.issues.length} 项非法配置（已被忽略，视为未配置）:`)
+        for (const issue of report.issues) {
+          lines.push(`  • [${issue.field}] ${issue.problem}`)
+        }
+        lines.push('', '以上项目当前未生效 —— 修正 policy.json 后自动恢复。')
+      }
       lines.push('', '说明: 策略文件缺失或损坏时默认全放行；保护名单同时以引擎 pre-hook 形式强制执行（纵深防御）。')
       return { content: lines.join('\n') }
     },

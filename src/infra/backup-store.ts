@@ -23,10 +23,11 @@ import * as path from 'path'
 import type { AbsolutePath, Result, TxId } from '../contracts/base'
 import { err, ioError, ok } from '../contracts/base'
 import type {
-  BackupArea, BackupRecord, FileFingerprint, IBackupStore,
+  BackupArea, BackupAreaInfo, BackupPurgeReason, BackupRecord, BackupTombstone,
+  FileFingerprint, IBackupStore,
 } from '../contracts/transaction'
 
-import { DEFAULT_IO_CONCURRENCY, dirSize, forEachPool, readJsonl } from './fs-utils'
+import { DEFAULT_IO_CONCURRENCY, dirSize, forEachPool, readJsonl, writeAllSync } from './fs-utils'
 
 // 与 wal.ts 同源的白名单：字母数字与-_，长度 ≤ 64；路径分隔符/点/空白一律非法
 const TXID_RE = /^[A-Za-z0-9_-]{1,64}$/
@@ -53,6 +54,20 @@ export interface BackupAreaRuntime extends BackupArea {
 /** createBackupStore 的运行时能力集：IBackupStore 契约的超集（向后兼容） */
 export interface BackupStoreRuntime extends IBackupStore {
   reserve(txId: TxId): Promise<BackupAreaRuntime>
+  /** V5.8 备份区清单：backupRoot 下全部事务区（txId 合法的目录）+ mtime。
+   *  GC 的候选扫描面；非 txId 形态的文件（如 purged.jsonl 墓碑）自然排除。 */
+  listAreas(): readonly BackupAreaInfo[]
+  /** V5.8 区体积（递归；符号链接不跟随，读不到按 0 计）。GC 配额计量用。 */
+  areaBytes(txId: TxId): number
+  /** V5.8 存储级清理：绕过 reserve 直接销毁指定事务区（GC 专用 —— reserve
+   *  会 mkdir 重建目录，对"即将删除"的区是语义噪音）。终结性判断由调用方
+   *  （GC）保证，本方法只做物理删除。 */
+  purgeArea(txId: TxId): Result<void>
+  /** V5.8 墓碑写入：purgeArea 成功后追加（顺序保证 —— 先删数据后立碑，
+   *  反序会在崩溃窗口留下"有碑无尸"的假过期）。 */
+  recordTombstone(txId: TxId, reason: BackupPurgeReason, bytes: number, at: string): void
+  /** V5.8 墓碑查询：备份区已不存在时，回答"何时因何被清理"（null = 无墓碑）。 */
+  tombstone(txId: TxId): BackupTombstone | null
 }
 
 /** child 是否位于 parent 内部（或与 parent 相同）—— 恢复依赖判定用。
@@ -136,10 +151,29 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
     return path.join(txArea(txId), 'manifest.jsonl')
   }
 
+  // ─── V5.8 墓碑（purged.jsonl）：GC 清理凭证，与事务区同域存放 ──
+  const tombstoneFile = path.join(options.backupRoot, 'purged.jsonl')
+
+  /** 形状守卫：磁盘墓碑行必须是合法 BackupTombstone（readJsonl 守卫纪律
+   *  —— "null"/数字等合法 JSON 直投会让 .purgedAt 访问抛 TypeError）。 */
+  function isTombstone(v: unknown): v is BackupTombstone {
+    if (v === null || typeof v !== 'object') return false
+    const t = v as Record<string, unknown>
+    return (t.reason === 'retention' || t.reason === 'quota')
+      && typeof t.txId === 'string' && TXID_RE.test(t.txId)
+      && typeof t.purgedAt === 'string'
+      && typeof t.bytes === 'number' && Number.isFinite(t.bytes)
+  }
+
+  function readTombstones(): readonly BackupTombstone[] {
+    return readJsonl<BackupTombstone>(tombstoneFile, isTombstone) ?? []
+  }
+
   function appendManifest(txId: TxId, record: BackupRecord): void {
     const fd = fs.openSync(manifestFile(txId), 'a')
     try {
-      fs.writeSync(fd, JSON.stringify(record) + '\n')
+      // writeAllSync：manifest 是恢复流程的唯一事实源，短写静默截断 = 数据丢失
+      writeAllSync(fd, Buffer.from(JSON.stringify(record) + '\n', 'utf-8'))
       fs.fdatasyncSync(fd)
     } finally {
       fs.closeSync(fd)
@@ -149,7 +183,7 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
   function writeSync(p: string, content: string): void {
     const fd = fs.openSync(p, 'w')
     try {
-      fs.writeSync(fd, content)
+      writeAllSync(fd, Buffer.from(content, 'utf-8'))
       fs.fsyncSync(fd)
     } finally {
       fs.closeSync(fd)
@@ -407,6 +441,66 @@ export function createBackupStore(options: BackupStoreOptions): BackupStoreRunti
         },
       }
       return area
+    },
+
+    listAreas(): readonly BackupAreaInfo[] {
+      let entries: readonly fs.Dirent[]
+      try { entries = fs.readdirSync(options.backupRoot, { withFileTypes: true }) } catch { return [] }
+      const out: BackupAreaInfo[] = []
+      for (const e of entries) {
+        if (!e.isDirectory() || !TXID_RE.test(e.name)) continue   // purged.jsonl 等非事务区自然排除
+        try {
+          const st = fs.statSync(path.join(options.backupRoot, e.name))
+          out.push({ txId: e.name as TxId, mtimeMs: Math.floor(st.mtimeMs) })
+        } catch { /* 单区 stat 失败：该区保持不可见，GC fail-closed 跳过 */ }
+      }
+      return out
+    },
+
+    areaBytes(txId: TxId): number {
+      try {
+        return dirSize(txArea(txId))
+      } catch {
+        return 0   // 白名单拒绝/不可读：按 0 计（与 dirSize 的 fail-soft纪律一致）
+      }
+    },
+
+    purgeArea(txId: TxId): Result<void> {
+      try {
+        // txArea 自带白名单校验（purge 是递归 rm，防路径注入的第一道闸）
+        const area = txArea(txId)
+        if (!fs.existsSync(area)) return ok(undefined)   // 幂等：已不存在 = 已清理
+        fs.rmSync(area, { recursive: true, force: true })
+        return ok(undefined)
+      } catch (e) {
+        return err(ioError('清理备份区失败', e))
+      }
+    },
+
+    recordTombstone(txId: TxId, reason: BackupPurgeReason, bytes: number, at: string): void {
+      try {
+        const fd = fs.openSync(tombstoneFile, 'a')
+        try {
+          // writeAllSync：墓碑是"数据已销毁"的唯一凭证，短写 = 永久哑谜
+          writeAllSync(fd, Buffer.from(
+            JSON.stringify({ txId, purgedAt: at, reason, bytes }) + '\n', 'utf-8'))
+          fs.fdatasyncSync(fd)
+        } finally {
+          fs.closeSync(fd)
+        }
+      } catch {
+        // 墓碑写入失败不回滚删除（数据已物理销毁，回滚无意义）——
+        // 代价是该事务的 restore 退化为含糊的"manifest 不存在"，可接受
+      }
+    },
+
+    tombstone(txId: TxId): BackupTombstone | null {
+      // 逆序扫描取最新：同一 txId 理论上只立一次碑，重复时以最后一次为准
+      const all = readTombstones()
+      for (let i = all.length - 1; i >= 0; i--) {
+        if (all[i]!.txId === txId) return all[i]!
+      }
+      return null
     },
   }
 

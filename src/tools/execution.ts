@@ -66,6 +66,23 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
           : `⚠️ 还原点创建失败: ${rp.error.message}（事务级备份仍生效）`)
       }
 
+      // 2.5) V5.8 备份保留策略（自动触发）：新事务启动前顺带执行一轮
+      //     GC —— 腾出的备份区空间正好服务本次清理。不进 commit 关键
+      //     路径（终结语义必须快）；失败只降级为提示，绝不阻断清理。
+      if (!dry_run) {
+        const gc = await rt.backupGc.run()
+        if (gc.ok && gc.value.purged.length > 0) {
+          const r = gc.value
+          rpLines.push(
+            `🧹 备份 GC：清理 ${r.purged.length} 个过期事务备份` +
+            `（释放 ${fmtBytes(r.purged.reduce((s, p) => s + p.bytes, 0))}，` +
+            `台账结算 ${fmtBytes(r.settledBytes)}）`,
+          )
+        } else if (!gc.ok) {
+          rpLines.push(`⚠️ 备份 GC 未执行: ${gc.error.message}（不影响本次清理）`)
+        }
+      }
+
       // 3) 事务：begin → plan →（dryRun | commit）
       const begin = await rt.engine.begin({
         plugins: cp.plugins, profile: cprof.profile, strategy: strat,
@@ -180,7 +197,27 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
           const mark = s.status === 'done' ? '✅' : s.status === 'skipped' ? '⏭️' : s.status === 'undone' ? '↩️' : '❌'
           out.push(`  ${mark} [${s.index}] ${s.action} (${s.operationId})  ${s.status}${s.bytesFreed > 0 ? `  回收 ${fmtBytes(s.bytesFreed)}` : ''}`)
         }
-        out.push('', `状态: ${tx.state}  |  实际回收: ${fmtBytes(tx.bytesFreedTotal)}`)
+        // V5.8 双轨记账（诚实性）：dir-move 步骤的字节只是"隔离进备份区"
+        // （rename 未释放物理空间），记 pending —— 备份 GC 销毁备份区时才
+        // 转 freed。totalFreed 从此只报真实物理回收，与磁盘可用字节同口径。
+        let quarantinedBytes = 0
+        for (const s of tx.steps) {
+          if (s.status !== 'done' || s.bytesFreed <= 0) continue
+          const quarantined = s.backup?.kind === 'dir-move'
+          if (quarantined) quarantinedBytes += s.bytesFreed
+          await rt.ledger.record({
+            at: new Date().toISOString(),
+            kind: quarantined ? 'pending' : 'freed',
+            txId: session.txId,
+            profile: cprof.profile, plugin: null, action: s.action,
+            bytes: s.bytesFreed,
+            note: quarantined
+              ? `事务 ${session.txId} 步骤 ${s.index}：已隔离进备份区（宽限期内可恢复）`
+              : `事务 ${session.txId} 步骤 ${s.index}`,
+          })
+        }
+        out.push('', `状态: ${tx.state}  |  实际回收: ${fmtBytes(tx.bytesFreedTotal - quarantinedBytes)}`
+          + (quarantinedBytes > 0 ? `（另有 ${fmtBytes(quarantinedBytes)} 已隔离进备份区，保留期后物理回收，nuke_gc 可查）` : ''))
 
         // 趋势快照 + 空间台账：数据驱动决策的原料
         await rt.trend.record({
@@ -188,14 +225,6 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
           bytesReclaimable: 0, bytesFreed: tx.bytesFreedTotal,
           residualCount: 0, healthScore: -1,
         })
-        for (const s of tx.steps) {
-          if (s.status !== 'done' || s.bytesFreed <= 0) continue
-          await rt.ledger.record({
-            at: new Date().toISOString(), kind: 'freed', txId: session.txId,
-            profile: cprof.profile, plugin: null, action: s.action,
-            bytes: s.bytesFreed, note: `事务 ${session.txId} 步骤 ${s.index}`,
-          })
-        }
 
         // 3) 报告导出
         if (fmt !== 'none') {

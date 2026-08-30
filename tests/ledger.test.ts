@@ -78,6 +78,25 @@ describe('空间台账', () => {
     expect(all.ok && all.value.entryCount).toBe(3)      // 半行不计
   })
 
+  it('形状守卫：null/数字/缺字段行跳过，聚合不炸不产 NaN', async () => {
+    const dir = path.join(tmp, `l-${seq++}`)
+    const l = createLedger({ historyDir: dir })
+    await l.record(entry({ bytes: 1000, at: '2026-01-01T00:00:00Z' }))
+    // 合法 JSON 但非 LedgerEntry 形态的三类坏行：
+    // null（e.at.slice 抛 TypeError）、数字（同左）、缺 kind/bytes（NaN 毒化聚合）
+    fs.appendFileSync(
+      path.join(dir, 'ledger.jsonl'),
+      'null\n42\n{"at":"2026-01-02T00:00:00Z","action":"remove-storages"}\n',
+    )
+    const r = await l.query()
+    expect(r.ok).toBe(true)
+    if (!r.ok) return
+    expect(r.value.entryCount).toBe(1)
+    expect(r.value.totalFreed).toBe(1000)
+    expect(Number.isFinite(r.value.totalFreed)).toBe(true)   // 无 NaN 污染
+    expect(l.entries().length).toBe(1)
+  })
+
   it('空台账 → 零值摘要', async () => {
     const r = await ledger().query()
     expect(r.ok).toBe(true)

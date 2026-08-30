@@ -26,6 +26,8 @@ import type {
   LockSlotStatus, ProcessProbe, StaleProof,
 } from '../contracts/lock'
 
+import { writeAllSync } from './fs-utils'
+
 interface LockFileContent {
   readonly version: 1
   readonly scope: string
@@ -224,9 +226,12 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     // O_EXCL：仅当文件不存在时创建；存在即失败 —— 获取互斥的物理保证
     try {
       const fd = fs.openSync(p, 'wx')
-      fs.writeSync(fd, JSON.stringify(content, null, 2))
-      fs.fsyncSync(fd)
-      fs.closeSync(fd)
+      try {
+        writeAllSync(fd, Buffer.from(JSON.stringify(content, null, 2), 'utf-8'))
+        fs.fsyncSync(fd)
+      } finally {
+        fs.closeSync(fd)
+      }
       return true
     } catch {
       return false
@@ -284,6 +289,11 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       // shared：在 guard 互斥下完成"读-改-写"。关键点：重读后若发现
       // exclusive 占据（早检与入锁之间被独占方抢先）必须放弃，绝不能以
       // 新 shared 内容覆盖 exclusive 锁文件。
+      // V5.8 竞态修复：exclusive 获取走 O_EXCL 创建、【不经 guard】——
+      // guard 只能串行化 shared 的读-改-写，拦不住并发 exclusive 的创建。
+      // 因此"文件不存在"分支绝不能 rename 覆盖（rename 会无条件吞掉
+      // 并发方刚创建的 exclusive 锁，互斥语义静默破产），必须同样走
+      // O_EXCL：创建失败 = exclusive 已抢先落位，放弃本次尝试走重试。
       const acquired = await withGuard(p, now, () => {
         let cur = readLock(p)
         // V5.6.2 陈旧锁回收（guard 内原子判定）：exclusive 陈旧锁同样会把
@@ -293,13 +303,22 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
           cur = readLock(p)
         }
         if (cur?.mode === 'exclusive') return false
-        const content: LockFileContent = cur?.mode === 'shared'
-          ? { ...cur, owners: [...cur.owners.filter(o => o.expiresAt > now()), me] }
-          : { version: 1, scope: scopeKey(request.scope), mode: 'shared', owners: [me] }
-        const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
-        fs.writeFileSync(tmp, JSON.stringify(content, null, 2))
-        fs.renameSync(tmp, p)
-        return true
+        if (cur?.mode === 'shared') {
+          // 已有 shared 锁文件：guard 互斥保证读-改-写期间文件不会消失
+          // （所有删除路径都在 guard 内；exclusive 的 O_EXCL 在文件存在时
+          // 必然失败）—— rename 更新是安全的
+          const content: LockFileContent = {
+            ...cur, owners: [...cur.owners.filter(o => o.expiresAt > now()), me],
+          }
+          const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
+          fs.writeFileSync(tmp, JSON.stringify(content, null, 2))
+          fs.renameSync(tmp, p)
+          return true
+        }
+        // 文件不存在：O_EXCL 原子创建（与 exclusive 获取的物理互斥点）
+        return writeLockAtomic(p, {
+          version: 1, scope: scopeKey(request.scope), mode: 'shared', owners: [me],
+        })
       }, guardHolderAlive)
       if (acquired !== true) return null
     } else {

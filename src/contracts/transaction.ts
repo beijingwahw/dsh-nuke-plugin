@@ -83,8 +83,58 @@ export interface BackupArea {
   /** 备份区中未被 manifest 覆盖的产物数（崩溃窗口残留）。>0 时禁止 purge：
    *  这些产物可能是数据唯一完整副本（stageDir 已把原位移走），销毁即永久丢失。 */
   orphanArtifacts(): number
-  /** 事务 committed 后按保留策略（默认 7 天）清理回收区 */
+  /** 事务终结（commit/rollback）后销毁本事务备份区。调用方（引擎恢复路径
+   *  或备份 GC）自行保证终结性与安全前提 —— 本方法只做物理删除。 */
   purge(txId: TxId): Promise<Result<void>>
+}
+
+// ─── V5.8 备份保留策略（GC）：备份必须有死期，死期由策略决定 ──
+// commit 只证明"步骤成功无需补偿"，不证明"数据不再需要"。回收区不能
+// 无界增长（dir-move 只是改名，字节并未释放，totalFreed 却已记账）；
+// 也不能提交即删（下游破坏的暴露周期以天计，宽限期内 restore 是 O(1)）。
+// 淘汰双维度：时间宽限期（常规纪律）+ 空间配额（紧急泄压阀，可提前于
+// 宽限期）。未终结事务的备份永不淘汰 —— 那可能是数据唯一完整副本。
+
+/** 备份被 GC 淘汰的原因 */
+export type BackupPurgeReason = 'retention' | 'quota'
+
+/** 单个已终结事务备份区的元数据（GC 候选清单条目） */
+export interface BackupAreaInfo {
+  readonly txId: TxId
+  /** 区目录 mtime（≈ 最后一次 stage/restore 时刻；宽限期时钟的近似值） */
+  readonly mtimeMs: number
+}
+
+/** GC 墓碑：备份区被清理后留下的"曾存在"凭证。restore/status 据此给出
+ *  精确的"已于 X 过期清理"而非含糊的"manifest 不存在"。 */
+export interface BackupTombstone {
+  readonly txId: TxId
+  readonly purgedAt: string
+  readonly reason: BackupPurgeReason
+  readonly bytes: number
+}
+
+/** 单次 GC 运行的结果报告 */
+export interface BackupGcReport {
+  /** 本次物理清理的事务（含回收字节与淘汰原因） */
+  readonly purged: readonly { readonly txId: TxId; readonly bytes: number; readonly reason: BackupPurgeReason }[]
+  /** 跳过的未终结事务数（永不淘汰，仅计数供观测） */
+  readonly skippedUnfinished: number
+  /** 跳过的状态不明事务数（WAL 缺失/损坏 —— fail-closed 保留现场） */
+  readonly skippedUnknown: number
+  /** GC 后备份区残余字节（含仍在宽限期内的事务） */
+  readonly retainedBytes: number
+  /** 本次结算的 pending → freed 字节（dir-move 隔离量的物理兑现） */
+  readonly settledBytes: number
+  readonly durationMs: number
+}
+
+export interface IBackupGc {
+  /** 执行一轮保留策略：宽限期到期的已终结备份区物理清理 + 配额 LRU
+   *  泄压 + 台账结算（pending→freed）+ 审计存证。全程持有全局独占锁
+   *  （拿不到锁 = 有并发清理在进行，本轮静默让位）。dryRun=true 只
+   *  报告不动盘。 */
+  run(options?: { readonly dryRun?: boolean }): Promise<Result<BackupGcReport>>
 }
 
 // ─── 原子操作（命令模式） ───────────────────────────────────
