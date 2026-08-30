@@ -453,21 +453,21 @@ describe('edit-ops 幂等 skip 语义', () => {
   })
 
   it('引用存在：preview.skipped 不置位', async () => {
-    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[1]!
+    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[2]!   // [2]=profile patch（V5.9.0 [0]=package.json）
     const p = await op.preview(ctx)
     expect(p.skipped).toBeFalsy()
     expect(p.touchedPaths).toEqual([patchFile()])
   })
 
   it('引用不存在：preview 返回 skipped 语义（不报错、无触碰路径）', async () => {
-    const op = configEditOps('not-referenced' as PluginName, PROFILE, () => dshHome)[1]!
+    const op = configEditOps('not-referenced' as PluginName, PROFILE, () => dshHome)[2]!
     const p = await op.preview(ctx)
     expect(p.skipped).toBe(true)
     expect(p.touchedPaths).toEqual([])
   })
 
   it('引用不存在：validate 依旧放行（不报错），execute skipped 且无空操作', async () => {
-    const op = configEditOps('not-referenced' as PluginName, PROFILE, () => dshHome)[1]!
+    const op = configEditOps('not-referenced' as PluginName, PROFILE, () => dshHome)[2]!
     const v = await op.validate(ctx)
     expect(v.ok).toBe(true)
     const r = await op.execute(ctx)
@@ -479,7 +479,7 @@ describe('edit-ops 幂等 skip 语义', () => {
   })
 
   it('重复执行幂等：首次摘除后再 preview/execute 均 skipped', async () => {
-    const mk = () => configEditOps(VICTIM, PROFILE, () => dshHome)[1]!
+    const mk = () => configEditOps(VICTIM, PROFILE, () => dshHome)[2]!
     const first = await mk().execute(ctx)
     expect(first.ok).toBe(true)
     expect(first.ok && first.value.outcome.skipped).toBeFalsy()   // 首次真摘除
@@ -494,7 +494,7 @@ describe('edit-ops 幂等 skip 语义', () => {
   })
 
   it('文件不存在：preview/execute 均 skipped', async () => {
-    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[0]!  // workspace yaml 未创建
+    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[0]!  // [0]=package.json 未创建
     const p = await op.preview(ctx)
     expect(p.skipped).toBe(true)
     const r = await op.execute(ctx)
@@ -576,7 +576,11 @@ describe('yaml-edit 字节级保持（含注释与顺序）', () => {
 describe('动作集元数据化（ACTION_METADATA）', () => {
   it('覆盖全部 CleanAction 且字段完备', () => {
     const allActions = new Set(Object.values(STRATEGY_ACTIONS).flat())
-    expect(Object.keys(ACTION_METADATA).length).toBe(allActions.size)
+    // V5.9.0：report-only 是纯报告动作（residual-scanner 专用），不进任何策略动作集
+    expect(Object.keys(ACTION_METADATA).length).toBe(allActions.size + 1)
+    for (const a of allActions) {
+      expect(ACTION_METADATA[a]).toBeDefined()
+    }
     for (const meta of Object.values(ACTION_METADATA)) {
       expect(['low', 'medium', 'high']).toContain(meta.riskLevel)
       expect(meta.description.length).toBeGreaterThan(0)
@@ -593,7 +597,7 @@ describe('动作集元数据化（ACTION_METADATA）', () => {
     const ops = factory({
       plugins: [VICTIM], profile: PROFILE, strategy: 'aggressive', dryRun: true, actor: 't',
     })
-    expect(ops.length).toBe(9)
+    expect(ops.length).toBe(11)   // V5.9.0：9 per-plugin（+package-json/pnpm-store）+ prune + purge-temp
     for (const op of ops) {
       expect(op.riskLevel).toBeDefined()
       expect(op.description).toBeDefined()
@@ -607,13 +611,13 @@ describe('makeOperationPlan（策略+插件 → 动作清单+风险+预估）', 
     plugins: [VICTIM], profile: PROFILE, strategy, dryRun: true, actor: 't',
   })
 
-  it('无 resolver：纯元数据清单（safe=4 动作、estimatedBytes 全 0、锁需求按动作推导）', async () => {
+  it('无 resolver：纯元数据清单（safe=5 动作、estimatedBytes 全 0、锁需求按动作推导）', async () => {
     const r = await makeOperationPlan(planRequest('safe'), {
       validator: createValidator(), tempRoot,
     })
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.value.actions.length).toBe(4)
+    expect(r.value.actions.length).toBe(5)
     expect(r.value.actions.every(a => a.estimatedBytes === 0)).toBe(true)
     expect(r.value.totalEstimatedBytes).toBe(0)
     const std = r.value.actions.find(a => a.action === 'standard-remove')!
@@ -622,13 +626,13 @@ describe('makeOperationPlan（策略+插件 → 动作清单+风险+预估）', 
     expect(r.value.actions.find(a => a.action === 'clean-workspace-yaml')!.riskLevel).toBe('low')
   })
 
-  it('无 resolver：aggressive=9 动作、highestRiskLevel=high（storages/prune）', async () => {
+  it('无 resolver：aggressive=11 动作、highestRiskLevel=high（storages/prune）', async () => {
     const r = await makeOperationPlan(planRequest('aggressive'), {
       validator: createValidator(), tempRoot,
     })
     expect(r.ok).toBe(true)
     if (!r.ok) return
-    expect(r.value.actions.length).toBe(9)
+    expect(r.value.actions.length).toBe(11)
     expect(r.value.highestRiskLevel).toBe('high')
     expect(r.value.actions.find(a => a.action === 'pnpm-store-prune')!.requiresExclusiveLock).toBe(true)
   })
@@ -684,7 +688,7 @@ describe('makeOperationPlan（策略+插件 → 动作清单+风险+预估）', 
       warnings: [],
       actions: r.value.actions,   // PlannedActionDetail 是 DryRunActionDetail 的结构超集
     }
-    expect(report.actions?.length).toBe(4)
+    expect(report.actions?.length).toBe(5)
     expect(report.actions?.[0]).toHaveProperty('riskLevel')
     expect(report.actions?.[0]).toHaveProperty('description')
     expect(report.actions?.[0]).toHaveProperty('estimatedBytes')

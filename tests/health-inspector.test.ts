@@ -88,6 +88,27 @@ describe('HealthInspector', () => {
     }
   })
 
+  it('V5.8.9 dsh 内置 bundle（dsh-web-app 等）不误报孤立 —— dsh 自注入不进 dependencies', async () => {
+    // 真实 dsh 0.1.1 实测：初始化 profile 时 dsh 自行写入 bundles
+    // （dsh-base / dsh-web-app…）但不进 dependencies（由全局安装解析）。
+    // 旧白名单只排除 dsh-base → dsh-web-app 每次健康检查都误报孤立。
+    const pd = path.join(home, 'profiles', 'default')
+    const pkgPath = path.join(pd, 'package.json')
+    const backup = fs.readFileSync(pkgPath, 'utf-8')
+    fs.writeFileSync(pkgPath, JSON.stringify({
+      dependencies: { 'my-plugin': '^1.0.0' },
+      dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app', 'my-plugin'] } },
+    }, null, 2))
+    try {
+      const r = await make().inspect(PROFILE)
+      if (!r.ok) throw new Error('inspect failed')
+      const check = r.value.results.find(x => x.check === 'bundles 一致性')!
+      expect(check.passed).toBe(true)
+    } finally {
+      fs.writeFileSync(pkgPath, backup)
+    }
+  })
+
   it('dsh CLI 未找到（ENOENT + 救援落空）→ warning 且不阻断；WAL 有未完成事务 → warning', async () => {
     // V5.1 语义修正：真实 spawnSync 的"命令不存在"是 status=null + error.code=ENOENT
     //（127 是 shell 的 not-found 码，spawnSync 无 shell 不会产生）；

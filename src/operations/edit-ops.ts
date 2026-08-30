@@ -20,15 +20,52 @@ import { removePluginFromYaml } from './yaml-edit'
 
 export interface EditOpSpec {
   readonly id: string
-  readonly action: 'clean-workspace-yaml' | 'clean-profile-patch' | 'clean-home-patch'
+  readonly action: 'clean-package-json' | 'clean-workspace-yaml' | 'clean-profile-patch' | 'clean-home-patch'
   readonly target: PluginName
   /** 相对 dshHome 的文件定位函数 */
   fileOf(ctx: TxContext): string
   readonly description: string
   readonly policy: PathPolicy
+  /** V5.9.0 可注入编辑器：content → 摘除后内容；null = 无引用（幂等 skip）。
+   *  缺省 removePluginFromYaml（YAML 家族）；package.json 注入 JSON 编辑器 */
+  readonly editor?: (content: string, plugin: string) => string | null
+}
+
+/** package.json 悬空声明编辑器（V5.9.0）：摘除 dependencies / dsh.profile.bundles
+ *  中的插件声明。standard-remove 成功时 dsh 已自清 → 无变化返回 null（幂等 skip）。
+ *  输出 2 空格缩进 + 尾换行（与 dsh CLI 写入口径一致）。 */
+export function removePluginFromPackageJson(content: string, plugin: string): string | null {
+  let pkg: Record<string, unknown>
+  try {
+    pkg = JSON.parse(content) as Record<string, unknown>
+  } catch {
+    // 解析失败的 package.json 不是本操作能处理的形态：返回 null（跳过），
+    // 健康检查会单独报告语法问题
+    return null
+  }
+  let changed = false
+  const deps = typeof pkg.dependencies === 'object' && pkg.dependencies !== null
+    ? pkg.dependencies as Record<string, unknown>
+    : null
+  if (deps !== null && plugin in deps) {
+    // no-dynamic-delete：以重建对象替代 delete（键序保持、无动态删除）
+    pkg.dependencies = Object.fromEntries(Object.entries(deps).filter(([k]) => k !== plugin))
+    changed = true
+  }
+  const dsh = typeof pkg.dsh === 'object' && pkg.dsh !== null ? pkg.dsh as Record<string, unknown> : null
+  const profile = dsh !== null && typeof dsh.profile === 'object' && dsh.profile !== null
+    ? dsh.profile as Record<string, unknown>
+    : null
+  if (profile !== null && Array.isArray(profile.bundles) && profile.bundles.includes(plugin)) {
+    profile.bundles = profile.bundles.filter((b: unknown) => b !== plugin)
+    changed = true
+  }
+  if (!changed) return null
+  return `${JSON.stringify(pkg, null, 2)}\n`
 }
 
 export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
+  const edit = spec.editor ?? removePluginFromYaml
   return {
     id: `${spec.id}:${spec.target}`,
     action: spec.action,
@@ -46,7 +83,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
       // 读取失败（EACCES/TOCTOU）直接抛出：plan()/dryRun() 均有逐 op 异常收敛，
       // 异常会被转成 Result 上报而不会逃逸出契约
       const content = fs.readFileSync(file, 'utf-8')
-      const next = removePluginFromYaml(content, spec.target)
+      const next = edit(content, spec.target)
       const touched = next === null ? [] : [file as AbsolutePath]
       return {
         summary: next === null
@@ -86,7 +123,7 @@ export function makeConfigEditOp(spec: EditOpSpec): CleanOperation {
       } catch (e) {
         return err(ioError(`${spec.description}: 读取配置失败`, e))
       }
-      const next = removePluginFromYaml(content, spec.target)
+      const next = edit(content, spec.target)
       if (next === null) {
         return ok({
           outcome: { bytesFreed: 0, message: '未发现引用，跳过', skipped: true },
@@ -129,12 +166,18 @@ export function configPolicies(profile: string): {
   }
 }
 
-/** 便捷构造：单插件的三个配置编辑操作 */
+/** 便捷构造：单插件的四个配置编辑操作（V5.9.0 新增 package.json 声明兜底） */
 export function configEditOps(
   target: PluginName, profile: string, dshHomeOf: (ctx: TxContext) => string,
 ): CleanOperation[] {
   const p = configPolicies(profile)
   return [
+    makeConfigEditOp({
+      id: 'op-clean-package-json', action: 'clean-package-json', target,
+      fileOf: ctx => path.join(dshHomeOf(ctx), 'profiles', profile, 'package.json'),
+      description: '清理 package.json 声明', policy: p.profileScoped,
+      editor: removePluginFromPackageJson,
+    }),
     makeConfigEditOp({
       id: 'op-clean-workspace-yaml', action: 'clean-workspace-yaml', target,
       fileOf: ctx => path.join(dshHomeOf(ctx), 'profiles', profile, 'pnpm-workspace.yaml'),

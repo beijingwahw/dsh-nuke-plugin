@@ -12,7 +12,7 @@ import { createPathResolver } from '../src/infra/path-resolver'
 import { createValidator } from '../src/infra/validator'
 import { configEditOps } from '../src/operations/edit-ops'
 import { makePnpmPruneOp, makeStandardRemoveOp } from '../src/operations/exec-ops'
-import { dirRemoveOps, makePurgeTempOp } from '../src/operations/fs-ops'
+import { dirRemoveOps, makePnpmStoreRemoveOp, makePurgeTempOp } from '../src/operations/fs-ops'
 import { makeOperationFactory, STRATEGY_ACTIONS } from '../src/operations/index'
 
 let home: string
@@ -81,7 +81,7 @@ afterAll(() => {
 
 describe('configEditOps（配置引用摘除）', () => {
   it('preview 零副作用：文件内容不变', async () => {
-    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[1]!  // profile patch
+    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[2]!  // [2]=profile patch（[0]=package.json、[1]=workspace-yaml）
     const before = fs.readFileSync(path.join(dshHome, 'profiles', PROFILE, 'cordis.patch.yml'), 'utf-8')
     await op.preview(ctx)
     const after = fs.readFileSync(path.join(dshHome, 'profiles', PROFILE, 'cordis.patch.yml'), 'utf-8')
@@ -89,7 +89,7 @@ describe('configEditOps（配置引用摘除）', () => {
   })
 
   it('execute 摘除 victim 块保留 keep 块；undo 完整恢复', async () => {
-    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[1]!
+    const op = configEditOps(VICTIM, PROFILE, () => dshHome)[2]!   // profile patch（[0]=package.json、[1]=workspace-yaml）
     const r = await op.execute(ctx)
     expect(r.ok).toBe(true)
     const content = fs.readFileSync(path.join(dshHome, 'profiles', PROFILE, 'cordis.patch.yml'), 'utf-8')
@@ -104,7 +104,7 @@ describe('configEditOps（配置引用摘除）', () => {
   })
 
   it('未引用时 execute 跳过（backup=null，无副作用）', async () => {
-    const op = configEditOps('not-installed' as PluginName, PROFILE, () => dshHome)[2]! // home patch
+    const op = configEditOps('not-installed' as PluginName, PROFILE, () => dshHome)[3]! // home patch
     const r = await op.execute(ctx)
     expect(r.ok).toBe(true)
     if (!r.ok) return
@@ -113,11 +113,105 @@ describe('configEditOps（配置引用摘除）', () => {
   })
 
   it('validate：越出白名单（home patch 写到系统路径）→ E_PATH_POLICY', async () => {
-    const op = configEditOps(VICTIM, PROFILE, () => '/definitely/not/allowed')[2]!
+    const op = configEditOps(VICTIM, PROFILE, () => '/definitely/not/allowed')[3]!
     const r = await op.validate(ctx)
     expect(r.ok).toBe(false)
     if (r.ok) return
     expect(r.error.code).toBe('E_PATH_POLICY')
+  })
+})
+
+describe('V5.9.0 clean-package-json（package.json 声明兜底）', () => {
+  it('execute 摘除 dependencies/bundles 声明；undo 完整恢复；无声明时幂等跳过', async () => {
+    const pkgPath = path.join(dshHome, 'profiles', PROFILE, 'package.json')
+    fs.writeFileSync(pkgPath, JSON.stringify({
+      dependencies: { 'victim-plugin': '^1', 'keep-plugin': '^1' },
+      dsh: { profile: { bundles: ['victim-plugin', 'keep-plugin'] } },
+    }))
+    try {
+      const op = configEditOps(VICTIM, PROFILE, () => dshHome)[0]!   // package.json
+      const r = await op.execute(ctx)
+      expect(r.ok).toBe(true)
+      if (r.ok) {
+        const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+          dependencies: Record<string, string>
+          dsh: { profile: { bundles: string[] } }
+        }
+        expect(pkg.dependencies).toEqual({ 'keep-plugin': '^1' })
+        expect(pkg.dsh.profile.bundles).toEqual(['keep-plugin'])
+
+        // 幂等：声明已不在（standard-remove 成功自清过）→ skipped 无副作用
+        // （必须在 undo 之前校验 —— undo 会把声明恢复回来）
+        const again = await op.execute(ctx)
+        expect(again.ok).toBe(true)
+        if (again.ok) {
+          expect(again.value.backup).toBeNull()
+          expect(again.value.outcome.skipped).toBe(true)
+        }
+
+        const undo = await op.undo(ctx, r.value.backup)
+        expect(undo.ok).toBe(true)
+        const restored = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+          dependencies: Record<string, string>
+        }
+        expect(restored.dependencies['victim-plugin']).toBe('^1')
+      }
+    } finally {
+      fs.rmSync(pkgPath, { force: true })
+    }
+  })
+})
+
+describe('V5.9.0 remove-pnpm-store（虚拟存储实体清理）', () => {
+  function seedStores() {
+    const pd = path.join(dshHome, 'profiles', PROFILE)
+    const mk = (name: string) => {
+      const d = path.join(pd, 'node_modules', '.pnpm', name, 'node_modules', 'pkg')
+      fs.mkdirSync(d, { recursive: true })
+      fs.writeFileSync(path.join(d, 'index.js'), 'x'.repeat(300))
+      return path.join(pd, 'node_modules', '.pnpm', name)
+    }
+    const v1 = mk('victim-plugin@1.0.0')
+    const v2 = mk('victim-plugin@2.0.0')
+    const other = mk('other-lib@9.9.9')
+    return { v1, v2, other }
+  }
+
+  it('execute 多版本实体全部进回收区，他人实体不动；undo 恢复全部', async () => {
+    const { v1, v2, other } = seedStores()
+    try {
+      const op = makePnpmStoreRemoveOp({ target: VICTIM, profile: PROFILE, dshHomeOf: () => dshHome })
+      const plan = await op.preview(ctx)
+      expect(plan.estimatedBytesReclaimable).toBeGreaterThan(0)
+
+      const r = await op.execute(ctx)
+      expect(r.ok).toBe(true)
+      if (!r.ok) return
+      expect(r.value.outcome.bytesFreed).toBeGreaterThan(0)
+      expect(fs.existsSync(v1)).toBe(false)
+      expect(fs.existsSync(v2)).toBe(false)
+      expect(fs.existsSync(other)).toBe(true)   // 他人实体绝不误删
+
+      // undo 凭 manifest 恢复全部 N 个实体（WAL 单 backup 装不下）
+      const undo = await op.undo(ctx, r.value.backup)
+      expect(undo.ok).toBe(true)
+      expect(fs.existsSync(path.join(v1, 'node_modules', 'pkg', 'index.js'))).toBe(true)
+      expect(fs.existsSync(path.join(v2, 'node_modules', 'pkg', 'index.js'))).toBe(true)
+    } finally {
+      fs.rmSync(path.join(dshHome, 'profiles', PROFILE, 'node_modules', '.pnpm'), { recursive: true, force: true })
+    }
+  })
+
+  it('无匹配实体（.pnpm 缺失/他人实体）→ 幂等跳过', async () => {
+    const op = makePnpmStoreRemoveOp({ target: 'ghost-plugin' as PluginName, profile: PROFILE, dshHomeOf: () => dshHome })
+    const plan = await op.preview(ctx)
+    expect(plan.skipped).toBe(true)
+    const r = await op.execute(ctx)
+    expect(r.ok).toBe(true)
+    if (r.ok) {
+      expect(r.value.backup).toBeNull()
+      expect(r.value.outcome.skipped).toBe(true)
+    }
   })
 })
 
@@ -264,7 +358,7 @@ describe('makeStandardRemoveOp / makePnpmPruneOp', () => {
 })
 
 describe('makeOperationFactory（策略编译）', () => {
-  it('safe=4 项/插件；balanced=7 项；aggressive=9 项+全局收尾一次', () => {
+  it('safe=5 项/插件；balanced=9 项；aggressive=11 项+全局收尾一次（V5.9.0 +package-json/pnpm-store）', () => {
     const mk = (strategy: 'safe' | 'balanced' | 'aggressive') => {
       const factory = makeOperationFactory({
         validator: createValidator(), runCommand: stubRun(), tempRoot,
@@ -276,9 +370,9 @@ describe('makeOperationFactory（策略编译）', () => {
     const safe = mk('safe')
     const balanced = mk('balanced')
     const aggressive = mk('aggressive')
-    expect(safe.length).toBe(4)
-    expect(balanced.length).toBe(7)
-    expect(aggressive.length).toBe(9)   // 7 + prune + purge-temp
+    expect(safe.length).toBe(5)
+    expect(balanced.length).toBe(9)
+    expect(aggressive.length).toBe(11)   // 9 + prune + purge-temp
     expect(new Set(aggressive.map(o => o.id)).size).toBe(aggressive.length)  // id 无重复
   })
 
@@ -290,8 +384,8 @@ describe('makeOperationFactory（策略编译）', () => {
       plugins: ['a-plugin' as PluginName, 'b-plugin' as PluginName],
       profile: PROFILE, strategy: 'safe', dryRun: true, actor: 't',
     })
-    expect(ops.filter(o => o.id.includes('a-plugin')).length).toBe(4)
-    expect(ops.filter(o => o.id.includes('b-plugin')).length).toBe(4)
+    expect(ops.filter(o => o.id.includes('a-plugin')).length).toBe(5)
+    expect(ops.filter(o => o.id.includes('b-plugin')).length).toBe(5)
   })
 
   it('STRATEGY_ACTIONS 单调扩展：aggressive ⊇ balanced ⊇ safe', () => {

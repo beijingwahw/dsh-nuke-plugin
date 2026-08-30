@@ -19,6 +19,11 @@ async function collect(iter: AsyncIterable<ScanEvent>): Promise<ScanEvent[]> {
   return out
 }
 
+/** found 事件窄化（替代 as any，规避 no-unsafe-call） */
+function isFound(e: ScanEvent): e is Extract<ScanEvent, { type: 'found' }> {
+  return e.type === 'found'
+}
+
 function seed() {
   const pd = path.join(home, 'profiles', 'default')
   fs.mkdirSync(pd, { recursive: true })
@@ -82,6 +87,118 @@ describe('ResidualScanner', () => {
     expect(done.type).toBe('done')
     expect((done as any).totalFound).toBe(6)
     expect((done as any).bytesReclaimable).toBeGreaterThan(0)
+  })
+
+  it('V5.8.9 悬空声明：已声明未安装 → config-ref 残留（下次 install 将复活）', async () => {
+    // --skip-standard 卸载 / pnpm remove 中途中断的真实后果：
+    // deps/bundles 仍声明、node_modules 已删 —— 旧扫描器对此报"无残留"
+    const pd = path.join(home, 'profiles', 'dangling-prof')
+    fs.mkdirSync(pd, { recursive: true })
+    fs.writeFileSync(path.join(pd, 'package.json'), JSON.stringify({
+      dependencies: { 'zombie-plugin': '^1' },
+      dsh: { profile: { bundles: ['zombie-plugin'] } },
+    }))
+    try {
+      const events = await collect(makeScanner().scan({
+        plugin: 'zombie-plugin' as PluginName,
+        profile: 'dangling-prof' as ProfileName,
+        strategy: 'safe', includeTemp: false,
+      }))
+      const found = events.filter(e => e.type === 'found')
+      expect(found.length).toBe(1)
+      const ev = (found[0] as any).evidence
+      expect(ev.kind).toBe('config-ref')
+      expect(ev.suggestedAction).toBe('clean-package-json')
+      expect(ev.description).toContain('悬空声明')
+    } finally {
+      fs.rmSync(pd, { recursive: true, force: true })
+    }
+  })
+
+  it('V5.8.9 对照：已声明且已安装 → 非悬空，不产出声明残留（正常安装不误报）', async () => {
+    const pd = path.join(home, 'profiles', 'installed-prof')
+    fs.mkdirSync(path.join(pd, 'node_modules', 'alive-plugin'), { recursive: true })
+    fs.writeFileSync(path.join(pd, 'node_modules', 'alive-plugin', 'index.js'), 'x')
+    fs.writeFileSync(path.join(pd, 'package.json'), JSON.stringify({
+      dependencies: { 'alive-plugin': '^1' },
+      dsh: { profile: { bundles: ['alive-plugin'] } },
+    }))
+    try {
+      const events = await collect(makeScanner().scan({
+        plugin: 'alive-plugin' as PluginName,
+        profile: 'installed-prof' as ProfileName,
+        strategy: 'safe', includeTemp: false,
+      }))
+      // node_modules 目录本身是残留（balanced 会回收），但绝无"悬空声明"
+      const decl = events.filter(e =>
+        isFound(e) && e.evidence.description.includes('悬空声明'))
+      expect(decl.length).toBe(0)
+    } finally {
+      fs.rmSync(pd, { recursive: true, force: true })
+    }
+  })
+
+  it('V5.9.0 pnpm 虚拟存储：链接层已删 → .pnpm 实体是残留；正常安装不误报', async () => {
+    const pd = path.join(home, 'profiles', 'pnpm-prof')
+    const mk = (name: string) => {
+      const d = path.join(pd, 'node_modules', '.pnpm', name, 'node_modules', 'pkg-plugin')
+      fs.mkdirSync(d, { recursive: true })
+      fs.writeFileSync(path.join(d, 'index.js'), 'x'.repeat(200))
+    }
+    mk('pkg-plugin@1.0.0')
+    mk('pkg-plugin@2.0.0')
+    mk('other-lib@9.9.9')   // 他人实体，绝不能命中
+    try {
+      // 场景 1：链接层存在（正常安装）→ .pnpm 实体不报
+      fs.mkdirSync(path.join(pd, 'node_modules', 'pkg-plugin'), { recursive: true })
+      let events = await collect(makeScanner().scan({
+        plugin: 'pkg-plugin' as PluginName,
+        profile: 'pnpm-prof' as ProfileName,
+        strategy: 'safe', includeTemp: false,
+      }))
+      let pnpmFound = events.filter(isFound).filter(e => e.evidence.location.includes('.pnpm'))
+      expect(pnpmFound.length).toBe(0)
+
+      // 场景 2：链接层删除（卸载后）→ 两个版本实体全部命中，other-lib 不碰
+      fs.rmSync(path.join(pd, 'node_modules', 'pkg-plugin'), { recursive: true, force: true })
+      events = await collect(makeScanner().scan({
+        plugin: 'pkg-plugin' as PluginName,
+        profile: 'pnpm-prof' as ProfileName,
+        strategy: 'safe', includeTemp: false,
+      }))
+      pnpmFound = events.filter(isFound).filter(e => e.evidence.location.includes('.pnpm'))
+      expect(pnpmFound.length).toBe(2)
+      for (const e of pnpmFound) {
+        expect(e.evidence.suggestedAction).toBe('remove-pnpm-store')
+        expect(e.evidence.sizeBytes).toBeGreaterThan(0)
+        expect(e.evidence.location).not.toContain('other-lib')
+      }
+    } finally {
+      fs.rmSync(pd, { recursive: true, force: true })
+    }
+  })
+
+  it('V5.9.0 lockfile 残留：引用命中 → lockfile 证据（report-only，不虚报体积）', async () => {
+    const pd = path.join(home, 'profiles', 'lock-prof')
+    fs.mkdirSync(pd, { recursive: true })
+    fs.writeFileSync(path.join(pd, 'package.json'), JSON.stringify({ dependencies: {} }))
+    fs.writeFileSync(path.join(pd, 'pnpm-lock.yaml'), 'packages:\n\n  lock-victim@1.0.0:\n    resolution: {integrity: sha512-x}\n')
+    try {
+      const events = await collect(makeScanner().scan({
+        plugin: 'lock-victim' as PluginName,
+        profile: 'lock-prof' as ProfileName,
+        strategy: 'safe', includeTemp: false,
+      }))
+      const lockEv = events.filter(isFound).filter(e => e.evidence.kind === 'lockfile')
+      expect(lockEv.length).toBe(1)
+      const ev = lockEv[0]!
+      expect(ev.evidence.suggestedAction).toBe('report-only')
+      // report-only 语义：文件不删不编辑 → 体积恒 0（不虚报可回收空间）
+      expect(ev.evidence.sizeBytes).toBe(0)
+      expect(ev.evidence.description).toContain('install')
+    } finally {
+      fs.rmSync(pd, { recursive: true, force: true })
+    }
   })
 
   it('配置文件不含插件名 → 不产出 config-ref 证据', async () => {
@@ -187,9 +304,10 @@ describe('ResidualScanner', () => {
       strategy: 'safe', includeTemp: false,
     }))
     const progress = events.filter(e => e.type === 'progress')
-    // 单插件 6 检查点：progress 在 stat 之前发出，存在与否不影响计数
-    expect(progress.length).toBe(6)
-    expect(progress.map(e => (e as any).scannedPaths)).toEqual([1, 2, 3, 4, 5, 6])
+    // 单插件 8 检查点（V5.8.9 悬空声明 + V5.9.0 lockfile；default 种子无
+    // .pnpm 目录 → 不产出额外检查点）：progress 在 stat 之前发出
+    expect(progress.length).toBe(8)
+    expect(progress.map(e => (e as any).scannedPaths)).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
   })
 
   it('增量缓存（突破升级）：二次扫描结果一致且全量命中缓存', async () => {

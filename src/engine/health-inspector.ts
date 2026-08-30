@@ -130,7 +130,12 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
         const bundlesRaw = asRecord(asRecord(pkg?.dsh)?.profile)?.bundles
         const bundles: string[] = Array.isArray(bundlesRaw) ? bundlesRaw as string[] : []
         const deps = new Set(Object.keys(asRecord(pkg?.dependencies) ?? {}))
-        const orphans = bundles.filter(b => !deps.has(b) && b !== '@deepseek-ai/dsh-base')
+        // 孤立判定排除 dsh 内置系统 bundle：dsh 初始化 profile 时自行写入
+        // bundles（dsh-base / dsh-web-app / dsh-tui-app…）但不进 dependencies
+        // —— 它们由全局 dsh 安装解析。旧白名单只排除 dsh-base，dsh-web-app
+        // 被误报孤立（真实 dsh 0.1.1 环境实测）。与 CLI 第 1111 行既有
+        // 前缀判据对齐：@deepseek-ai/dsh- 前缀 = 系统内置。
+        const orphans = bundles.filter(b => !deps.has(b) && !b.startsWith('@deepseek-ai/dsh-'))
         if (orphans.length === 0) {
           out.push(R('bundles 一致性', true, '所有 bundle 均有对应依赖', 'info', 'config'))
         } else {

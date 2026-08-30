@@ -166,6 +166,148 @@ export function dirRemoveOps(
   ]
 }
 
+// ─── pnpm 虚拟存储清理（V5.9.0，balanced+） ────────────────
+
+export interface PnpmStoreOpSpec {
+  readonly target: PluginName
+  readonly profile: string
+  readonly dshHomeOf: (ctx: TxContext) => string
+}
+
+/** .pnpm 实体目录名前缀：普通包 `plugin@`；scoped 包 `@scope+plugin@`（`/`→`+`）。
+ *  peer/完整性后缀跟在版本号之后，前缀匹配天然覆盖。 */
+function pnpmStorePrefix(plugin: string): string {
+  return plugin.startsWith('@') ? `${plugin.replace('/', '+')}@` : `${plugin}@`
+}
+
+/** 枚举 .pnpm 下属于 target 的实体目录（精确前缀匹配，他人实体绝不命中） */
+function listPnpmStores(dshHome: string, profile: string, target: string): string[] {
+  const pnpmDir = path.join(dshHome, 'profiles', profile, 'node_modules', '.pnpm')
+  const prefix = pnpmStorePrefix(target)
+  try {
+    return fs.readdirSync(pnpmDir)
+      .filter(e => e.startsWith(prefix))
+      .map(e => path.join(pnpmDir, e))
+  } catch {
+    return []   // .pnpm 不存在（非 pnpm 环境）= 无实体可清
+  }
+}
+
+/** makePnpmStoreRemoveOp —— 多目录操作（构建期无 ctx 拿不到 dshHome，
+ *  运行时枚举，与 purge-temp 同模式）：
+ *  preview 汇总影响面；execute 逐目录 stageDir 进回收区（O(1) 可逆）；
+ *  undo 按 manifest 筛 .pnpm 内记录逆序恢复（WAL 单 backup 字段装不下 N 条）。
+ *  ENOENT 幂等跳过：扫描与执行之间被并发清理是常态，不拖垮事务。 */
+export function makePnpmStoreRemoveOp(spec: PnpmStoreOpSpec): CleanOperation {
+  const stores = (ctx: TxContext) => listPnpmStores(spec.dshHomeOf(ctx), spec.profile, spec.target)
+  // 专用策略：allowedRoots 限定 profile 内，denyGlobs 不含 .pnpm 拒绝项
+  //（DENY 黑名单本为防误删 .pnpm 他人实体而设，本操作的目标恰在 .pnpm 内；
+  //  精确性由 pnpmStorePrefix 前缀匹配保证，dsh-base/.nuke 拒绝保留）
+  const policy: PathPolicy = {
+    allowedRoots: [{ kind: 'profile-dir', profile: spec.profile }],
+    denyGlobs: ['**/@deepseek-ai/dsh-base*', '**/.nuke/**'], strictWindows: true,
+  }
+  return {
+    id: `op-remove-pnpm-store:${spec.target}`,
+    action: 'remove-pnpm-store',
+    target: spec.target,
+
+    async preview(ctx): Promise<OperationPlan> {
+      const dirs = stores(ctx)
+      if (dirs.length === 0) {
+        return {
+          summary: 'pnpm 虚拟存储清理: 无匹配实体，跳过',
+          touchedPaths: [], estimatedBytesReclaimable: 0, requiresExclusiveLock: false,
+          skipped: true,
+        }
+      }
+      let bytes = 0
+      let fileCount = 0
+      for (const d of dirs) {
+        const s = dirStats(d)
+        bytes += s.bytes
+        fileCount += s.fileCount
+      }
+      return {
+        summary: `pnpm 虚拟存储清理: ${dirs.length} 个实体目录（${bytes} 字节 → 回收区）`,
+        touchedPaths: dirs.map(d => d as AbsolutePath),
+        estimatedBytesReclaimable: bytes,
+        requiresExclusiveLock: false,
+        fileCount,
+      }
+    },
+
+    async validate(ctx): Promise<Result<void>> {
+      for (const dir of stores(ctx)) {
+        const check = await ctx.resolver.assertDeletable(dir, policy)
+        if (!check.ok) return check
+      }
+      return ok(undefined)
+    },
+
+    async execute(ctx): Promise<Result<ExecutedStep>> {
+      const dirs = stores(ctx)
+      if (dirs.length === 0) {
+        return ok({
+          outcome: { bytesFreed: 0, message: '无匹配实体，跳过', skipped: true },
+          backup: null,
+        })
+      }
+      let bytes = 0
+      let backup = null
+      const failures: string[] = []
+      let vanished = 0
+      for (const dir of dirs) {
+        try {
+          const rec = await ctx.backups.stageDir(dir as AbsolutePath)
+          backup = backup ?? rec
+          bytes += rec.fingerprint.size
+        } catch (e) {
+          // 与 purge-temp 同款幂等纪律：目标已被并发清理 = 达成，不算失败
+          if ((e as NodeJS.ErrnoException).code === 'ENOENT') {
+            vanished++
+            continue
+          }
+          failures.push(`${dir}: ${errorToMessage(e)}`)
+        }
+      }
+      if (failures.length > 0 && bytes === 0) {
+        return err({ code: 'E_IO', message: `pnpm 虚拟存储清理全部失败: ${failures.join('; ')}` })
+      }
+      const done = dirs.length - failures.length - vanished
+      return ok({
+        outcome: {
+          bytesFreed: bytes,
+          message: `pnpm 虚拟存储清理 ${done}/${dirs.length} 个实体`
+            + (vanished > 0 ? `（已被并发清理 ${vanished}）` : ''),
+          ...(done === 0 && failures.length === 0 ? { skipped: true } : {}),
+        },
+        backup,
+      })
+    },
+
+    async undo(ctx, record): Promise<Result<void>> {
+      // N 个实体目录只有首条进 WAL step-done 的单 backup 字段；
+      // 恢复的第一事实源是 manifest（originalPath 在 .pnpm 内 = 本操作 stage 的）
+      const pnpmRoot = path.join(spec.dshHomeOf(ctx), 'profiles', spec.profile, 'node_modules', '.pnpm')
+      const mine = ctx.backups.manifest()
+        .filter(r => isInsideDir(pnpmRoot, r.originalPath))
+      const targets = mine.length > 0
+        ? [...mine].reverse()
+        : record !== null
+          ? [record]
+          : []
+      if (targets.length === 0) return ok(undefined)
+      let firstError: NukeError | null = null
+      for (const t of targets) {
+        const r = await ctx.backups.restore(t)
+        if (!r.ok && firstError === null) firstError = r.error
+      }
+      return firstError === null ? ok(undefined) : err(firstError)
+    },
+  }
+}
+
 // ─── TEMP 孤儿清理（aggressive 专属） ─────────────────────
 
 export interface PurgeTempOptions {

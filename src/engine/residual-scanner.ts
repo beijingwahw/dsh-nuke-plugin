@@ -76,9 +76,35 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
     }
   }
 
-  /** 单插件 × 单 profile 的全部检查点 */
+  /** pnpm 虚拟存储目录名匹配：plugin → .pnpm 下的实体目录名前缀。
+   *  普通包 `plugin@1.2.3`；scoped 包 `@scope+plugin@1.2.3`（`/`→`+`）；
+   *  peer/完整性后缀（`(peer@..)`/`(sha512:..)`）跟在版本后，前缀匹配覆盖 */
+  function pnpmStorePrefix(plugin: string): string {
+    return plugin.startsWith('@') ? plugin.replace('/', '+') + '@' : plugin + '@'
+  }
+
   function* checkPoints(plugin: string, profile: ProfileName) {
     const profileDir = path.join(options.dshHome, 'profiles', profile)
+    // 悬空声明（V5.8.9 实测发现）：dependencies/bundles 已声明但
+    // node_modules 缺失（--skip-standard 卸载 / pnpm remove 中途中断）。
+    // 危害：下次任意 pnpm install 会自动重装该插件 ——「删除后复活」。
+    // 判据必须含 node_modules 缺失：全局模式下插件集本身取自
+    // package.json，无条件检查会把每个正常安装的插件都误报成残留。
+    const pkgPath = path.join(profileDir, 'package.json')
+    yield {
+      kind: 'config-ref' as ResidualKind, location: pkgPath,
+      description: `package.json 悬空声明: ${plugin}（已声明未安装，下次 install 将复活）`,
+      isFile: true, action: 'clean-package-json' as const,
+      predicate: (): boolean => {
+        if (fs.existsSync(path.join(profileDir, 'node_modules', ...plugin.split('/')))) return false
+        try {
+          const pkg = asRecord(JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as unknown)
+          if (plugin in (asRecord(pkg?.dependencies) ?? {})) return true
+          const bundles = asRecord(asRecord(pkg?.dsh)?.profile)?.bundles
+          return Array.isArray(bundles) && (bundles as unknown[]).includes(plugin)
+        } catch { return false }
+      },
+    }
     yield {
       kind: 'config-ref' as ResidualKind, location: path.join(profileDir, 'pnpm-workspace.yaml'),
       description: `pnpm-workspace.yaml 中仍引用 ${plugin}`,
@@ -98,6 +124,27 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
       kind: 'node-modules' as ResidualKind, location: path.join(profileDir, 'node_modules', ...plugin.split('/')),
       description: `node_modules 包目录: ${plugin}`, isFile: false, action: 'remove-node-modules' as const,
     }
+    // V5.9.0 pnpm 虚拟存储残留（实测发现）：remove-node-modules 只删了
+    // node_modules/<plugin> 链接层，实体全在 .pnpm/<plugin>@<ver>/ 下 ——
+    // 这是卸载后最大的空间残留（pnpm store prune 也不回收：store 侧硬链接
+    // 计数未清零）。判据：链接层已不存在才算残留，正常安装不误报。
+    // scoped 包名 `/`→`+` 转义见 pnpmStorePrefix。
+    const nmLink = path.join(profileDir, 'node_modules', ...plugin.split('/'))
+    if (!fs.existsSync(nmLink)) {
+      const pnpmDir = path.join(profileDir, 'node_modules', '.pnpm')
+      let entries: string[] = []
+      try { entries = fs.readdirSync(pnpmDir) } catch {}
+      const prefix = pnpmStorePrefix(plugin)
+      for (const entry of entries) {
+        if (!entry.startsWith(prefix)) continue
+        yield {
+          kind: 'node-modules' as ResidualKind,
+          location: path.join(pnpmDir, entry),
+          description: `pnpm 虚拟存储实体: ${entry}`,
+          isFile: false, action: 'remove-pnpm-store' as const,
+        }
+      }
+    }
     yield {
       kind: 'storage' as ResidualKind, location: path.join(options.dshHome, 'storages', plugin),
       description: `storages 持久化数据: ${plugin}`, isFile: false, action: 'remove-storages' as const,
@@ -105,6 +152,14 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
     yield {
       kind: 'attachment' as ResidualKind, location: path.join(options.dshHome, 'attachments', 'v1', plugin),
       description: `attachments 会话附件: ${plugin}`, isFile: false, action: 'remove-attachments' as const,
+    }
+    // V5.9.0 lockfile 残留（report-only）：importer dependencies 与 packages
+    // 段的插件条目在卸载后仍留存。手改 lockfile 会破坏 integrity →
+    // 只报告，由下次 pnpm install 自动重新解析收敛
+    yield {
+      kind: 'lockfile' as ResidualKind, location: path.join(profileDir, 'pnpm-lock.yaml'),
+      description: `pnpm-lock.yaml 中仍引用 ${plugin}（仅报告，下次 install 自动收敛）`,
+      isFile: true, contains: plugin, action: 'report-only' as const,
     }
   }
 
@@ -177,12 +232,16 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
           try { stat = fs.statSync(cp.location) } catch {}
           if (stat === null) continue
 
+          // predicate 检查点（如悬空声明）：命中判定依赖外部状态
+          // （node_modules 存在性），contains 缓存语义不适用 —— 每次实判
+          if (cp.predicate !== undefined && !cp.predicate()) continue
+
           // 增量缓存命中判定：指纹（mtime+size）匹配才有资格复用
           const cached = cache?.get(cp.location, stat.mtimeMs, stat.size) ?? null
 
           // contains 检查：缓存命中直接用 containsHit；miss 才读全文并回写
           let containsHit: boolean
-          if (cp.isFile && cp.contains !== undefined) {
+          if (cp.predicate === undefined && cp.isFile && cp.contains !== undefined) {
             if (cached?.containsHit !== undefined) {
               containsHit = cached.containsHit
             } else {
@@ -208,6 +267,9 @@ export function createResidualScanner(options: ResidualScannerOptions): IResidua
               mtimeMs: stat.mtimeMs, size: stat.size, dirBytes: size,
             })
           }
+          // V5.9.0 report-only 残留（lockfile）：不删不编辑 → 可回收恒 0。
+          // 通用路径给的是文件体积，覆盖之，避免 bytesReclaimable 虚报
+          if (cp.action === 'report-only') size = 0
 
           bytesReclaimable += size
           totalFound++

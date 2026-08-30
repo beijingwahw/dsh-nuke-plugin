@@ -85,28 +85,34 @@ export type CleanStrategy = 'safe' | 'balanced' | 'aggressive'
 
 export type CleanAction =
   | 'standard-remove'
+  | 'clean-package-json'   // V5.9.0：package.json 悬空声明兜底清理（CLI 先行，契约对齐）
   | 'clean-workspace-yaml'
   | 'clean-profile-patch'
   | 'clean-home-patch'
   | 'remove-node-modules'
+  | 'remove-pnpm-store'    // V5.9.0：node_modules/.pnpm/<plugin>@* 虚拟存储实体清理
   | 'remove-storages'
   | 'remove-attachments'
   | 'pnpm-store-prune'
   | 'purge-temp'           // V4 新增：TEMP 目录孤儿清理
+  | 'report-only'          // V5.9.0：仅报告不执行（lockfile 等手改有风险的残留）
 
 /** CleanAction 的运行时白名单 —— 类型联合的值级伴随。
  *  磁盘数据（WAL/审计链）中的 action 字段名义上是 CleanAction，
  *  实际可能被篡改或来自旧版本；读侧窄化必须经此守卫而非 as 断言。 */
 export const CLEAN_ACTIONS: readonly CleanAction[] = [
   'standard-remove',
+  'clean-package-json',
   'clean-workspace-yaml',
   'clean-profile-patch',
   'clean-home-patch',
   'remove-node-modules',
+  'remove-pnpm-store',
   'remove-storages',
   'remove-attachments',
   'pnpm-store-prune',
   'purge-temp',
+  'report-only',
 ]
 
 export function isCleanAction(v: unknown): v is CleanAction {

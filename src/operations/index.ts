@@ -22,30 +22,35 @@ import type { IInputValidator } from '../contracts/validation'
 
 import { configEditOps } from './edit-ops'
 import { makePnpmPruneOp, makeStandardRemoveOp, type CommandRunner } from './exec-ops'
-import { dirRemoveOps, makePurgeTempOp } from './fs-ops'
+import { dirRemoveOps, makePnpmStoreRemoveOp, makePurgeTempOp } from './fs-ops'
 
 export const STRATEGY_ACTIONS: Readonly<Record<CleanStrategy, readonly CleanAction[]>> = {
   safe: [
     'standard-remove',
+    'clean-package-json',
     'clean-workspace-yaml',
     'clean-profile-patch',
     'clean-home-patch',
   ],
   balanced: [
     'standard-remove',
+    'clean-package-json',
     'clean-workspace-yaml',
     'clean-profile-patch',
     'clean-home-patch',
     'remove-node-modules',
+    'remove-pnpm-store',
     'remove-storages',
     'remove-attachments',
   ],
   aggressive: [
     'standard-remove',
+    'clean-package-json',
     'clean-workspace-yaml',
     'clean-profile-patch',
     'clean-home-patch',
     'remove-node-modules',
+    'remove-pnpm-store',
     'remove-storages',
     'remove-attachments',
     'pnpm-store-prune',
@@ -72,6 +77,10 @@ export const ACTION_METADATA: Readonly<Record<CleanAction, ActionMeta>> = {
     action: 'standard-remove', riskLevel: 'medium', scope: 'per-plugin',
     description: '调用 dsh CLI 标准卸载插件（外部包管理器副作用，undo 为补偿提示）',
   },
+  'clean-package-json': {
+    action: 'clean-package-json', riskLevel: 'low', scope: 'per-plugin',
+    description: '从 package.json 摘除 dependencies/bundles 悬空声明（行级可逆，防删除后复活；standard-remove 成功时为幂等 no-op）',
+  },
   'clean-workspace-yaml': {
     action: 'clean-workspace-yaml', riskLevel: 'low', scope: 'per-plugin',
     description: '从 profile 的 pnpm-workspace.yaml 摘除插件引用（行级精确摘除，快照可恢复）',
@@ -88,6 +97,10 @@ export const ACTION_METADATA: Readonly<Record<CleanAction, ActionMeta>> = {
     action: 'remove-node-modules', riskLevel: 'medium', scope: 'per-plugin',
     description: '将插件的 node_modules 包目录原子移入回收区（O(1) 可逆，commit 后才物理清除）',
   },
+  'remove-pnpm-store': {
+    action: 'remove-pnpm-store', riskLevel: 'medium', scope: 'per-plugin',
+    description: '将 node_modules/.pnpm/<插件>@<版本> 虚拟存储实体移入回收区（pnpm 结构下的空间大头，链接层删除后才算残留）',
+  },
   'remove-storages': {
     action: 'remove-storages', riskLevel: 'high', scope: 'per-plugin',
     description: '将插件的 storages 持久化数据移入回收区（数据丢失类动作，请确认无需保留）',
@@ -103,6 +116,10 @@ export const ACTION_METADATA: Readonly<Record<CleanAction, ActionMeta>> = {
   'purge-temp': {
     action: 'purge-temp', riskLevel: 'medium', scope: 'global',
     description: '清理 TEMP 下过期的 dsh 痕迹条目（标记+期限双重过滤，进回收区可恢复）',
+  },
+  'report-only': {
+    action: 'report-only', riskLevel: 'low', scope: 'per-plugin',
+    description: '仅报告不执行（lockfile 等手改有风险的残留，由下次 pnpm install 自动收敛）',
   },
 }
 
@@ -139,6 +156,9 @@ const PER_PLUGIN_BUILDERS: readonly PerPluginBuilder[] = [
     ...(options.toolRegistry ? { toolRegistry: options.toolRegistry } : {}),
   })],
   (plugin, profile, dshHomeOf) => configEditOps(plugin, profile, dshHomeOf),
+  // V5.9.0：.pnpm 实体清理排在 dirRemoveOps 之前 —— remove-node-modules 删
+  // 链接层后本操作收走实体，顺序与 CLI executeClean 一致
+  (plugin, profile, dshHomeOf) => [makePnpmStoreRemoveOp({ target: plugin, profile, dshHomeOf })],
   (plugin, profile, dshHomeOf) => dirRemoveOps(plugin, profile, dshHomeOf),
 ]
 

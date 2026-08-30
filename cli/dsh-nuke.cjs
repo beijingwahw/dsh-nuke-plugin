@@ -535,19 +535,19 @@ const STRATEGIES = {
   safe: {
     label: '🛡️ 安全模式',
     description: '仅标准卸载 + 清理配置引用，不删除目录',
-    actions: ['standard-remove', 'clean-workspace-yaml', 'clean-profile-patch', 'clean-home-patch'],
+    actions: ['standard-remove', 'clean-package-json', 'clean-workspace-yaml', 'clean-profile-patch', 'clean-home-patch'],
   },
   balanced: {
     label: '⚖️ 均衡模式',
-    description: '标准卸载 + 配置清理 + 删除 storages/attachments/node_modules',
-    actions: ['standard-remove', 'clean-workspace-yaml', 'clean-profile-patch', 'clean-home-patch',
-              'remove-node-modules', 'remove-storages', 'remove-attachments'],
+    description: '标准卸载 + 配置清理 + 删除 storages/attachments/node_modules/.pnpm 实体',
+    actions: ['standard-remove', 'clean-package-json', 'clean-workspace-yaml', 'clean-profile-patch', 'clean-home-patch',
+              'remove-node-modules', 'remove-pnpm-store', 'remove-storages', 'remove-attachments'],
   },
   aggressive: {
     label: '💥 激进模式',
     description: '均衡模式 + pnpm store prune，彻底清除',
-    actions: ['standard-remove', 'clean-workspace-yaml', 'clean-profile-patch', 'clean-home-patch',
-              'remove-node-modules', 'remove-storages', 'remove-attachments', 'pnpm-store-prune'],
+    actions: ['standard-remove', 'clean-package-json', 'clean-workspace-yaml', 'clean-profile-patch', 'clean-home-patch',
+              'remove-node-modules', 'remove-pnpm-store', 'remove-storages', 'remove-attachments', 'pnpm-store-prune'],
   },
 };
 
@@ -599,6 +599,27 @@ function scanResiduals(profile, pluginName) {
   const list = [];
   const profileDir = path.join(DSH_HOME, 'profiles', profile);
 
+  // V5.8.9 悬空声明检查：dependencies/bundles 已声明但 node_modules 缺失
+  // （--skip-standard 卸载 / pnpm remove 中途中断）→ 下次任意 pnpm install
+  // 会自动重装该插件（「删除后复活」）。node_modules 存在 = 正常安装状态，
+  // 不算残留（全局扫描的插件集取自 package.json，无条件检查会全部误报）。
+  const pkgJsonPath = path.join(profileDir, 'package.json');
+  if (fs.existsSync(pkgJsonPath) && !fs.existsSync(path.join(profileDir, 'node_modules', ...pluginName.split('/')))) {
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+      const declared = Object.keys(pkg?.dependencies || {}).includes(pluginName)
+        || (pkg?.dsh?.profile?.bundles || []).includes(pluginName);
+      if (declared) {
+        list.push({
+          location: pkgJsonPath,
+          description: `package.json 悬空声明（${pluginName} 已声明未安装，下次 install 将复活）`,
+          // 编辑类残留（删行不删文件）→ 空间回收为 0，避免"发现 123B / 释放 0B"的口径矛盾
+          severity: 4, sizeBytes: 0, action: 'clean-package-json',
+        });
+      }
+    } catch {}
+  }
+
   const fileChecks = [
     { path: path.join(profileDir, 'pnpm-workspace.yaml'), test: c => c.includes(pluginName), desc: `allowBuilds 中仍有 ${pluginName}`, severity: 3, action: 'clean-workspace-yaml' },
     { path: path.join(profileDir, 'cordis.patch.yml'), test: c => c.includes(pluginName), desc: `profile patch 中仍有 ${pluginName}`, severity: 5, action: 'clean-profile-patch' },
@@ -624,6 +645,41 @@ function scanResiduals(profile, pluginName) {
   for (const dc of dirChecks) {
     if (!fs.existsSync(dc.dir)) continue;
     list.push({ location: dc.dir, description: dc.desc, severity: dc.severity, sizeBytes: dirSize(dc.dir), action: dc.action });
+  }
+
+  // V5.9.0 pnpm 虚拟存储残留（实测发现）：remove-node-modules 只删链接层
+  // node_modules/<plugin>，实体全在 .pnpm/<plugin>@<ver>/ 下。pnpm 结构下
+  // 这才是体积大头，且 store prune 不回收。判据：链接层已删才算残留
+  // （正常安装的插件 .pnpm 实体是正常状态）。scoped 包 `/`→`+`。
+  const nmLink = path.join(profileDir, 'node_modules', pluginName);
+  if (!fs.existsSync(nmLink)) {
+    const pnpmDir = path.join(profileDir, 'node_modules', '.pnpm');
+    const prefix = pluginName.startsWith('@') ? pluginName.replace('/', '+') + '@' : pluginName + '@';
+    try {
+      const stores = fs.readdirSync(pnpmDir).filter(e => e.startsWith(prefix));
+      for (const s of stores) {
+        const sdir = path.join(pnpmDir, s);
+        list.push({
+          location: sdir, description: `pnpm 虚拟存储实体: ${s}（链接层已删，实体残留）`,
+          severity: 3, sizeBytes: dirSize(sdir), action: 'remove-pnpm-store',
+        });
+      }
+    } catch {}
+  }
+
+  // V5.9.0 lockfile 残留（report-only）：importer/packages 段的插件条目。
+  // 手改 lockfile 破坏 integrity → 只报告，下次 pnpm install 自动收敛
+  const lockPath = path.join(profileDir, 'pnpm-lock.yaml');
+  if (fs.existsSync(lockPath)) {
+    try {
+      if (fs.readFileSync(lockPath, 'utf-8').includes(pluginName)) {
+        list.push({
+          location: lockPath,
+          description: `pnpm-lock.yaml 中仍引用 ${pluginName}（仅报告，下次 install 自动收敛）`,
+          severity: 1, sizeBytes: 0, action: 'report-only',
+        });
+      }
+    } catch {}
   }
 
   // sessions 引用（仅报告）
@@ -713,6 +769,33 @@ function executeClean(profile, pluginName, actions, tx) {
     return null;
   });
 
+  runAction('clean-package-json', () => {
+    // V5.8.9 悬空声明兜底：standard-remove 成功时 dsh 已自清声明（此处
+    // no-op）；dsh CLI 缺失 / --skip-standard / remove 中途失败时声明残留
+    // —— 不清则下次 pnpm install 自动重装（「删除后复活」）
+    const pkgPath = path.join(profileDir, 'package.json');
+    if (!fs.existsSync(pkgPath)) return null;
+    let pkg;
+    try { pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')); } catch { return null; }
+    let changed = false;
+    if (pkg.dependencies && Object.prototype.hasOwnProperty.call(pkg.dependencies, pluginName)) {
+      delete pkg.dependencies[pluginName];
+      changed = true;
+    }
+    const bundles = pkg?.dsh?.profile?.bundles;
+    if (Array.isArray(bundles) && bundles.includes(pluginName)) {
+      pkg.dsh.profile.bundles = bundles.filter(b => b !== pluginName);
+      changed = true;
+    }
+    if (!changed) return null;
+    const backup = backupFile(pkgPath);
+    const step = tx.steps[tx.steps.length - 1];
+    if (backup) step.backup = backup;
+    fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+    log('CLEAN', `package.json: removed declaration of ${pluginName}`);
+    return '已清理 package.json 声明（防删除后复活）';
+  });
+
   runAction('clean-workspace-yaml', () => {
     const wsPath = path.join(profileDir, 'pnpm-workspace.yaml');
     if (!fs.existsSync(wsPath)) return null;
@@ -722,7 +805,19 @@ function executeClean(profile, pluginName, actions, tx) {
     const step = tx.steps[tx.steps.length - 1];
     if (backup) step.backup = backup;
     const lines = content.split('\n');
-    const newLines = lines.filter(l => !l.trim().startsWith(pluginName + ':') && !l.trim().startsWith(pluginName + ' :'));
+    // V5.8.9 修复：旧行过滤只匹配映射键（plugin:），漏掉 allowBuilds
+    // 列表项（- plugin / - 'plugin' / - "plugin"）→ 残留扫到但清不掉
+    const isTargetLine = (l) => {
+      const t = l.trim();
+      if (t.startsWith(pluginName + ':') || t.startsWith(pluginName + ' :')) return true;
+      const m = t.match(/^-\s*(.+)$/);
+      if (!m) return false;
+      let v = m[1].trim();
+      const hashIdx = v.indexOf(' #');
+      if (hashIdx !== -1) v = v.slice(0, hashIdx).trim();
+      return v.replace(/^['"]/, '').replace(/['"]$/, '') === pluginName;
+    };
+    const newLines = lines.filter(l => !isTargetLine(l));
     const newContent = newLines.join('\n');
     if (newContent !== content) { fs.writeFileSync(wsPath, newContent); log('CLEAN', `workspace.yaml: removed ${pluginName}`); return '已清理 pnpm-workspace.yaml'; }
     return null;
@@ -773,6 +868,30 @@ function executeClean(profile, pluginName, actions, tx) {
     });
   }
 
+  // V5.9.0 pnpm 虚拟存储实体清理：remove-node-modules 只删了链接层，
+  // .pnpm/<plugin>@<ver>/ 下的实体才是空间大头。前缀转义与扫描端一致
+  //（scoped `/`→`+`）。只删与目标插件精确匹配的实体目录，不碰 .pnpm 其他内容
+  runAction('remove-pnpm-store', () => {
+    const pnpmDir = path.join(profileDir, 'node_modules', '.pnpm');
+    if (!fs.existsSync(pnpmDir)) return null;
+    const prefix = pluginName.startsWith('@') ? pluginName.replace('/', '+') + '@' : pluginName + '@';
+    let stores;
+    try { stores = fs.readdirSync(pnpmDir).filter(e => e.startsWith(prefix)); } catch { return null; }
+    if (stores.length === 0) return null;
+    let freed = 0;
+    for (const s of stores) {
+      const sdir = path.join(pnpmDir, s);
+      const size = dirSize(sdir);
+      fs.rmSync(sdir, { recursive: true, force: true });
+      freed += size;
+    }
+    totalFreed += freed;
+    const step = tx.steps[tx.steps.length - 1];
+    step.sizeFreed = freed;
+    log('CLEAN', `removed .pnpm entities: ${stores.join(', ')} (${formatBytes(freed)})`);
+    return `已删除 pnpm 虚拟存储实体 ×${stores.length}: ${stores.join(', ')} (${formatBytes(freed)})`;
+  });
+
   runAction('pnpm-store-prune', () => {
     const bin = resolveBin('pnpm');
     if (!bin) {
@@ -803,7 +922,9 @@ function runHealthChecks(profile) {
       results.push({ check: 'package.json 语法', passed: true, message: 'JSON 格式正确' });
       const bundles = pkg?.dsh?.profile?.bundles || [];
       const deps = Object.keys(pkg?.dependencies || {});
-      const orphans = bundles.filter(b => !deps.includes(b) && b !== '@deepseek-ai/dsh-base');
+      // dsh 内置 bundle（dsh-base/dsh-web-app/dsh-tui-app…）由 dsh 自行写入
+      // bundles 而不进 dependencies —— 前缀判据与下方 1111 行既有逻辑对齐
+      const orphans = bundles.filter(b => !deps.includes(b) && !b.startsWith('@deepseek-ai/dsh-'));
       results.push({ check: 'bundles 一致性', passed: orphans.length === 0, message: orphans.length === 0 ? '所有 bundle 均有对应依赖' : `孤立: ${orphans.join(', ')}` });
     } catch (err) {
       results.push({ check: 'package.json', passed: false, message: `解析失败: ${err.message}` });
@@ -926,14 +1047,26 @@ function cmdClean(positional, flags) {
     report.push(c.dim(`   插件: ${names.join(', ')} | profile: ${profile} | 策略: ${strat.label} | dry_run: ${dryRun}`));
     report.push('═'.repeat(60));
 
-    // 依赖检测
+    // 依赖检测（V5.9.0：警告 → 阻断）。实测发现仅警告时用户照删，
+    // 依赖方运行时 require 失败连带崩掉整个 dsh。--force 明确越过。
+    const blockedBy = [];
     for (const name of names) {
       const deps = checkDependents(profile, name);
-      if (deps.length > 0) {
-        const warn = `"${name}" 被以下插件依赖: ${deps.join(', ')}`;
-        allWarnings.push(warn);
+      if (deps.length > 0) blockedBy.push({ name, deps });
+    }
+    if (blockedBy.length > 0) {
+      for (const b of blockedBy) {
+        const warn = `"${b.name}" 被以下插件依赖: ${b.deps.join(', ')}`;
         report.push(c.red(`🚨 ${warn}`));
+        if (!flags.force) allWarnings.push(warn);
       }
+      if (!flags.force && !dryRun) {
+        report.push(c.red('   卸载将破坏上述插件的运行时依赖。确认无误请加 --force 重试。'));
+        console.error(report.join('\n'));
+        log('NUKE_BLOCKED', `plugins=[${blockedBy.map(b => b.name).join(',')}] dependents detected`);
+        process.exit(1);
+      }
+      if (flags.force) report.push(c.yellow('   --force：跳过阻断继续执行（依赖方可能损坏）'));
     }
 
     // 快照
@@ -1311,6 +1444,7 @@ for (let i = 0; i < restArgs.length; i++) {
   else if (restArgs[i] === '--strategy') { flags.strategy = restArgs[++i]; }
   else if (restArgs[i] === '--skip-standard') { flags.skipStandard = true; }
   else if (restArgs[i] === '--skip-health')   { flags.skipHealth = true; }
+  else if (restArgs[i] === '--force')         { flags.force = true; }  // 越过依赖方阻断
   else if (restArgs[i] === '--json')     { flags.json = true; }   // 机器可读输出（scan/deps/health/sweep）
   else if (restArgs[i] === '--version' || restArgs[i] === '-v') { flags.version = true; }
   else { positional.push(restArgs[i]); }
@@ -1412,6 +1546,7 @@ ${c.cyan('通用选项:')}
   --dry-run             仅预览，不执行
   --skip-standard       跳过标准卸载
   --skip-health         跳过健康检查
+  --force               越过依赖方阻断（明知被依赖仍强制卸载）
   --json                机器可读输出（scan / deps / sweep / health）
   --version, -v         输出版本号
 
