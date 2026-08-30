@@ -1298,6 +1298,18 @@ process.on('uncaughtException', err => {
   process.exit(1);
 });
 
+// V5.8.5 信号退出兜底：SIGINT/SIGTERM/SIGHUP 的默认行为是直接终止进程，
+// try/finally 不执行 —— Ctrl+C / kill 一次就漏一把锁，占用至 TTL 过期。
+// 注册处理器：先释放（releaseLock 内 bootToken 归属核验，只删自己的锁，
+// 未持锁时为无害 no-op），再按 128+信号值 惯例码退出。
+const SIG_EXIT_CODES = { SIGINT: 130, SIGHUP: 129, SIGTERM: 143 };
+for (const sig of Object.keys(SIG_EXIT_CODES)) {
+  process.on(sig, () => {
+    try { releaseLock(); } catch {}
+    process.exit(SIG_EXIT_CODES[sig]);
+  });
+}
+
 // help/version 不依赖 DSH_HOME（排障时可能恰好环境损坏，最需要看到用法）
 // 注意 --version 可独立于子命令出现（此时它占据 command 位，不进 flags 解析）
 if (flags.version || command === '--version' || command === '-v') {

@@ -181,6 +181,8 @@ describe('陈旧锁自动回收（V5.6.2）', () => {
   })
 
   it('持有者已死但 TTL 未到期 → 不回收，报错携带自动回收倒计时', async () => {
+    // 跨主机保守边界（ownerA.hostname='h' ≠ os.hostname()）：共享锁目录上
+    // 本机永远探不到他机进程，TTL 过期是远程持有者的唯一保护（V5.8.5）
     const m = makeManager([])
     okv(await m.acquire(req(ownerA, 'exclusive', 10_000)))
     nowStub.value += 4000   // 剩余 6s
@@ -191,6 +193,31 @@ describe('陈旧锁自动回收（V5.6.2）', () => {
     expect(r.error.message).toContain('进程已死')
     expect(r.error.message).toContain('6')
     expect(r.error.message).toContain('自动回收')
+  })
+
+  // V5.8.5 同机已死立即回收（"用完即放，绝不占用"）：本机 kill 探测权威
+  // （ESRCH = 内核证明进程不存在），死亡即终局，TTL 不再是必要条件。
+  // 现实价值：崩溃/被 kill 的持有者不再让后续全部 nuke 操作白等 5 分钟 TTL。
+  it('V5.8.5 同机持有者已死但 TTL 未到期 → exclusive 获取路径立即回收', async () => {
+    const m = makeManager([])   // 111 已死
+    const localA: LockOwner = { pid: 111, hostname: os.hostname(), bootToken: 'a', purpose: 'clean' }
+    okv(await m.acquire(req(localA, 'exclusive', 10_000)))
+    nowStub.value += 1000   // TTL 剩余 9s：旧实现报 E_LOCK_HELD + 倒计时
+    const h2 = await m.acquire(req(ownerB, 'exclusive'))
+    expect(h2.ok).toBe(true)
+    expect(m.holders({ kind: 'global' }).length).toBe(1)
+    if (h2.ok) await h2.value.release()
+  })
+
+  it('V5.8.5 同机持有者已死但 TTL 未到期 → shared 获取路径（guard 内回收）同样立即回收', async () => {
+    const m = makeManager([])
+    const localA: LockOwner = { pid: 111, hostname: os.hostname(), bootToken: 'a', purpose: 'clean' }
+    okv(await m.acquire(req(localA, 'exclusive', 10_000)))
+    nowStub.value += 1000
+    const h2 = await m.acquire(req(ownerB, 'shared'))
+    expect(h2.ok).toBe(true)
+    expect(m.holders({ kind: 'global' }).length).toBe(1)
+    if (h2.ok) await h2.value.release()
   })
 
   it('持有者存活且过期 → 严格破锁纪律，不自动回收（防 SIGSTOP/长 GC 误伤）', async () => {
@@ -525,6 +552,23 @@ describe('V5.7 inspect() 锁诊断快照', () => {
     expect(reused.pidReused).toBe(true)    // 指纹不符 → PID 被复用
     expect(reused.alive).toBe(false)
     expect(reused.autoReapInSec).toBe(0)   // 已过期 → 立即可回收
+  })
+
+  it('V5.8.5 同机全体已死（TTL 未过期）→ autoReapInSec=0（立即可回收，不再倒计时）', () => {
+    const lockRoot = path.join(tmp, `run-${Math.random().toString(36).slice(2)}`)
+    const dir = path.join(lockRoot, 'locks')
+    fs.mkdirSync(dir, { recursive: true })
+    const t = nowStub.value
+    fs.writeFileSync(path.join(dir, 'global.lock'), JSON.stringify({
+      version: 1, scope: 'global', mode: 'exclusive',
+      owners: [{ owner: { pid: 999, hostname: os.hostname(), bootToken: 'z', purpose: 'clean' },
+        acquiredAt: 't0', expiresAt: t + 60_000 }],
+    }))
+    const m = createLockManager({ lockRoot, now: () => t, probe: { isAlive: () => false } })
+    const slot = m.inspect()[0]!.slots[0]!
+    expect(slot.alive).toBe(false)
+    expect(slot.expired).toBe(false)          // TTL 未过期
+    expect(slot.autoReapInSec).toBe(0)        // 同机已死 → 立即回收（旧实现为 60）
   })
 
   it('空锁目录 → 空快照（不抛错）', () => {

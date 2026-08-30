@@ -9,10 +9,11 @@
 //     随机后缀 guard 每个进程创建不同文件名，O_EXCL 永不冲突，形同虚设。
 //  5. 等待重试 = 指数退避 + 等值抖动（防惊群）；acquire 可选自动心跳续期
 //  6. V5.6.2 陈旧锁自动回收：获取路径内嵌 reapStale —— 全体 owner 均
-//     TTL 过期且进程已死（verifiedDead && ttlExpired 双条件，纪律同 2.）
-//     的锁文件在 guard 互斥下就地删除。修复缺陷：持有者崩溃后锁文件永久
-//     残留，O_EXCL 永远失败，acquire 只能 E_LOCK_HELD —— 全部 nuke 操作
-//     被一个早已死亡的进程无限期阻塞（breakStale 从未被生产代码调用）。
+//     不可回收（见 slotReapable）的锁文件在 guard 互斥下就地删除。修复
+//     缺陷：持有者崩溃后锁文件永久残留，O_EXCL 永远失败，acquire 只能
+//     E_LOCK_HELD —— 全部 nuke 操作被一个早已死亡的进程无限期阻塞
+//    （breakStale 从未被生产代码调用）。V5.8.5 收紧占用：同主机已证
+//     死亡的持有者立即回收（不等 TTL）；跨主机维持 TTL 双条件保守纪律。
 import { spawnSync } from 'child_process'
 import * as crypto from 'crypto'
 import * as fs from 'fs'
@@ -238,14 +239,24 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
     }
   }
 
-  /** V5.6.2 锁文件整体陈旧判定：全体 owner 均 TTL 过期且进程已死
-   *  （verifiedDead && ttlExpired 双条件，与 breakStale 同纪律）。任一
-   *  owner 未过期或仍存活 → false：慢而未死（SIGSTOP/长 GC）的持有者
-   *  可能随时恢复工作，绝不能在它头上并发第二个清理者。空 owners 视为
-   *  非陈旧（结构异常保守处理）。 */
+  /** V5.8.5 单 slot 可回收判定（持有者已死的前提下分主机域）：
+   *  - 同主机（hostname 与本机一致）：kill 探测是权威事实 —— ESRCH 即
+   *    内核证明该进程不存在，EPERM/EACCES 仍按存活保守；PID 复用由
+   *    startTime 指纹甄别。死亡即终局，TTL 不再是必要条件 → 立即回收。
+   *    bootToken 防住复用进程的 refresh/release，误回收无副作用窗口。
+   *  - 跨主机（锁目录可能在共享存储上，hostname 不匹配恒判"死"）：
+   *    本机永远探测不到他机进程，TTL 过期是远程持有者的唯一保护
+   *    （autoRenew 心跳持续保鲜 expiresAt）→ 维持 TTL 双条件保守。
+   *  持有者仍活 → 一律不可回收（SIGSTOP/长 GC 慢而未死，可能随时恢复）。 */
+  function slotReapable(o: { owner: LockOwner; expiresAt: number }, t: number): boolean {
+    if (holderAlive(o.owner)) return false
+    return o.owner.hostname === os.hostname() || o.expiresAt <= t
+  }
+
+  /** V5.6.2 锁文件整体陈旧判定：全体 owner 均可回收（slotReapable）。
+   *  任一 owner 仍存活 → false。空 owners 视为非陈旧（结构异常保守处理）。 */
   function allSlotsStale(cur: LockFileContent, t: number): boolean {
-    return cur.owners.length > 0 && cur.owners.every(o =>
-      o.expiresAt <= t && !holderAlive(o.owner))
+    return cur.owners.length > 0 && cur.owners.every(o => slotReapable(o, t))
   }
 
   /** V5.6.2 陈旧锁自动回收（获取路径内嵌，唯一被生产触发的破锁路径）：
@@ -463,12 +474,15 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
           const reuse = pidReuseOf(o.owner)
           const dead = reuse === true || !probe.isAlive(o.owner.pid, o.owner.hostname)
           const expired = o.expiresAt <= t
-          // 四象限单口径（与 inspect()/allSlotsStale 同判据）：
+          // 四象限单口径（与 inspect()/slotReapable 同判据）：
           //  活跃 / 已过期仍存活（SIGSTOP/长 GC，绝不可回收）/ 已死未到期
-          //  （给出自动回收倒计时）/ 陈旧残留（reap 不可达时的兜底报告）
+          //  （V5.8.5 同机=可立即回收，跨机=倒计时）/ 陈旧残留（兜底报告）
           if (!dead && !expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 活跃)`
           if (!dead) return `${o.owner.purpose}(pid ${o.owner.pid}, 已过期但进程仍存活)`
           if (expired) return `${o.owner.purpose}(pid ${o.owner.pid}, 陈旧残留)`
+          if (o.owner.hostname === os.hostname()) {
+            return `${o.owner.purpose}(pid ${o.owner.pid}, 进程已死（本机已证，可立即回收 —— 本次回收受阻，请重试）)`
+          }
           const remainSec = Math.max(0, Math.round((o.expiresAt - t) / 1000))
           return `${o.owner.purpose}(pid ${o.owner.pid}, 进程已死, TTL 剩余 ${remainSec}s 后自动回收)`
         }).join(', ') ?? 'unknown'
@@ -560,9 +574,11 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
         if (!f.endsWith('.lock')) continue
         const cur = readLock(path.join(lockDir, f))
         if (!cur) continue
-        // 全体 owner 进程已死 → TTL 全部过期后自动回收（allSlotsStale 同判据）
+        // 全体 owner 进程已死 → 可回收；V5.8.5 分主机域给出时限：
+        // 全部同机 → 0（死亡即事实，立即回收）；任一跨机 → TTL 倒计时
         const allDead = cur.owners.length > 0
           && cur.owners.every(o => !holderAlive(o.owner))
+        const allLocal = cur.owners.every(o => o.owner.hostname === os.hostname())
         const lastExpire = Math.max(...cur.owners.map(o => o.expiresAt))
         const slots: readonly LockSlotStatus[] = cur.owners.map(o => {
           const reuse = pidReuseOf(o.owner)
@@ -576,7 +592,9 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
             alive,
             expired: o.expiresAt <= t,
             pidReused: reuse,
-            autoReapInSec: allDead ? Math.max(0, Math.round((lastExpire - t) / 1000)) : null,
+            autoReapInSec: allDead
+              ? (allLocal ? 0 : Math.max(0, Math.round((lastExpire - t) / 1000)))
+              : null,
           }
         })
         out.push({ file: f, scope: cur.scope, mode: cur.mode, slots })
