@@ -418,13 +418,25 @@ function acquireLock(operation) {
 }
 
 function releaseLock() {
-  // 只清除自己的锁：确认锁内 bootToken 归属，防止误删他人刚重建的锁
-  try {
-    const lock = readV4Lock(LOCK_FILE);
-    if (lock && lock.owners.some(o => o.owner && o.owner.bootToken === CLI_BOOT_TOKEN)) {
-      fs.unlinkSync(LOCK_FILE);
+  // 只清除自己的锁：确认锁内 bootToken 归属，防止误删他人刚重建的锁。
+  // V5.8.6 瞬态重试：Windows AV/索引器短暂占用（EPERM/EBUSY/EACCES）时
+  // unlink 间歇失败 —— 只试一次 = 锁残留，且 CLI 退出后须等 TTL + 陈旧
+  // 回收兜底，期间全部并发清理被阻塞。退避用 Atomics.wait 同步睡眠
+  //（exit 处理器内 setTimeout 永不触发），最多 3 次尝试。
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const lock = readV4Lock(LOCK_FILE);
+      if (lock && lock.owners.some(o => o.owner && o.owner.bootToken === CLI_BOOT_TOKEN)) {
+        fs.unlinkSync(LOCK_FILE);
+      }
+      return;
+    } catch (e) {
+      const code = e && e.code;
+      const transient = code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
+      if (!transient || attempt >= 2) return; // 退出路径静默：非瞬态/耗尽即止
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50 * (attempt + 1));
     }
-  } catch {}
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1309,6 +1321,15 @@ for (const sig of Object.keys(SIG_EXIT_CODES)) {
     process.exit(SIG_EXIT_CODES[sig]);
   });
 }
+
+// V5.8.6 退出兜底（最后一道防线）：process.exit() 立即终止进程，try/finally
+// 不执行 —— CLI 内任意 process.exit 调用点若处于持锁窗口内，cmdNuke 的
+// finally 释放全部跳过。exit 处理器在一切退出路径（正常结束/process.exit/
+// 未捕获异常收尾）同步执行；releaseLock 幂等（归属核验 + 已删即 no-op），
+// 与信号/uncaughtException 处理器的先行释放重复调用无副作用。
+process.on('exit', () => {
+  try { releaseLock(); } catch {}
+});
 
 // help/version 不依赖 DSH_HOME（排障时可能恰好环境损坏，最需要看到用法）
 // 注意 --version 可独立于子命令出现（此时它占据 command 位，不进 flags 解析）

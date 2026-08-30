@@ -264,7 +264,14 @@ export function createTransactionEngine(
    *  否则锁悬挂会阻塞后续全部清理事务。 */
   async function finalize(rt: TxRuntime): Promise<void> {
     rememberFinished(rt.txId, summarize(rt, rt.txId))
-    await rt.lockHandle.release()
+    // V5.8.6：release 内部已带瞬态重试；此处仅记录残余失败（永久性 IO
+    // 故障）—— 静默丢弃会把"锁占用中"伪装成"已释放"，排障无从下手。
+    const releasedResult = await rt.lockHandle.release()
+    if (!releasedResult.ok) {
+      deps.logger.error('事务锁释放失败（陈旧回收将在进程退出后兜底）', {
+        tx: rt.txId, error: releasedResult.error.message,
+      })
+    }
     runtimes.delete(rt.txId)
   }
 

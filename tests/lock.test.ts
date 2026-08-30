@@ -1,12 +1,46 @@
 import * as fs from 'fs'
+import type * as FsModule from 'fs'
 import * as os from 'os'
 import * as path from 'path'
 
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ok } from '../src/contracts/base'
 import type { LockOwner, LockRequest } from '../src/contracts/lock'
 import { createLockManager, defaultProcessProbe } from '../src/infra/lock-manager'
+
+// ─── V5.8.6 释放重试故障注入（ESM 命名空间不可 spyOn，与
+// engine-v5.test.ts 的 tamperMetaJson 同模式：vi.mock 透传真实 fs，
+// 仅按队列逐次注入 errno 抛出；队列空 = 完全透传，其余测试不受影响）───
+const releaseFailures = vi.hoisted(() => ({
+  unlink: [] as string[],
+  unlinkCalls: 0,
+  rename: [] as string[],
+  renameCalls: 0,
+}))
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof FsModule>()
+  const errnoThrow = (code: string): never => {
+    const e = new Error(`${code}: simulated transient failure`) as NodeJS.ErrnoException
+    e.code = code
+    throw e
+  }
+  return {
+    ...actual,
+    unlinkSync: (((p: fs.PathLike) => {
+      releaseFailures.unlinkCalls++
+      const code = releaseFailures.unlink.shift()
+      if (code !== undefined) errnoThrow(code)
+      return actual.unlinkSync(p)
+    }) as typeof actual.unlinkSync),
+    renameSync: (((a: fs.PathLike, b: fs.PathLike) => {
+      releaseFailures.renameCalls++
+      const code = releaseFailures.rename.shift()
+      if (code !== undefined) errnoThrow(code)
+      return actual.renameSync(a, b)
+    }) as typeof actual.renameSync),
+  }
+})
 
 let tmp: string
 const nowStub = { value: 1_000_000 }
@@ -61,6 +95,66 @@ describe('独占锁', () => {
     expect(h.ok).toBe(true)
     await okv(h).release()
     expect((await okv(h).release()).ok).toBe(true)
+  })
+})
+
+describe('V5.8.6 释放瞬态重试（用完即放，绝不占用）', () => {
+  beforeEach(() => {
+    releaseFailures.unlink.length = 0
+    releaseFailures.rename.length = 0
+    releaseFailures.unlinkCalls = 0
+    releaseFailures.renameCalls = 0
+  })
+  // 队列残留清理：未消费的注入项绝不允许泄漏进后续 describe 的测试
+  afterEach(() => {
+    releaseFailures.unlink.length = 0
+    releaseFailures.rename.length = 0
+  })
+
+  it('unlink 首次 EPERM（Windows AV 短暂占用）→ 退避重试后释放成功', async () => {
+    const m = makeManager()
+    const h = okv(await m.acquire(req(ownerA, 'exclusive')))
+    releaseFailures.unlink.push('EPERM')   // 仅首次失败，其后透传真实实现
+    const r = await h.release()
+    expect(r.ok).toBe(true)                      // 瞬态抖动在 release 内自愈
+    expect(releaseFailures.unlinkCalls).toBe(2)  // 失败 1 次 + 重试成功 1 次
+    // 锁确实已删：下一个获取者立即成功（不等 TTL/陈旧回收兜底）
+    const h2 = await m.acquire(req(ownerB, 'exclusive'))
+    expect(h2.ok).toBe(true)
+    if (h2.ok) await h2.value.release()
+  })
+
+  it('非瞬态错误（永久性故障）→ 立即失败，不做无意义重试', async () => {
+    const m = makeManager()
+    const h = okv(await m.acquire(req(ownerA, 'exclusive')))
+    // 队列备足 4 份：若实现错误地重试，第 2 次调用仍会抛（计数断言拆穿）
+    releaseFailures.unlink.push('EISDIR', 'EISDIR', 'EISDIR', 'EISDIR')
+    const r = await h.release()
+    expect(r.ok).toBe(false)
+    expect(releaseFailures.unlinkCalls).toBe(1)  // 单次尝试即透传非瞬态错误
+  })
+
+  it('瞬态错误持续 → 3 次尝试耗尽后报错（不无限重试）', async () => {
+    const m = makeManager()
+    const h = okv(await m.acquire(req(ownerA, 'exclusive')))
+    releaseFailures.unlink.push('EBUSY', 'EBUSY', 'EBUSY', 'EBUSY', 'EBUSY')
+    const r = await h.release()
+    expect(r.ok).toBe(false)
+    expect(releaseFailures.unlinkCalls).toBe(3)  // 1 + 2 次重试 = 上限
+  })
+
+  it('shared 模式 rename 瞬态失败同样重试自愈', async () => {
+    const m = makeManager()
+    const h1 = okv(await m.acquire(req(ownerA, 'shared')))
+    okv(await m.acquire(req(ownerB, 'shared')))
+    // 第二个 shared 获取走读-改-写也调 renameSync：清零后只观测 release 阶段
+    releaseFailures.renameCalls = 0
+    releaseFailures.rename.push('EACCES')   // 首次 rename 失败
+    const r = await h1.release()
+    expect(r.ok).toBe(true)
+    expect(releaseFailures.renameCalls).toBe(2)  // 失败 1 次 + 重试成功 1 次
+    // ownerA 已移除，仅剩 ownerB：引用计数正确
+    expect(m.holders({ kind: 'global' }).length).toBe(1)
   })
 })
 

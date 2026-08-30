@@ -27,7 +27,7 @@ import type {
   LockSlotStatus, ProcessProbe, StaleProof,
 } from '../contracts/lock'
 
-import { writeAllSync } from './fs-utils'
+import { TRANSIENT_ERRNO_CODES, withTransientRetry, writeAllSync } from './fs-utils'
 
 interface LockFileContent {
   readonly version: 1
@@ -37,6 +37,21 @@ interface LockFileContent {
 }
 
 const LOCK_DIR_NAME = 'locks'
+
+// ─── V5.8.6 释放路径瞬态重试参数 ─────────────────────────────
+// 释放的 unlink/rename 失败码 = 杀软/索引器占用的典型签名（EPERM/EACCES
+// 仅在 Windows libuv 上出现）∪ fs-utils 的通用瞬态集合（EMFILE/EBUSY 等）。
+// 哨兵错误无 errno code（isTransientError 判 code 字段恒 false）—— 抛出即
+// 终止 withTransientRetry 循环，guard 不可用不做额外重试。
+const RELEASE_TRANSIENT_CODES: readonly string[] = [...TRANSIENT_ERRNO_CODES, 'EPERM', 'EACCES']
+
+/** guard 不可用的内部控制流哨兵（非瞬态，立即终止释放重试循环） */
+class ReleaseGuardUnavailableError extends Error {
+  constructor() {
+    super('release guard unavailable')
+    this.name = 'ReleaseGuardUnavailableError'
+  }
+}
 
 export interface LockManagerOptions {
   /** 锁文件根目录，默认 <dshHome>/.nuke/locks */
@@ -378,48 +393,60 @@ export function createLockManager(options: LockManagerOptions): LockManagerRunti
       // 先停心跳再释放：避免释放后残留一轮续期与 unlink 竞争
       //（移入 doRelease：失败重试路径同样不允许心跳复活已删的锁）
       stopAutoRenew()
+      // V5.8.6 瞬态失败有界重试（「用完即放」的自愈闭环）：unlink/rename 遇
+      // Windows AV/索引器短暂占用（EPERM/EBUSY/EACCES）时旧实现直接报错
+      // 返回 —— 锁文件残留且本进程存活，持有者存活保护使陈旧回收永不触发
+      // （DSH 宿主进程存活数天 = 独占锁占用数天，阻塞全部清理事务）。
+      // guard 在 withGuard 的 finally 中必被释放，逐次重试重新进临界区安全；
+      // 非瞬态错误（永久权限缺失等）立即透传，不做无意义重试。
       try {
-        // shared：读-改-写必须进 guard，否则两个并发 release 的 rename 互相
-        // 覆盖，丢失对方的移除结果。exclusive 同样进 guard 且核验归属后再
-        // unlink：锁文件可能已被陈旧回收 + 他人重建（跨机共享锁目录上，
-        // 持有者挂起恢复后 TTL 早已过期 —— 本机视角 kill(pid,0) 探不到他机
-        // 进程，他机按"已死+过期"回收是设计内行为）。盲 unlink 会删掉现任
-        // 持有者的锁，两个 exclusive 并存 = 互斥语义静默破产；check 与
-        // unlink 必须在同一 guard 临界区内（无 TOCTOU 窗口）。
-        const done = await withGuard(p, now, () => {
-          const cur = readLock(p)
-          if (!cur) return true   // 文件已不存在：幂等成功
-          if (request.mode === 'shared') {
-            const rest = cur.owners.filter(o => !sameOwner(o.owner, request.owner))
-            if (rest.length === 0) {
-              // V5.7：unlink 失败（Windows AV/索引器短暂占用 → EPERM/EBUSY）
-              // 不再吞错——静默成功会把"锁文件残留+进程存活"伪装成已释放，
-              // 该锁到进程退出前都不可回收（allSlotsStale 要求进程死亡）。
+        await withTransientRetry(async () => {
+          // shared：读-改-写必须进 guard，否则两个并发 release 的 rename 互相
+          // 覆盖，丢失对方的移除结果。exclusive 同样进 guard 且核验归属后再
+          // unlink：锁文件可能已被陈旧回收 + 他人重建（跨机共享锁目录上，
+          // 持有者挂起恢复后 TTL 早已过期 —— 本机视角 kill(pid,0) 探不到他机
+          // 进程，他机按"已死+过期"回收是设计内行为）。盲 unlink 会删掉现任
+          // 持有者的锁，两个 exclusive 并存 = 互斥语义静默破产；check 与
+          // unlink 必须在同一 guard 临界区内（无 TOCTOU 窗口）。
+          const done = await withGuard(p, now, () => {
+            const cur = readLock(p)
+            if (!cur) return true   // 文件已不存在：幂等成功
+            if (request.mode === 'shared') {
+              const rest = cur.owners.filter(o => !sameOwner(o.owner, request.owner))
+              if (rest.length === 0) {
+                // V5.7：unlink 失败（Windows AV/索引器短暂占用 → EPERM/EBUSY）
+                // 不再吞错——静默成功会把"锁文件残留+进程存活"伪装成已释放，
+                // 该锁到进程退出前都不可回收（allSlotsStale 要求进程死亡）。
+                // V5.8.6 起瞬态失败由外层 withTransientRetry 自愈。
+                fs.unlinkSync(p)
+              } else {
+                const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
+                fs.writeFileSync(tmp, JSON.stringify({ ...cur, owners: rest }, null, 2))
+                fs.renameSync(tmp, p)
+              }
+              return true
+            }
+            // exclusive：仅当锁文件仍含本人 slot 才删除；已易主（本人 slot 被
+            // 安全回收）视同已释放，绝不删他人的锁
+            if (cur.owners.some(o => sameOwner(o.owner, request.owner))) {
               fs.unlinkSync(p)
-            } else {
-              const tmp = p + '.tmp.' + crypto.randomBytes(4).toString('hex')
-              fs.writeFileSync(tmp, JSON.stringify({ ...cur, owners: rest }, null, 2))
-              fs.renameSync(tmp, p)
             }
             return true
-          }
-          // exclusive：仅当锁文件仍含本人 slot 才删除；已易主（本人 slot 被
-          // 安全回收）视同已释放，绝不删他人的锁
-          if (cur.owners.some(o => sameOwner(o.owner, request.owner))) {
-            fs.unlinkSync(p)
-          }
-          return true
-        }, guardHolderAlive)
-        if (done !== true) {
-          // released 未置位：guard 恢复后可重试 release
-          return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用（可重试 release）' })
-        }
+          }, guardHolderAlive)
+          // guard 不可用：withGuard 内部已等满 GUARD_MAX_WAIT_MS，立即重试
+          // 大概率再等一轮 —— 抛非瞬态哨兵终止重试循环，交还调用方处置
+          if (done !== true) throw new ReleaseGuardUnavailableError()
+        }, { retries: 2, baseDelayMs: 50, maxDelayMs: 200, codes: RELEASE_TRANSIENT_CODES })
         released = true
         return ok(undefined)
       } catch (e) {
+        if (e instanceof ReleaseGuardUnavailableError) {
+          // released 未置位：guard 恢复后可重试 release
+          return err({ code: 'E_LOCK_STATE', message: '释放锁失败：互斥 guard 在等待窗口内不可用（可重试 release）' })
+        }
         // released 未置位：锁文件可能仍存在，调用方可重试 release 或交给
         // 陈旧回收（进程退出 + TTL 过期后自动兜底）
-        return err(ioError('释放锁失败（锁文件可能被暂时占用，可重试 release）', e))
+        return err(ioError('释放锁失败（重试已耗尽，锁文件可能仍被占用）', e))
       }
     }
 
