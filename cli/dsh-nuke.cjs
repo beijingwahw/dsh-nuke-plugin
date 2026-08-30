@@ -301,7 +301,12 @@ function readV4Lock(p) {
  *  的补集是"每 owner 过期 OR 死亡"—— 存活但 TTL 已过（CLI 无心跳续期，
  *  长清理必然出现）的持有者锁会被并发 CLI 强行破掉，产生两个并发清理
  *  者恰是锁要防的事故。收紧后：进程已死须等 TTL 过期、TTL 过期须等进程
- *  确认死亡，双条件同时满足才允许破锁（与插件版 reapStale 同纪律）。 */
+ *  确认死亡，双条件同时满足才允许破锁（与插件版 reapStale 同纪律）。
+ *  V5.8.8 分主机域（与插件版 slotReapable 同判据）：同机持有者已死
+ *  （kill ESRCH 内核权威证明）→ 立即回收，不再白等 TTL —— 崩溃/被
+ *  kill -9 的 CLI 不再让后续全部清理阻塞 5 分钟；跨机维持 TTL 双条件
+ *  （锁目录可能在共享存储上，本机永远探不到他机进程，TTL 过期是远程
+ *  持有者的唯一保护）。 */
 function hasActiveOwner(lock) {
   if (!lock) return false;
   const now = Date.now();
@@ -312,7 +317,10 @@ function hasActiveOwner(lock) {
     const alive = o.owner && Number.isInteger(o.owner.pid) && o.owner.pid > 0
       && pidReused(o.owner) !== true
       && isProcessAlive(o.owner.pid, o.owner.hostname);
-    return o.expiresAt > now || alive;
+    if (alive) return true;
+    // 已死：同机 → 死亡即终局（立即回收）；跨机 → TTL 未过期前保守
+    if (o.owner && o.owner.hostname === os.hostname()) return false;
+    return o.expiresAt > now;
   });
 }
 
@@ -368,15 +376,21 @@ function acquireLock(operation) {
       const expired = slot.expiresAt <= Date.now();
       const aliveRaw = Number.isInteger(o.pid) && o.pid > 0 && isProcessAlive(o.pid, o.hostname);
       // 四象限诊断（与插件版 E_LOCK_HELD 报错同口径）：谁占着、还活着吗、何时可回收
-      const state = !expired && (aliveRaw && reused !== true)
+      // V5.8.8：已死未到期分主机域 —— 同机死亡即终局（本应已回收，受阻提示
+      // 重试而非等待）；跨机才给 TTL 倒计时（本机探不到他机进程，TTL 唯一保护）
+      const dead = !aliveRaw || reused === true;
+      const sameHost = o.hostname === os.hostname();
+      const state = !expired && !dead
         ? '活跃清理中'
-        : expired && (!aliveRaw || reused === true)
+        : expired && dead
           ? '陈旧残留（破锁受阻，请重试）'
-          : !expired && (!aliveRaw || reused === true)
-            ? `持有者已死，TTL 剩余 ${Math.max(0, Math.round((slot.expiresAt - Date.now()) / 1000))}s 后可自动清除`
-            : '已过期但进程仍存活（SIGSTOP/长任务，不可回收）';
+          : !expired && dead && sameHost
+            ? '持有者已死（本机已证，可立即回收 —— 本次回收受阻，请重试）'
+            : !expired && dead
+              ? `持有者已死（跨机），TTL 剩余 ${Math.max(0, Math.round((slot.expiresAt - Date.now()) / 1000))}s 后可自动清除`
+              : '已过期但进程仍存活（SIGSTOP/长任务，不可回收）';
       console.error(c.red(`🔒 另一个 nuke 操作持有全局锁（PID: ${o.pid}，用途: ${o.purpose || 'unknown'}，状态: ${state}）`));
-      console.error(c.dim('   破锁纪律：仅当持有者进程死亡且 TTL 过期时自动清除；否则请等待其完成。'));
+      console.error(c.dim('   破锁纪律：同机持有者已死即回收；跨机须死亡且 TTL 过期；持有者存活绝不破锁。'));
       console.error(c.dim('   诊断：插件版可运行 nuke_locks 查看全部锁现场。'));
       process.exit(1);
     }

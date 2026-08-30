@@ -31,14 +31,14 @@ function runCli(args: string[], home = dshHome) {
 }
 
 /** 构造 V4 协议锁文件（与插件版 lock-manager 同格式） */
-function writeV4Lock(name: string, pid: number, expiresAt: number, purpose = 'test', startTime?: number) {
+function writeV4Lock(name: string, pid: number, expiresAt: number, purpose = 'test', startTime?: number, hostname = os.hostname()) {
   const lockDir = path.join(dshHome, '.nuke', 'locks')
   fs.mkdirSync(lockDir, { recursive: true })
   fs.writeFileSync(path.join(lockDir, name), JSON.stringify({
     version: 1, scope: 'global', mode: 'exclusive',
     owners: [{
       owner: {
-        pid, hostname: os.hostname(), bootToken: `test-${name}`, purpose,
+        pid, hostname, bootToken: `test-${name}`, purpose,
         ...(startTime !== undefined ? { startTime } : {}),
       },
       acquiredAt: new Date().toISOString(), expiresAt,
@@ -145,10 +145,21 @@ describe('CLI V4 锁互斥（与插件版共享 .nuke/locks/ 协议）', () => {
     fs.rmSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))
   })
 
-  it('v5.6.2 持有者已死但 TTL 未过期 → 不破锁拒绝执行（等 TTL 到期）', () => {
+  it('V5.8.8 同机持有者已死但 TTL 未过期 → 立即回收继续执行（内核 ESRCH 权威证明，不等 TTL）', () => {
+    // 旧纪律（死+TTL 双条件）下崩溃的 CLI 会阻塞后续清理 5 分钟；
+    // V5.8.8 与插件版 slotReapable 对齐：同机死亡即终局，立即回收。
     writeV4Lock('global.lock', 999_999_999, Date.now() + 60_000, 'dead-not-expired')
     const r = runCli(['clean', 'foo-plugin', '--dry-run'])
+    expect(r.status).toBe(0)
+    // 回收后 CLI 自己的锁在结束时也应清理干净
+    expect(fs.existsSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))).toBe(false)
+  })
+
+  it('V5.8.8 跨机持有者已死且 TTL 未过期 → 维持双条件拒绝（共享存储防误删远程存活者）', () => {
+    writeV4Lock('global.lock', 999_999_999, Date.now() + 60_000, 'remote-dead', undefined, 'other-host')
+    const r = runCli(['clean', 'foo-plugin', '--dry-run'])
     expect(r.status).toBe(1)
+    expect(r.stderr).toContain('跨机')
     expect(fs.existsSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))).toBe(true)
     fs.rmSync(path.join(dshHome, '.nuke', 'locks', 'global.lock'))
   })
