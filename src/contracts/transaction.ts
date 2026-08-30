@@ -31,6 +31,9 @@ export interface CleanRequest {
   readonly dryRun: boolean
   /** aggressive 策略必须携带；由确认流程签发的一次性令牌 */
   readonly confirmationToken?: string
+  /** 跳过 standard-remove（dsh CLI 标准卸载）步骤：CLI 不可用 / 宿主 PATH
+   *  缺口时的显式逃生通道；与独立 CLI 的 --skip-standard 同语义 */
+  readonly skipStandard?: boolean
   /** 操作人标识（CLI 用户名 / tool 调用者），写入审计日志 */
   readonly actor: string
 }

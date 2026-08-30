@@ -23,13 +23,14 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
       dry_run: { type: 'boolean', description: '仅预演，默认 false' },
       confirmation_token: { type: 'string', description: 'aggressive 必填：CONFIRM:<profile>:<插件清单>' },
       skip_health: { type: 'boolean', description: '跳过健康检查闸门，默认 false' },
+      skip_standard: { type: 'boolean', description: '跳过 dsh CLI 标准卸载步骤（CLI 不可用 / 宿主 PATH 缺口时的逃生通道），默认 false' },
       report_format: { type: 'string', enum: ['json', 'markdown', 'both', 'none'], description: '报告格式，默认 markdown' },
       actor: { type: 'string', description: '操作人标识（写入审计日志），默认 nuke-tool' },
     },
     execute: async (args) => {
       const {
         profile = 'web', strategy = 'balanced', dry_run = false,
-        skip_health = false, report_format = 'markdown', actor = 'nuke-tool',
+        skip_health = false, skip_standard = false, report_format = 'markdown', actor = 'nuke-tool',
         plugin_names, plugin_name, confirmation_token,
       } = args
       // 类型与枚举（strategy/report_format）已由 defineTool 编译进 JSON Schema
@@ -88,6 +89,7 @@ export function registerExecutionTools(ctx: Context, rt: Runtime): void {
         plugins: cp.plugins, profile: cprof.profile, strategy: strat,
         dryRun: dry_run, actor,
         ...(confirmation_token !== undefined ? { confirmationToken: confirmation_token } : {}),
+        ...(skip_standard ? { skipStandard: true } : {}),
       })
       if (!begin.ok) {
         return { content: `❌ 事务开启失败 [${begin.error.code}]: ${begin.error.message}` }

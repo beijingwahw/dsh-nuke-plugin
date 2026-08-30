@@ -791,6 +791,23 @@ describe('执行域 nuke_clean', () => {
     expect(rt.engine.begin).toHaveBeenCalled()
   })
 
+  it('skip_standard=true → 透传到事务请求（剔除标准卸载步骤）', async () => {
+    const { defs, rt } = setup()
+    await runTool(defs.get('nuke_clean')!, {
+      plugin_names: ['demo-plugin'], dry_run: true, skip_standard: true,
+    })
+    expect(rt.engine.begin).toHaveBeenCalledWith(expect.objectContaining({ skipStandard: true }))
+  })
+
+  it('skip_standard 缺省 → 请求不带 skipStandard（向后兼容）', async () => {
+    const { defs, rt } = setup()
+    await runTool(defs.get('nuke_clean')!, {
+      plugin_names: ['demo-plugin'], dry_run: true,
+    })
+    const req = (rt.engine.begin as ReturnType<typeof vi.fn>).mock.calls[0]![0] as Record<string, unknown>
+    expect('skipStandard' in req).toBe(false)
+  })
+
   it('dry-run：预演输出 + rollback 释放锁 + 不建还原点', async () => {
     const { defs, rt } = setup({
       engine: {

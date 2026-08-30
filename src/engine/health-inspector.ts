@@ -21,6 +21,7 @@ import type {
   HealthCheckResult, HealthReport, IHealthInspector,
 } from '../contracts/health.contract'
 import type { IToolRegistry } from '../contracts/tool.contract'
+import { adaptSpawnInvocation } from '../infra/cmd-shim'
 import { DEFAULT_IO_CONCURRENCY, forEachPool } from '../infra/fs-utils'
 import { createToolRegistry } from '../infra/tool-registry'
 
@@ -90,8 +91,10 @@ export function createHealthInspector(options: HealthInspectorOptions): IHealthI
     }
   })
   // spawnSync 失败时 stdout/stderr 可能为 null —— 归一化为 string（与 exec-ops 同纪律）
+  // Windows .cmd/.bat shim 经 ComSpec 适配（直接 spawn 会抛 EINVAL，见 cmd-shim）
   const runCommand = options.runCommand ?? ((cmd, args, opts) => {
-    const r = spawnSync(cmd, args, { cwd: opts.cwd, encoding: 'utf-8', timeout: opts.timeoutMs })
+    const t = adaptSpawnInvocation(cmd, args)
+    const r = spawnSync(t.file, t.args, { cwd: opts.cwd, encoding: 'utf-8', timeout: opts.timeoutMs })
     return {
       status: r.status,
       // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- 防御性：外部输入（spawnSync 失败路径 stdout 运行时可能为 null，类型标注未覆盖）

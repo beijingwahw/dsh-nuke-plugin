@@ -27,6 +27,7 @@ import type {
   CleanOperation, CommandExecutionDetail, ExecutedStep, OperationPlan, TxContext,
 } from '../contracts/transaction'
 import type { IInputValidator } from '../contracts/validation'
+import { adaptSpawnInvocation } from '../infra/cmd-shim'
 import { createToolRegistry } from '../infra/tool-registry'
 
 /** 命令运行器返回形态（error/signal 为 V4 增量可选字段，旧注入实现无需改动） */
@@ -63,7 +64,9 @@ const MAX_STREAM_CHARS = 1_000_000
  *    上游 isTimedOut/isRetryable 无需感知实现差异） */
 export const defaultCommandRunner: CommandRunner = (cmd, args, opts) =>
   new Promise<CommandResult>(resolve => {
-    const child = spawn(cmd, args, { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}) })
+    // Windows .cmd/.bat shim 经 ComSpec 适配（直接 spawn 会抛 EINVAL，见 cmd-shim）
+    const t = adaptSpawnInvocation(cmd, args)
+    const child = spawn(t.file, t.args, { ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}) })
     let stdout = ''
     let stderr = ''
     let settled = false

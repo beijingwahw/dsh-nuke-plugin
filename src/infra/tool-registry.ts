@@ -16,6 +16,7 @@ import type {
 } from '../contracts/tool.contract'
 
 import { resolveCommand } from './bin-resolver'
+import { adaptSpawnInvocation } from './cmd-shim'
 
 /** 探测返回形态（与 health-inspector 的 CommandProbe 同构） */
 export interface ToolProbeResult {
@@ -76,9 +77,11 @@ function flagNote(r: ToolProbeResult): string {
   return (r.stdout.trim() || r.stderr.trim()).slice(0, 60)
 }
 
-/** 默认探测：真实 spawnSync（注册表可独立构造，宿主入口直接用） */
+/** 默认探测：真实 spawnSync（注册表可独立构造，宿主入口直接用）。
+ *  Windows .cmd/.bat shim 经 ComSpec 适配（直接 spawn 会抛 EINVAL，见 cmd-shim） */
 function defaultProbe(cmdOrPath: string): ToolProbeResult {
-  const r = spawnSync(cmdOrPath, ['--version'], { encoding: 'utf-8', timeout: 5000 })
+  const t = adaptSpawnInvocation(cmdOrPath, ['--version'])
+  const r = spawnSync(t.file, t.args, { encoding: 'utf-8', timeout: 5000 })
   return {
     status: r.status,
     // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition -- spawn 失败（如 ENOENT）时 stdout 实际为 undefined（SpawnSyncReturns 类型未建模），?? '' 是必需的运行时防御

@@ -170,6 +170,9 @@ function buildOperations(
 ): CleanOperation[] {
   const dshHomeOf = (c: TxContext) => c.resolver.platform().dshHome
   const actions = new Set(STRATEGY_ACTIONS[request.strategy])
+  // skip_standard：显式剔除标准卸载步骤（CLI 不可用时的逃生通道，
+  // 与独立 CLI 的 --skip-standard 同语义）—— dry-run / 执行 / 回滚共用本内核
+  if (request.skipStandard) actions.delete('standard-remove')
   const ops: CleanOperation[] = []
 
   // 防御性闸门：插件名必须通过 npm 包名规范校验才参与操作集构建

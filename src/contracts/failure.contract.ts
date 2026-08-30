@@ -77,7 +77,7 @@ const MODE_RULES: readonly { readonly mode: FailureMode; readonly patterns: read
   { mode: 'space', patterns: [/\bENOSPC\b/, /no space left/i, /磁盘空间不足/, /space insufficient/i] },
   { mode: 'vanished', patterns: [/\bENOENT\b/, /no such file or directory/i, /不存在/] },
   { mode: 'permission', patterns: [/\bEACCES\b/, /\bEPERM\b/, /permission denied/i, /权限/] },
-  { mode: 'io', patterns: [/\bEIO\b/, /\bEROFS\b/, /\bEISDIR\b/, /\bENOTDIR\b/, /\bENOTEMPTY\b/, /read-only/i] },
+  { mode: 'io', patterns: [/\bEIO\b/, /\bEROFS\b/, /\bEISDIR\b/, /\bENOTDIR\b/, /\bENOTEMPTY\b/, /\bEINVAL\b/, /read-only/i] },
 ]
 
 /**

@@ -73,6 +73,16 @@ function formatBytes(bytes) {
 
 const binCache = new Map();
 
+// Windows 扩展名补全：npm 全局安装生成 .cmd 包装器（优先）而非裸名可执行文件。
+// 真实故障：只查精确名 → D:\...\dsh.cmd 存在但 'dsh' 查不到 → CLI 误报
+// "无法定位 dsh CLI"。与插件版 bin-resolver 的 WIN_EXT_ORDER 同源。
+const WIN_PLATFORM = process.platform === 'win32';
+const WIN_EXT_ORDER = ['.cmd', '.exe', '.bat'];
+
+function candidateNames(cmd) {
+  return WIN_PLATFORM ? [...WIN_EXT_ORDER.map(ext => cmd + ext), cmd] : [cmd];
+}
+
 function resolveBin(cmd) {
   if (binCache.has(cmd)) return binCache.get(cmd);
   const found = resolveOnPath(cmd) || rescueFromCommonDirs(cmd);
@@ -84,38 +94,56 @@ function resolveOnPath(cmd) {
   const pathVar = process.env.PATH || process.env.Path || '';
   for (const dir of pathVar.split(path.delimiter)) {
     if (!dir) continue;
-    const full = path.join(dir, cmd);
-    try { if (fs.existsSync(full)) return full; } catch { /* 不可读即跳过 */ }
+    for (const name of candidateNames(cmd)) {
+      const full = path.join(dir, name);
+      try { if (fs.existsSync(full)) return full; } catch { /* 不可读即跳过 */ }
+    }
   }
   return null;
 }
 
 function rescueFromCommonDirs(cmd) {
   const home = os.homedir();
-  const dirs = ['/usr/local/bin', '/opt/homebrew/bin', path.join(home, '.local', 'bin'),
-    path.join(home, '.volta', 'bin'), path.join(home, '.asdf', 'shims')];
-  if (process.env.npm_config_prefix) dirs.push(path.join(process.env.npm_config_prefix, 'bin'));
-  // nvm 版本目录（~/.nvm/versions/node/<ver>/bin）—— 逐版本枚举，fail-soft
-  const nvmVersions = path.join(home, '.nvm', 'versions', 'node');
-  try {
-    for (const v of fs.readdirSync(nvmVersions)) dirs.push(path.join(nvmVersions, v, 'bin'));
-  } catch { /* nvm 未安装 → 跳过 */ }
+  const dirs = [];
+  if (WIN_PLATFORM) {
+    // 与插件版 bin-resolver 的 win32 分支同源：npm 全局 bin / nvm-windows
+    if (process.env.APPDATA) dirs.push(path.join(process.env.APPDATA, 'npm'));
+    if (process.env.NVM_HOME) dirs.push(process.env.NVM_HOME);
+    if (process.env.NVM_SYMLINK) dirs.push(process.env.NVM_SYMLINK);
+  } else {
+    dirs.push('/usr/local/bin', '/opt/homebrew/bin', path.join(home, '.local', 'bin'),
+      path.join(home, '.volta', 'bin'), path.join(home, '.asdf', 'shims'));
+    if (process.env.npm_config_prefix) dirs.push(path.join(process.env.npm_config_prefix, 'bin'));
+    // nvm 版本目录（~/.nvm/versions/node/<ver>/bin）—— 逐版本枚举，fail-soft
+    const nvmVersions = path.join(home, '.nvm', 'versions', 'node');
+    try {
+      for (const v of fs.readdirSync(nvmVersions)) dirs.push(path.join(nvmVersions, v, 'bin'));
+    } catch { /* nvm 未安装 → 跳过 */ }
+  }
   for (const dir of dirs) {
-    const full = path.join(dir, cmd);
-    try { if (fs.existsSync(full)) return full; } catch { /* 不可读即跳过 */ }
+    for (const name of candidateNames(cmd)) {
+      const full = path.join(dir, name);
+      try { if (fs.existsSync(full)) return full; } catch { /* 不可读即跳过 */ }
+    }
   }
   return null;
 }
 
 /** 执行救援命中的命令：nvm 全局 CLI 是 node 脚本（shebang `#!/usr/bin/env node`），
  *  PATH 缺口场景下 child 进程同样找不到 node → 退出码 127。
- *  对策：把当前 node 所在目录注入 child 的 PATH（幂等：已在 PATH 则不重复）。 */
+ *  对策：把当前 node 所在目录注入 child 的 PATH（幂等：已在 PATH 则不重复）。
+ *  Windows .cmd/.bat 必须经 %ComSpec% /d /s /c 执行（Node 修复 CVE-2024-27980
+ *  后直接 spawn 会抛 EINVAL —— 与插件版 cmd-shim 同源适配）。 */
 function spawnBin(bin, args, opts = {}) {
   const nodeDir = path.dirname(process.execPath);
   const pathVar = process.env.PATH || '';
   const env = pathVar.split(path.delimiter).includes(nodeDir)
     ? process.env
     : { ...process.env, PATH: `${nodeDir}${path.delimiter}${pathVar}` };
+  if (WIN_PLATFORM && ['.cmd', '.bat'].includes(path.extname(bin).toLowerCase())) {
+    const comspec = process.env.ComSpec || 'cmd.exe';
+    return spawnSync(comspec, ['/d', '/s', '/c', bin, ...args], { ...opts, env });
+  }
   return spawnSync(bin, args, { ...opts, env });
 }
 

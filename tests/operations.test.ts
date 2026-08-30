@@ -298,6 +298,31 @@ describe('makeOperationFactory（策略编译）', () => {
     for (const a of STRATEGY_ACTIONS.safe) expect(STRATEGY_ACTIONS.balanced).toContain(a)
     for (const b of STRATEGY_ACTIONS.balanced) expect(STRATEGY_ACTIONS.aggressive).toContain(b)
   })
+
+  it('skipStandard=true → 三策略均剔除 standard-remove（CLI 逃生通道）', () => {
+    const factory = makeOperationFactory({
+      validator: createValidator(), runCommand: stubRun(), tempRoot,
+    })
+    for (const strategy of ['safe', 'balanced', 'aggressive'] as const) {
+      const ops = factory({
+        plugins: [VICTIM], profile: PROFILE, strategy, dryRun: true, actor: 't',
+        skipStandard: true,
+      })
+      expect(ops.map(o => o.action)).not.toContain('standard-remove')
+      expect(ops.length).toBe(STRATEGY_ACTIONS[strategy].length - 1)
+    }
+  })
+
+  it('skipStandard 缺省 → 动作集不变（向后兼容）', () => {
+    const factory = makeOperationFactory({
+      validator: createValidator(), runCommand: stubRun(), tempRoot,
+    })
+    const ops = factory({
+      plugins: [VICTIM], profile: PROFILE, strategy: 'safe', dryRun: true, actor: 't',
+    })
+    expect(ops.map(o => o.action)).toContain('standard-remove')
+    expect(ops.length).toBe(STRATEGY_ACTIONS.safe.length)
+  })
 })
 
 describe('makePurgeTempOp（V5.8.1：多条目备份完整性与并发清理容忍）', () => {
